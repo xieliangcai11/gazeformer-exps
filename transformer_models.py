@@ -150,12 +150,14 @@ class RMSNorm(torch.nn.Module):
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        # eps: 普通成员（float，不可学习），防止除零的数值稳定项
         self.eps = eps
-        # 可学习的缩放参数 gamma
+        # weight: 可学习成员参数（gamma），形状 [dim]，float32，随模型设备移动；
+        # 归一化后乘上它恢复表达能力；生命周期与模型相同
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        # 用均方根归一化（rsqrt 即 1/sqrt）
+        # x: [B, dim]（或任意前缀维 + dim）；在最后一维上用均方根归一化（rsqrt 即 1/sqrt）
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
@@ -173,10 +175,13 @@ class Attention(nn.Module):
 
     def __init__(self, embed_dim, num_heads, batch_first=True):
         super(Attention, self).__init__()
+        # attention: 成员（nn.MultiheadAttention，可学习，float32）；
+        # 内含 in_proj_weight [3*embed_dim, embed_dim] 与 out_proj 权重 [embed_dim, embed_dim]
         # embed_dim 必须能被 num_heads 整除（由 nn.MultiheadAttention 校验）
         self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=batch_first)
 
     def forward(self, query, key, value, mask=None):
+        # query/key/value: [B, L, embed_dim]（batch_first=True 时）；mask 可为 None
         # 注意力原理：Q（query，查询）、K（key，键）、V（value，值）都是输入经内部投影后的向量；
         # Q 与每个 K 计算相似度，在最后一维（key 维，dim=-1）上做 softmax 得到权重，
         # 再用权重对 V 加权求和，实现"从序列中按相关性提取信息"。
@@ -201,11 +206,15 @@ class FlashAttention(nn.Module):
 
     def __init__(self, embed_dim, num_heads, cross_attn = False, use_flash_attn = True, return_residual = False):
         super().__init__()
+        # cross_attn: 普通成员（bool，不可学习），决定前向走自注意力还是交叉注意力分支
         self.cross_attn = cross_attn
+        # return_residual: 普通成员（bool，不可学习），决定是否额外返回输入作为残差
         self.return_residual = return_residual
+        # attention: 成员（flash_attn 的 MHA，可学习），更省显存的高效注意力实现
         self.attention = MHA(embed_dim, num_heads, cross_attn = cross_attn, use_flash_attn = use_flash_attn, return_residual=return_residual)
 
     def forward(self, x, x_kv=None, mask=None):
+        # x: [B, L, embed_dim]；x_kv（交叉注意力时）: [B, L_kv, embed_dim]；输出同 query 长度
         # key_padding_mask（键填充掩码）：形状 [batch, 序列长]，为 True 的位置表示 padding（填充），
         # 注意力会忽略这些位置；与上面 attn_mask 的语义不同。
         if not self.cross_attn:
@@ -227,11 +236,14 @@ class FeedForward(nn.Module):
 
     def __init__(self, embed_dim, inter_dim):
         super(FeedForward, self).__init__()
+        # fc1: 可学习成员，权重 [inter_dim, embed_dim]；升维扩大表达空间
         self.fc1 = nn.Linear(embed_dim, inter_dim)  # 升维
+        # fc2: 可学习成员，权重 [embed_dim, inter_dim]；降维回原维度
         self.fc2 = nn.Linear(inter_dim, embed_dim)  # 降维回原维度
         # self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
+        # x: [B, L, embed_dim] -> fc1 -> [B, L, inter_dim] -> SiLU -> fc2 -> [B, L, embed_dim]
         x = F.silu(self.fc1(x))  # Swish/SiLU 激活
         # x = self.dropout(x)
         # x = self.dropout(x) # remove dropout
@@ -250,10 +262,11 @@ class Router(nn.Module):
         self.gating = nn.Linear(input_dim, num_experts)
 
     def forward(self, x):
-        # 计算专家 logits
+        # x: [N, input_dim]（N 为样本数）
+        # 计算专家 logits（未归一化打分）
         expert_logits = self.gating(x)  # Shape: [batch_size, num_experts]
-        # softmax 得到专家选择概率
-        expert_probs = F.softmax(expert_logits, dim=-1)
+        # softmax 在最后一维（专家维）上归一化，每个样本所有专家概率和为 1
+        expert_probs = F.softmax(expert_logits, dim=-1)  # [batch_size, num_experts]
         return expert_probs
 
 
@@ -275,10 +288,12 @@ class MixtureOfExperts(nn.Module):
         :param capacity   : 每个输入激活的 top-k 专家数量。
         """
         super(MixtureOfExperts, self).__init__()
+        # num_experts / capacity: 普通成员（int，不可学习），专家数与 top-k 数，构造期与前向读取
         self.num_experts = num_experts
         self.capacity = capacity
-        # 每个专家就是一个线性层
+        # experts: 可学习成员列表，num_experts 个 nn.Linear(input_dim, output_dim)
         self.experts = nn.ModuleList([nn.Linear(input_dim, output_dim) for _ in range(num_experts)])
+        # router: 可学习成员（Router），负责为每个样本挑选专家
         self.router = Router(input_dim, num_experts)
 
     def forward(self, x):
@@ -564,16 +579,20 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, embed_dim, num_heads, ff_dim, num_experts, capacity):
         super(TransformerBlock, self).__init__()
+        # self_attn / cross_attn: 可学习成员（Attention），自注意力与交叉注意力
         self.self_attn = Attention(embed_dim, num_heads)   # 自注意力
         self.cross_attn = Attention(embed_dim, num_heads)  # 交叉注意力
         # self.ff = FeedForward(embed_dim, ff_dim)
+        # moe: 可学习成员（MixtureOfExperts，注意该类 forward 有未定义变量，不可实际调用）
         self.moe = MixtureOfExperts(embed_dim, embed_dim, num_experts, capacity)  # 简单 MoE
         # self.moe = MOE()
+        # norm1/2/3: 可学习成员（RMSNorm），三个子层各自的归一化
         self.norm1 = RMSNorm(embed_dim, eps=1e-5)
         self.norm2 = RMSNorm(embed_dim, eps=1e-5)
         self.norm3 = RMSNorm(embed_dim, eps=1e-5)
 
     def forward(self, x, cross_input, mask=None):
+        # x / cross_input: [B, L, embed_dim]；cross_input 为交叉注意力的 K/V 来源
         # 自注意力 + 残差 + 归一化
         attn_output = self.self_attn(x, x, x, mask)
         x = self.norm1(x + attn_output)
@@ -605,6 +624,7 @@ class PositionalEncoding(nn.Module):
             max_seq_len : 最大序列长度。
         """
         super(PositionalEncoding, self).__init__()
+        # embed_dim: 普通成员（int，不可学习），编码维度
         self.embed_dim = embed_dim
 
         # 位置索引 (max_seq_len, 1)
@@ -619,7 +639,8 @@ class PositionalEncoding(nn.Module):
 
         # 增加 batch 维度 (1, max_seq_len, embed_dim)
         encoding = encoding.unsqueeze(0)
-        # 注册为 buffer（不参与反向传播）
+        # 注册为 buffer（不参与反向传播）：positional_encoding 形状 [1, max_seq_len, embed_dim]，
+        # float32，随模型保存/移动设备，但不可学习
         self.register_buffer('positional_encoding', encoding)
 
     def forward(self, x):
@@ -677,7 +698,9 @@ class Block(nn.Module):
 
     def __init__(self, embed_dim, num_heads, n_routed_experts, n_activated_experts, n_shared_experts, moe_inter_dim, inter_dim = 10944, layer_id=None):
         super(Block, self).__init__()
+        # self_attn: 可学习成员（Attention），该块唯一的注意力模块（自/交叉共用）
         self.self_attn = Attention(embed_dim, num_heads)
+        # n_dense_layers: 普通成员（int，不可学习），前几层用普通 FFN 的阈值
         self.n_dense_layers = 3  # 前 3 层为 dense FFN
         n_dense_layers = self.n_dense_layers
 
@@ -697,6 +720,7 @@ class Block(nn.Module):
         self.norm3 = RMSNorm(embed_dim, eps=1e-5)
 
     def forward(self, x, cross_input=None, mask=None):
+        # x: [B, L, embed_dim]；cross_input: 交叉注意力的 K/V 序列（None 则自注意力）
         # Pre-Norm 后做注意力
         x_norm = self.norm1(x)
         if cross_input is None:
@@ -739,18 +763,21 @@ class BlockMoba(nn.Module):
         moba_topk=2
     ):
         super(BlockMoba, self).__init__()
+        # embed_dim / num_heads: 普通成员（int，不可学习），前向中用于多头拆分
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        # MoBA 相关参数（当前未真正使用）
+        # MoBA 相关参数（当前未真正使用，仅存储）
         self.moba_chunk_size = moba_chunk_size
         self.moba_topk = moba_topk
 
         # 前 9 层为 dense FFN，其余层为 MoE
         self.n_dense_layers = 9
         if layer_id is not None and layer_id < self.n_dense_layers:
+            # moe: 可学习成员；浅层为 FeedForward，深层为 MoE（见上方分支）
             self.moe = FeedForward(embed_dim, inter_dim)
         else:
             self.moe = MoE(embed_dim, n_routed_experts, n_activated_experts, n_shared_experts, moe_inter_dim)
+        # norm1/norm3: 可学习成员（RMSNorm），注意力前与 MoE/FF 前各一次归一化
         self.norm1 = RMSNorm(embed_dim, eps=1e-5)
         self.norm3 = RMSNorm(embed_dim, eps=1e-5)
 
@@ -853,7 +880,10 @@ class TransformerDeepSeek_gaze(nn.Module):
         dropout_rate=0.1
     ):
         super().__init__()
+        # d_model: 普通成员（int，不可学习），统一 token 维度
         self.d_model = d_model
+        # dropout: 成员（nn.Dropout，无可学习参数）；训练时以 dropout_rate 概率随机置零元素，
+        # 推理时自动关闭（需 model.eval()），正则化防过拟合
         self.dropout = nn.Dropout(dropout_rate)  # Dropout
 
         # 各特征到统一维度 d_model 的投影层
@@ -868,7 +898,7 @@ class TransformerDeepSeek_gaze(nn.Module):
         # 最终从它所在位置取特征做 gaze 回归。
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        # 堆叠 num_layers 个 BlockMoba（前 9 层 FFN，其余 MoE）
+        # layers: 可学习成员列表（ModuleList），每层为 BlockMoba（前 9 层 FFN，其余 MoE）
         self.layers = nn.ModuleList([
             BlockMoba(
                 d_model,
@@ -885,6 +915,7 @@ class TransformerDeepSeek_gaze(nn.Module):
             for i in range(num_layers)
         ])
         # 输出头：CLS token -> 3D gaze
+        # linear_head: 可学习成员，权重 [out_dim, d_model]=[3, d_model]
         self.linear_head = nn.Linear(d_model, out_dim)
 
     def forward(self, raw_inputs, mask=None):
