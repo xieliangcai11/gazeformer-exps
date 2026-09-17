@@ -30,6 +30,17 @@ transformer_models.py
 
 说明：本文件中 MoE/BlockMoba 等命名参考了 DeepSeek-V3 / MoBA 架构，
       但 BlockMoba 内实际使用的是标准缩放点积注意力（并非真正的 MoBA 稀疏注意力）。
+
+术语对照（中英对照，全文通用）：
+    - MoE       : 混合专家（Mixture of Experts），由门控为每个 token 挑选少量专家计算，节省算力。
+    - gate      : 门控/路由器（gate/router），给每个 token 打分并选出 top-k 个专家。
+    - expert    : 专家（expert），一个小型前馈网络，只处理被路由到它的 token。
+    - top-k     : 只取得分最大的 k 个，其余不参与计算。
+    - logits    : 未归一化打分（logits），经 softmax/sigmoid 后才变成权重或概率。
+    - mask      : 掩码（mask），屏蔽注意力中不应关注的位置（True/非零处被屏蔽或保留，视实现而定）。
+    - residual  : 残差连接（residual），输出 = 输入 + 变换(输入)。
+    - buffer    : 缓冲张量（buffer），随模型保存/移动设备，但不是可学习参数。
+    - dense     : 密集层（dense），指普通 FFN，非 MoE。
 """
 
 import random
@@ -166,6 +177,11 @@ class Attention(nn.Module):
         self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=batch_first)
 
     def forward(self, query, key, value, mask=None):
+        # 注意力原理：Q（query，查询）、K（key，键）、V（value，值）都是输入经内部投影后的向量；
+        # Q 与每个 K 计算相似度，在最后一维（key 维，dim=-1）上做 softmax 得到权重，
+        # 再用权重对 V 加权求和，实现"从序列中按相关性提取信息"。
+        # mask（掩码）：传给 attn_mask，会被广播到 [batch, 头数, 序列长, 序列长]；
+        # 被屏蔽位置的注意力权重 softmax 后趋于 0。
         # 返回注意力输出（忽略注意力权重）
         attn_output, _ = self.attention(query, key, value, attn_mask=mask)
         return attn_output
@@ -190,6 +206,8 @@ class FlashAttention(nn.Module):
         self.attention = MHA(embed_dim, num_heads, cross_attn = cross_attn, use_flash_attn = use_flash_attn, return_residual=return_residual)
 
     def forward(self, x, x_kv=None, mask=None):
+        # key_padding_mask（键填充掩码）：形状 [batch, 序列长]，为 True 的位置表示 padding（填充），
+        # 注意力会忽略这些位置；与上面 attn_mask 的语义不同。
         if not self.cross_attn:
             # 自注意力：query=key=value=x
             attn_output = self.attention(x, x_kv=None, key_padding_mask=mask)
@@ -402,13 +420,21 @@ class Gate(nn.Module):
             scores = scores + self.bias
         # 若分组数 > 1，则先按组选 topk_groups，再在组内选专家
         if self.n_groups > 1:
+            # view：把专家维拆成两组 -> [N, n_groups, 每组专家数]，
+            # 即第 1 维（专家维）被"拆分"为 组数 × 每组专家数 两维
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
+                # amax：组内取最大分作为该组的代表分 -> [N, n_groups]
                 group_scores = scores.amax(dim=-1)
             else:
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            # 每个样本挑出得分最高的 topk_groups 个组，indices: [N, topk_groups]
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            # scatter_：把选中组的位置填 True，得到 [N, n_groups] 布尔掩码，
+            # 用于屏蔽未选中组的专家分数
             mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+            # 广播：mask [N, n_groups] 经 unsqueeze(-1) 变 [N, n_groups, 1]，
+            # 与 scores [N, n_groups, 每组专家数] 相乘时最后一维自动补齐；随后合并回 [N, 专家总数]
             scores = (scores * mask.unsqueeze(-1)).flatten(1)
         # 取 top-k 专家的索引
         indices = torch.topk(scores, self.topk, dim=-1)[1]
@@ -767,23 +793,30 @@ class BlockMoba(nn.Module):
         bsz, seqlen, d_model = q.shape
         head_dim = d_model // self.num_heads
 
-        # 拆分为多头：q/k/v -> [bsz, num_heads, seqlen, head_dim]
+        # 拆分为多头：view 把最后一维 d_model 拆成 num_heads × head_dim，
+        # transpose 把"头"维移到第 1 维：q/k/v: [bsz, seqlen, d_model] -> [bsz, num_heads, seqlen, head_dim]
+        # （目的是让每个头独立地在自己 head_dim 维内做注意力，bsz 与 num_heads 共同充当 batch 维）
         q = q.view(bsz, seqlen, self.num_heads, head_dim).transpose(1, 2)
         k = k.view(bsz, seqlen, self.num_heads, head_dim).transpose(1, 2)
         v = v.view(bsz, seqlen, self.num_heads, head_dim).transpose(1, 2)
 
-        # 缩放点积注意力分数
+        # 缩放点积注意力分数：矩阵乘发生在 q 的 seqlen 维与 k 转置后的 seqlen 维之间，
+        # scores: [bsz, num_heads, seqlen, seqlen]（行是 query，列是 key）；
+        # 除以 sqrt(head_dim) 防止点积随维度增大而过大，导致 softmax 梯度消失
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
         if mask is not None:
             # 被掩码位置置为很小的数（-1e9），softmax 后接近 0
+            # masked_fill 会把 mask 广播到 scores 的形状（mask 为 0 的位置被屏蔽）
             scores = scores.masked_fill(mask == 0, -1e9)
 
-        # softmax 归一化
+        # softmax 在最后一维（key 维）上归一化：每个 query 对所有 key 的权重和为 1
         attn_weights = torch.softmax(scores, dim=-1)
-        # 加权求和 value
+        # 加权求和 value：attn_weights [bsz, num_heads, seqlen, seqlen] @ v [bsz, num_heads, seqlen, head_dim]
+        # -> [bsz, num_heads, seqlen, head_dim]，每个 token 得到按相关性加权的信息
         attn_output = torch.matmul(attn_weights, v)
 
-        # 合并多头并恢复原始形状 [bsz, seqlen, d_model]
+        # 合并多头：transpose 把头维换回第 1 维，view 把 num_heads × head_dim 合并回 d_model
+        # [bsz, num_heads, seqlen, head_dim] -> [bsz, seqlen, d_model]
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seqlen, d_model)
         return attn_output
 
@@ -827,8 +860,12 @@ class TransformerDeepSeek_gaze(nn.Module):
         self.proj_f1 = nn.Linear(512, d_model)     # feature_1（CLIP 512 维）
         self.proj_f2 = nn.Linear(512, d_model)     # feature_2（CLIP 512 维）
         self.proj_f3 = nn.Linear(2048, d_model)    # feature_3（CNN layer4 通道 2048）
+        # 注意：proj_f3 的输入维度硬编码为 2048（ResNet-50），若 CNN_MODEL 改为 ResNet-18
+        # （layer4 输出 512 通道），此处会报形状不匹配错误，需要同步修改。
         self.proj_patch = nn.Linear(d_model, d_model)  # ViT patch token（已是 d_model 维）
-        # 可学习 CLS token
+        # 可学习 CLS token：成员参数，形状 [1, 1, d_model]，float32，随模型设备移动；
+        # 前向时被 expand 到 batch 大小，作为汇总全序列信息的"全局查询"，
+        # 最终从它所在位置取特征做 gaze 回归。
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
         # 堆叠 num_layers 个 BlockMoba（前 9 层 FFN，其余 MoE）
@@ -852,10 +889,13 @@ class TransformerDeepSeek_gaze(nn.Module):
 
     def forward(self, raw_inputs, mask=None):
         # ---------- 1. 各特征投影并构造成 token ----------
-        # feature_1/feature_2：各投影为 1 个 token [B, 1, d_model]
+        # feature_1/feature_2：投影到 d_model 后 unsqueeze(1) 在序列维插入长度 1，
+        # 得到各 1 个 token：[B, 512] -> [B, 1, d_model]；每个 token 都过 Dropout
+        # token_f1/token_f2: [B, 1, d_model] float32，可学习路径上的中间张量
         token_f1 = self.dropout(self.proj_f1(raw_inputs["feature_1"]).unsqueeze(1))
         token_f2 = self.dropout(self.proj_f2(raw_inputs["feature_2"]).unsqueeze(1))
-        # feature_3：CNN 特征图展平后的 token 序列 [B, N, d_model]
+        # feature_3：CNN 特征图展平后的 token 序列 [B, N, d_model]（N 为空间位置数 H*W，
+        # 要求上游已把特征整理为 [B, N, 2048]，见 train.py 中的处理）
         token_f3 = self.dropout(self.proj_f3(raw_inputs["feature_3"]))
         token_list = [token_f1, token_f2, token_f3]
 
@@ -864,11 +904,12 @@ class TransformerDeepSeek_gaze(nn.Module):
             token_patch = self.dropout(self.proj_patch(raw_inputs["token_img_patch"]))
             token_list.append(token_patch)
 
-        # 沿序列维拼接所有 token -> [B, L, d_model]
+        # 沿序列维拼接所有 token -> [B, L, d_model]（L = 1 + 1 + N [+ patch 数]）
         transformer_input = torch.cat(token_list, dim=1)
 
         # ---------- 2. 拼接 CLS token ----------
         batch_size = transformer_input.size(0)
+        # expand：把第 0 维从 1 广播为 batch_size（不复制内存，共享同一份存储）
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         transformer_input = torch.cat([cls_tokens, transformer_input], dim=1)
 
@@ -878,6 +919,7 @@ class TransformerDeepSeek_gaze(nn.Module):
             x = self.dropout(layer(x, cross_input=None, mask=mask))  # 每层后加 Dropout
 
         # ---------- 4. 取 CLS token 回归 gaze ----------
+        # 注意：Dropout 训练时随机置零、推理时自动关闭；推理前需 model.eval()，否则结果带随机性。
         global_repr = x[:, 0, :]  # [B, d_model]
         out = self.linear_head(global_repr)  # [B, 3]
         return out
