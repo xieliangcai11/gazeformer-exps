@@ -87,9 +87,12 @@ class GEWithCLIPModel(nn.Module):
         ]
 
         # ---------- 用 CLIP 的 tokenizer 把文本转为 token id ----------
+        # 以下 tokens 均：[N, 77] int64，在 DEVICE 上，不可学习；仅在构造期用于预计算文本特征
         illum_tokens = clip.tokenize(self.illumination_texts).to(DEVICE)
         headpose_tokens = clip.tokenize(self.headpose_texts).to(DEVICE)
         bg_tokens = clip.tokenize(self.background_texts).to(DEVICE)
+        # label_tokens: 成员（普通张量，非 Parameter），[8, 77] int64，在 DEVICE 上；
+        # 生命周期与模型相同，每次前向时作为文本编码器输入
         self.label_tokens = clip.tokenize(self.label_texts).to(DEVICE)
 
         # 深拷贝一份 CLIP 模型，仅用于预计算文本属性特征（避免影响主模型）
@@ -97,6 +100,8 @@ class GEWithCLIPModel(nn.Module):
         clip_model_1.eval()
         with torch.no_grad():
             # 用文本编码器（encoder_t1）预计算三类无关属性的特征向量
+            # 以下 6 个成员均为普通张量（非 Parameter、不可学习、无梯度），
+            # float32，在 DEVICE 上；构造期写入，之后每次前向只读
             self.illum_feats = clip_model_1.encode_text(illum_tokens)      # [3, 512]
             self.head_feats = clip_model_1.encode_text(headpose_tokens)    # [2, 512]
             self.bg_feats = clip_model_1.encode_text(bg_tokens)            # [2, 512]
@@ -104,11 +109,11 @@ class GEWithCLIPModel(nn.Module):
             # 对上述特征做 L2 归一化，便于后续计算余弦相似度
             self.illum_norm = self.illum_feats / self.illum_feats.norm(
                 dim=-1, keepdim=True
-            )
+            )   # [3, 512] float32
             self.head_norm = self.head_feats / self.head_feats.norm(
                 dim=-1, keepdim=True
-            )
-            self.bg_norm = self.bg_feats / self.bg_feats.norm(dim=-1, keepdim=True)
+            )   # [2, 512] float32
+            self.bg_norm = self.bg_feats / self.bg_feats.norm(dim=-1, keepdim=True)  # [2, 512] float32
         # 释放临时 CLIP 模型，清空显存
         del clip_model_1
         torch.cuda.empty_cache()
@@ -136,11 +141,15 @@ class GEWithCLIPModel(nn.Module):
             main_model_feats_dim = main_model.head.fc.in_features
             main_model.head.fc = nn.Identity()
         self.main_model = main_model
+        # main_model: 成员（nn.Module，可学习，float32），CNN 主干网络；
+        # ResNet-18/50 时已把 fc 换为 Identity，输出 [B, main_model_feats_dim] 的全局特征
 
         # ---------- 融合层 ----------
         # 融合维度 = 无关特征 + 相关特征 + CNN 特征
         fused_dim = irrelevant_feats_dim + relevant_feats_dim + main_model_feats_dim
         # 简单 MLP：fused_dim -> 256 -> ReLU -> 3（输出 3D gaze 向量）
+        # fuse_model: 成员（nn.Sequential，可学习），两个 Linear + ReLU；
+        # 输入 [B, fused_dim]，输出 [B, 3]
         self.fuse_model = nn.Sequential(
             nn.Linear(fused_dim, 256), nn.ReLU(), nn.Linear(256, 3)  # 3D gaze output
         )
@@ -268,28 +277,32 @@ class GEWithCLIPModel_zhao(nn.Module):
         ]
 
         # ---------- 文本 tokenize ----------
+        # 以下 tokens 均：[N, 77] int64，在 DEVICE 上，不可学习
         illum_tokens = clip.tokenize(self.illumination_texts).to(DEVICE)
         headpose_tokens = clip.tokenize(self.headpose_texts).to(DEVICE)
         bg_tokens = clip.tokenize(self.background_texts).to(DEVICE)
+        # label_tokens: 成员（普通张量，非 Parameter），[8, 77] int64，在 DEVICE 上，前向时只读
         self.label_tokens = clip.tokenize(self.label_texts).to(DEVICE)
 
         # 用临时 CLIP 预计算文本属性特征
+        # 以下 6 个成员均为普通张量（非 Parameter、不可学习、无梯度），
+        # float32，在 DEVICE 上；构造期写入，之后每次前向只读
         clip_model_1 = copy.deepcopy(CLIP_MODEL)
         clip_model_1.eval()
         with torch.no_grad():
             # encoder_t1
-            self.illum_feats = clip_model_1.encode_text(illum_tokens)
-            self.head_feats = clip_model_1.encode_text(headpose_tokens)
-            self.bg_feats = clip_model_1.encode_text(bg_tokens)
+            self.illum_feats = clip_model_1.encode_text(illum_tokens)   # [3, 512]
+            self.head_feats = clip_model_1.encode_text(headpose_tokens) # [2, 512]
+            self.bg_feats = clip_model_1.encode_text(bg_tokens)         # [2, 512]
 
             # L2 归一化
             self.illum_norm = self.illum_feats / self.illum_feats.norm(
                 dim=-1, keepdim=True
-            )
+            )   # [3, 512] float32
             self.head_norm = self.head_feats / self.head_feats.norm(
                 dim=-1, keepdim=True
-            )
-            self.bg_norm = self.bg_feats / self.bg_feats.norm(dim=-1, keepdim=True)
+            )   # [2, 512] float32
+            self.bg_norm = self.bg_feats / self.bg_feats.norm(dim=-1, keepdim=True)  # [2, 512] float32
         del clip_model_1
         torch.cuda.empty_cache()
 
@@ -316,9 +329,13 @@ class GEWithCLIPModel_zhao(nn.Module):
             main_model_feats_dim = main_model.head.fc.in_features
             main_model.head.fc = nn.Identity()
         self.main_model = main_model
+        # main_model: 成员（nn.Module，可学习，float32）；
+        # ResNet-18/50 时为 create_feature_extractor 包装，前向返回字典
+        # {"features": [B, C, H', W']}（C=2048/512，H'=W'=输入边长/32）
 
         # ---------- 融合层 ----------
         fused_dim = irrelevant_feats_dim + relevant_feats_dim + main_model_feats_dim
+        # fuse_model: 成员（nn.Sequential，可学习）；输入 [B, fused_dim]，输出 [B, 3]
         self.fuse_model = nn.Sequential(
             nn.Linear(fused_dim, 256), nn.ReLU(), nn.Linear(256, 3)  # 3D gaze output
         )
@@ -329,42 +346,65 @@ class GEWithCLIPModel_zhao(nn.Module):
         face,
         other_face,
     ):
+        """
+        前向过程（与 GEWithCLIPModel.forward 相同，仅 CNN 分支返回中间特征图）。
+
+        Args:
+            face       : [B, 3, 224, 224] float32，CLIP 预处理后的人脸图像，在 GPU 上。
+            other_face : [B, 3, H, W] float32，CNN 预处理后的人脸图像，在 GPU 上。
+
+        Returns:
+            gaze_pred  : [B, 3] 预测的 3D gaze 向量。
+            sim_label  : [B, 8] 图像与 8 个方向文本的相似度 logits（未 softmax）。
+            feature_1  : [B, 512] 上下文补偿特征（已 L2 归一化）。
+            feature_2  : [B, 512] 任务对齐特征（已 L2 归一化）。
+        """
         # 图像语义特征 + 方向标签特征
+        # img_feats: [B, 512] float32；label_feats: [8, 512] float32
         img_feats = self.encoder_i(face)
         label_feats = self.encoder_t2(self.label_tokens)
 
         # 归一化后计算相似度，选出最高索引
-        img_norm = img_feats / img_feats.norm(dim=-1, keepdim=True)
-        label_norm = label_feats / label_feats.norm(dim=-1, keepdim=True)
+        # 矩阵乘：img_norm [B, 512] @ *.T [512, 3/2/2/8] -> [B, 3/2/2/8]，512 维做内积
+        img_norm = img_feats / img_feats.norm(dim=-1, keepdim=True)        # [B, 512]
+        label_norm = label_feats / label_feats.norm(dim=-1, keepdim=True)  # [8, 512]
 
-        sim_illum = self.logit_scale.exp() * img_norm @ self.illum_norm.T
-        sim_head = self.logit_scale.exp() * img_norm @ self.head_norm.T
-        sim_bg = self.logit_scale.exp() * img_norm @ self.bg_norm.T
+        sim_illum = self.logit_scale.exp() * img_norm @ self.illum_norm.T  # [B, 3]
+        sim_head = self.logit_scale.exp() * img_norm @ self.head_norm.T    # [B, 2]
+        sim_bg = self.logit_scale.exp() * img_norm @ self.bg_norm.T        # [B, 2]
 
+        # clamp 限制温度上限，避免方向标签 logits 过大
         scale = self.logit_scale.exp().clamp(max=10)
-        sim_label = scale * img_norm @ label_norm.T
+        sim_label = scale * img_norm @ label_norm.T                        # [B, 8]
 
+        # argmax 沿属性维（dim=-1）取最匹配属性的索引 -> 各 [B]（int64）
         idx_illum = sim_illum.argmax(dim=-1)
         idx_head = sim_head.argmax(dim=-1)
         idx_bg = sim_bg.argmax(dim=-1)
         idx_label = sim_label.argmax(dim=-1)
+        # 用索引从预计算特征表中取出每个样本最匹配的属性向量 -> 各 [B, 512]
         selected_illum = self.illum_feats[idx_illum]
         selected_head = self.head_feats[idx_head]
         selected_bg = self.bg_feats[idx_bg]
         selected_label = label_feats[idx_label]
 
+        # feature_1: [B, 512]，图像 + 无关属性（光照/头姿/背景），再 L2 归一化
         feature_1 = img_feats + selected_illum + selected_head + selected_bg
         feature_1 = feature_1 / feature_1.norm(dim=-1, keepdim=True)
 
+        # feature_2: [B, 512]，图像 + 视线方向标签，再 L2 归一化
         feature_2 = img_feats + selected_label
         feature_2 = feature_2 / feature_2.norm(dim=-1, keepdim=True)
 
         # 注意：此处 CNN 输出是 create_feature_extractor 返回的字典，
         # 但在此处直接 reshape 会因返回 dict 而出错（保留原代码，实际训练在 train.py 中另行处理）
         # feature_3 = self.main_model(other_face).view(face.size(0), -1)
+        # 注意: 若 main_model 返回 dict（ResNet 分支），此行会抛 AttributeError；
+        #       EdgeNeXt 分支返回张量，形状 [B, C'] -> reshape -> [B, C']
         feature_3 = self.main_model(other_face).reshape(face.size(0), -1)
 
+        # 沿最后一维拼接：[B, 512] + [B, 512] + [B, C'] -> [B, 512+512+C']
         fused = torch.cat([feature_1, feature_2, feature_3], dim=-1)
-        gaze_pred = self.fuse_model(fused)
+        gaze_pred = self.fuse_model(fused)  # [B, 3]
 
         return gaze_pred, sim_label, feature_1, feature_2

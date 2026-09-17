@@ -83,6 +83,7 @@ class Bottleneck(nn.Module):
         self.relu3 = nn.ReLU(inplace=True)
 
         self.downsample = None
+        # stride: 普通成员（int，不可学习），记录下采样倍数，仅构造期使用
         self.stride = stride
 
         # 当需要改变空间尺寸（stride>1）或通道数不匹配时，构造"捷径分支"使残差相加维度一致
@@ -95,16 +96,20 @@ class Bottleneck(nn.Module):
             ]))
 
     def forward(self, x: torch.Tensor):
+        # x: [B, inplanes, H, W]（B 为 batch size，C 通道，H/W 空间高宽）
         # 保存输入作为残差连接的 identity
         identity = x
 
         # 主路径：conv1 -> bn1 -> relu -> conv2 -> bn2 -> relu -> avgpool -> conv3 -> bn3
+        # ->（conv1 降维）-> [B, planes, H, W]
         out = self.relu1(self.bn1(self.conv1(x)))
+        # ->（conv2 + avgpool）-> [B, planes, H', W']（有下采样时 H'=H/stride）
         out = self.relu2(self.bn2(self.conv2(out)))
         out = self.avgpool(out)
+        # ->（conv3 升维）-> [B, planes*4, H', W']
         out = self.bn3(self.conv3(out))
 
-        # 若存在下采样分支，则对 identity 做同样的下采样/通道对齐
+        # 若存在下采样分支，则对 identity 做同样的下采样/通道对齐 -> [B, planes*4, H', W']
         if self.downsample is not None:
             identity = self.downsample(x)
 
@@ -134,11 +139,12 @@ class AttentionPool2d(nn.Module):
         # 输出投影层
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
-        # 说明：positional_embedding 与 Q/K/V/c_proj 的权重均为可学习参数（float32，随模型设备移动）；
         # positional_embedding 形状 [HW+1, embed_dim]，第一行对应 CLS token 的位置编码。
+        # 全部成员均为可学习参数，float32，随模型 .to(device) 移动；生命周期与模型相同。
 
     def forward(self, x):
-        # 输入 x 形状: NCHW，展平空间维并转置为 (HW)NC
+        # x: [B, C, H, W]（H=W=spacial_dim，C=embed_dim）
+        # 输入 x 形状: NCHW，flatten 把 H/W 合并成一维，permute 把空间维移到最前 -> (HW)NC
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
         # 在所有 token 前插入一个全局平均 token 作为查询（CLS token）
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
@@ -169,7 +175,7 @@ class AttentionPool2d(nn.Module):
             training=self.training,
             need_weights=False
         )
-        # 去掉最前面的维度，返回 CLS token 的特征
+        # 去掉最前面的维度，返回 CLS token 的特征 -> [B, output_dim]
         return x.squeeze(0)
 
 
@@ -185,7 +191,9 @@ class ModifiedResNet(nn.Module):
 
     def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
         super().__init__()
+        # output_dim: 普通成员（int，不可学习），最终输出特征维度（= embed_dim）
         self.output_dim = output_dim
+        # input_resolution: 普通成员（int，不可学习），期望输入分辨率（如 224）
         self.input_resolution = input_resolution
 
         # ---- 3 层 stem（茎部）----
@@ -241,13 +249,16 @@ class ModifiedResNet(nn.Module):
 
         # 将输入转换为与权重一致的 dtype（便于 fp16 混合精度训练）
         x = x.type(self.conv1.weight.dtype)
+        # stem: [B, 3, 224, 224] -> [B, width, 56, 56]
         x = stem(x)
-        # 依次通过 4 个残差阶段
+        # 依次通过 4 个残差阶段，空间尺寸逐次减半、通道逐次翻倍：
+        # layer1 -> [B, 256, 56, 56]；layer2 -> [B, 512, 28, 28]；
+        # layer3 -> [B, 1024, 14, 14]；layer4 -> [B, 2048, 7, 7]（width=64 时）
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        # 注意力池化得到最终特征
+        # 注意力池化得到最终特征 -> [B, output_dim]
         x = self.attnpool(x)
 
         return x
@@ -436,6 +447,7 @@ class CLIP(nn.Module):
                  ):
         super().__init__()
 
+        # context_length: 普通成员（int，不可学习），文本最大 token 数（如 77），构造期使用
         self.context_length = context_length
 
         # ---- 选择视觉编码器 ----
@@ -470,8 +482,10 @@ class CLIP(nn.Module):
             attn_mask=self.build_attention_mask()
         )
 
+        # vocab_size: 普通成员（int，不可学习），词表大小，构造期使用
         self.vocab_size = vocab_size
-        # 词嵌入表
+        # 词嵌入表：可学习模块，权重形状 [vocab_size, transformer_width]，float32；
+        # 把 token id（int64）映射为 transformer_width 维稠密向量
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
         # 文本位置编码
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
@@ -564,11 +578,13 @@ class CLIP(nn.Module):
         return x
 
     def forward(self, image, text):
-        # 分别编码图像和文本
+        # image: [B, 3, H, W]；text: [B, n_ctx]（token id，int64）
+        # 分别编码图像和文本 -> 各 [B, embed_dim]
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
 
         # L2 归一化，使特征位于单位超球面上
+        # 广播：norm 结果 [B, 1] 与 [B, embed_dim] 从右往左对齐后逐元素相除
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
