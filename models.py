@@ -22,6 +22,13 @@ models.py
 
 注：在本项目 train.py 中，实际训练时使用 GEWithCLIPModel_zhao 来生成中间特征，
     而最终的 3D gaze 回归由 transformer_models.py 中的 TransformerDeepSeek_gaze 完成。
+
+术语对照（中英对照，全文通用）：
+    - prompt   : 提示词（prompt），引导 CLIP 文本编码器输出特定语义的文本描述。
+    - logits   : 未归一化打分（logits），这里的"相似度 logits"乘了温度系数，未经 softmax。
+    - softmax  : 归一化函数，把打分沿指定维变成和为 1 的概率。
+    - argmax   : 沿指定维取得分最大值的索引（int64），本文件用它挑"最匹配的属性文本"。
+    - broadcast: 广播，形状不同时从最右维向左自动补齐后逐元素运算。
 """
 
 import clip
@@ -108,6 +115,9 @@ class GEWithCLIPModel(nn.Module):
 
         # ---------- 主 CLIP 模型及其编码器 ----------
         self.model = CLIP_MODEL
+        # 注意：encoder_i / encoder_t2 是"绑定方法"而非 nn.Module 子模块，
+        # 不会出现在 self.modules() / state_dict() 中；
+        # CLIP_MODEL 的参数是否参与训练取决于外部对其参数 requires_grad 的设置（本项目中冻结）。
         self.encoder_i = CLIP_MODEL.encode_image   # 图像编码器
         self.encoder_t2 = CLIP_MODEL.encode_text   # 文本编码器
 
@@ -134,7 +144,9 @@ class GEWithCLIPModel(nn.Module):
         self.fuse_model = nn.Sequential(
             nn.Linear(fused_dim, 256), nn.ReLU(), nn.Linear(256, 3)  # 3D gaze output
         )
-        # 复用 CLIP 的可学习温度系数
+        # 复用 CLIP 的可学习温度系数：logit_scale 是与 CLIP 主模型共享的同一个可学习标量
+        # （nn.Parameter，shape=[] 即标量，float32，随模型设备移动）。
+        # 注意：由于共享，训练中对它的更新会同时反映到 CLIP 模型本体（若 CLIP 冻结则它也难以更新）。
         self.logit_scale = CLIP_MODEL.logit_scale
 
     def forward(
@@ -144,17 +156,25 @@ class GEWithCLIPModel(nn.Module):
     ):
         """
         Args:
-            face       : 经过 CLIP 预处理的原始人脸图像。
-            other_face : 经过 CNN 预处理的人脸图像。
+            face       : 输入人脸图像，[B, 3, 224, 224]，float32，已按 CLIP 官方预处理
+                         （resize 到 224、归一化到 [-1,1]），在 GPU 上。
+            other_face : 输入人脸图像，[B, 3, H, W]，float32，已按 CNN 主干的预处理方式处理
+                         （例如 ImageNet 归一化），在 GPU 上。可视为 face 的另一份预处理副本。
 
         Returns:
-            gaze_pred  : [B, 3] 预测的 3D gaze 向量。
-            sim_label  : [B, 8] 图像与 8 个方向文本的相似度 logits。
-            feature_1  : 上下文补偿特征（图像 + 光照/头姿/背景）。
-            feature_2  : 任务对齐特征（图像 + 视线方向标签）。
+            gaze_pred  : [B, 3] float32，预测的 3D gaze 向量。
+            sim_label  : [B, 8] float32，图像与 8 个方向文本的相似度 logits（未 softmax）。
+            feature_1  : [B, 512] float32，上下文补偿特征（图像 + 光照/头姿/背景，已 L2 归一化）。
+            feature_2  : [B, 512] float32，任务对齐特征（图像 + 视线方向标签，已 L2 归一化）。
+
+        Shapes:
+            [B, 3, 224, 224] ->（CLIP）-> [B, 512]；[B, 3, H, W] ->（CNN）-> [B, C']；
+            拼接 [B, 512+512+C'] ->（MLP）-> [B, 3]。
         """
         # ---------- 1. 图像语义特征 + 方向标签特征 ----------
+        # img_feats: [B, 512] float32，CLIP 图像语义向量（B 为 batch size）
         img_feats = self.encoder_i(face)                      # [B, 512]
+        # label_feats: [8, 512] float32，8 个方向提示词的文本特征（8 固定，不随 batch 变化）
         label_feats = self.encoder_t2(self.label_tokens)      # [8, 512]
 
         # L2 归一化后计算余弦相似度
@@ -162,6 +182,8 @@ class GEWithCLIPModel(nn.Module):
         label_norm = label_feats / label_feats.norm(dim=-1, keepdim=True)  # [8, 512]
 
         # 计算图像与各类属性文本的相似度 logits（乘以温度系数）
+        # 矩阵乘：img_norm [B, 512] @ illum_norm.T [512, 3] -> sim_illum [B, 3]，
+        # 512 维做内积，B 当 batch 维；.T 转置把属性维换到最后一维以便对齐。
         sim_illum = self.logit_scale.exp() * img_norm @ self.illum_norm.T  # [B, 3]
         sim_head = self.logit_scale.exp() * img_norm @ self.head_norm.T    # [B, 2]
         sim_bg = self.logit_scale.exp() * img_norm @ self.bg_norm.T        # [B, 2]
@@ -170,7 +192,7 @@ class GEWithCLIPModel(nn.Module):
         scale = self.logit_scale.exp().clamp(max=10)
         sim_label = scale * img_norm @ label_norm.T                        # [B, 8]
 
-        # ---------- 2. 选出相似度最高的属性向量（argmax） ----------
+        # ---------- 2. 选出相似度最高的属性向量（argmax 沿属性维 dim=-1） ----------
         idx_illum = sim_illum.argmax(dim=-1)  # [B]
         idx_head = sim_head.argmax(dim=-1)    # [B]
         idx_bg = sim_bg.argmax(dim=-1)        # [B]

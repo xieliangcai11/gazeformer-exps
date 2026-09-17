@@ -21,6 +21,15 @@ clipmodel.py
     - CLIP                   : 完整的 CLIP 双塔模型（视觉 + 文本）
     - convert_weights        : 将模型参数转换为 fp16
     - build_model            : 根据 state_dict 推断超参并构建模型
+
+术语对照（中英对照，全文通用）：
+    - logits    : 未归一化打分（logits），经 softmax 后才变成概率分布。
+    - mask      : 掩码（mask），用于屏蔽注意力中不应关注的位置，通常被屏蔽处为 -inf。
+    - token     : 词元/图块（token），序列的基本单元：一个词、一个图像块或一个特征向量。
+    - CLS token : 额外拼接在序列开头的全局词元，用于聚合整个序列的信息。
+    - broadcast : 广播（broadcasting），形状不同的张量从最右维向左自动补齐后逐元素运算。
+    - residual  : 残差连接（residual connection），输出 = 输入 + 变换(输入)，利于深层网络训练。
+    - buffer    : 缓冲张量（buffer），随模型保存/随设备移动，但不是可学习参数。
 """
 
 from collections import OrderedDict
@@ -42,6 +51,11 @@ class Bottleneck(nn.Module):
     与标准 torchvision 实现的不同之处：
         - 下采样不使用 stride=2 的卷积，而是用 avgpool 完成（抗混叠，anti-aliasing）。
         - 所有卷积层 stride 均为 1。
+
+    关于 BatchNorm（批归一化）：
+        - 训练时用当前 batch 的均值/方差做归一化，并同步维护滑动平均统计量（running stats）。
+        - 推理时固定使用滑动平均统计量，因此推理前必须调用 model.eval()。
+        - 注意: batch 很小时（如 1~2）训练统计量噪声大，BN 表现会不稳定。
     """
 
     # 每个 Bottleneck 会把通道数扩展为 planes 的 4 倍
@@ -120,6 +134,8 @@ class AttentionPool2d(nn.Module):
         # 输出投影层
         self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
         self.num_heads = num_heads
+        # 说明：positional_embedding 与 Q/K/V/c_proj 的权重均为可学习参数（float32，随模型设备移动）；
+        # positional_embedding 形状 [HW+1, embed_dim]，第一行对应 CLS token 的位置编码。
 
     def forward(self, x):
         # 输入 x 形状: NCHW，展平空间维并转置为 (HW)NC
@@ -128,6 +144,10 @@ class AttentionPool2d(nn.Module):
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
         # 加上位置编码
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        # 注意力原理：Q（query，查询）与每个 K（key，键）算相似度，在 key 维（dim=-1）
+        # 做 softmax 得到权重，再对 V（value，值）加权求和。
+        # 此处 query 只有 1 个（CLS token），key/value 是全部 (HW+1) 个 token，
+        # 因此输出可理解为"全图信息的加权聚合"。
         # 使用 PyTorch 的多头注意力前向函数：
         # query 只取 CLS token（x[:1]），key/value 使用全部 token，从而聚合全局信息
         x, _ = F.multi_head_attention_forward(
@@ -288,6 +308,10 @@ class ResidualAttentionBlock(nn.Module):
     def attention(self, x: torch.Tensor):
         # 将掩码转换到与输入相同的 dtype 和 device
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        # mask（掩码）为"加性掩码"：被屏蔽位置填 -inf，注意力分数加上 -inf 后
+        # 经 softmax（在 key 维 dim=-1 上）权重变为 0。
+        # 文本编码器使用因果掩码（causal mask，下三角形状）：每个 token 只能看到自己之前的 token，
+        # 这是自回归语言建模的标准做法。
         # 自注意力：query=key=value=x，只取输出（不需要注意力权重）
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
@@ -352,6 +376,8 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         # 最终投影层：把 width 维投影到 output_dim（CLIP 中为 512 的统一嵌入空间）
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        # 说明：class_embedding / positional_embedding / proj 都是 nn.Parameter（可学习成员参数，
+        # dtype 为 float32，随 model.to(device) 一起移动；加载官方权重后随 convert_weights 变为 fp16）。
 
     def forward(self, x: torch.Tensor):
         # 打印卷积前输入的均值和标准差（调试用）
@@ -378,6 +404,8 @@ class VisionTransformer(nn.Module):
         # 只取 CLS token（第 0 个 token），再 LayerNorm
         x = self.ln_post(x[:, 0, :])
         # 投影到统一嵌入空间（output_dim 维）
+        # 矩阵乘 x @ self.proj：最后一维 width 与 proj 的第 0 维做乘法，输出 [*, output_dim]；
+        # 其余维（如 batch）当作 batch 维保留。
         if self.proj is not None:
             x = x @ self.proj
         return x
@@ -530,6 +558,7 @@ class CLIP(nn.Module):
         # x.shape = [batch_size, n_ctx, transformer.width]
         # 取每个序列中 EOT（end-of-text）token 位置的特征：
         # text.argmax(dim=-1) 返回每行最大值（EOT token id 最大）的索引
+        # 矩阵乘：[batch_size, width] @ [width, embed_dim]，把宽度维投影到统一嵌入空间
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x
@@ -543,6 +572,10 @@ class CLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
+        # logits（未归一化打分）：对角线位置是"配对"图文对的相似度，非对角是"错配"的。
+        # logit_scale 是可学习标量参数（成员、float32），exp 后作为温度系数的倒数乘在相似度上，
+        # 数值越大，softmax 后的分布越尖锐（越自信）。
+        # 矩阵乘 img @ text^T：[B, embed] 与 [embed, B] 相乘，embed 维做内积，得到 [B, B] 相似度矩阵。
         # 余弦相似度作为 logits（乘以温度系数）
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
