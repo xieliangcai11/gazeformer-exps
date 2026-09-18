@@ -249,6 +249,11 @@ class GEWithCLIPModel_zhao(nn.Module):
         irrelevant_feats_dim=512,
         relevant_feats_dim=512,
     ):
+        """
+        Args:
+            irrelevant_feats_dim (int, 默认 512): 无关特征（feature_1）维度，需等于 CLIP 嵌入维度。
+            relevant_feats_dim (int, 默认 512): 相关特征（feature_2）维度，同上。
+        """
         super().__init__()
 
         # ---------- 文本提示定义（同 GEWithCLIPModel） ----------
