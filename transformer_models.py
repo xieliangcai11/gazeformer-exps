@@ -214,6 +214,16 @@ class FlashAttention(nn.Module):
         self.attention = MHA(embed_dim, num_heads, cross_attn = cross_attn, use_flash_attn = use_flash_attn, return_residual=return_residual)
 
     def forward(self, x, x_kv=None, mask=None):
+        """
+        Args:
+            x: 查询序列，[B, L, embed_dim]，float16/bfloat16（flash_attn 要求半精度）。
+            x_kv: 交叉注意力时的键/值序列，[B, L_kv, embed_dim]，可为 None
+                  （仅自注意力时 None）。
+            mask: 键填充掩码（key_padding_mask），[B, L]，True 表示 padding，可为 None。
+        Returns:
+            注意力输出，[B, L, embed_dim]；若 return_residual 为 True，
+            返回 (输出, x) 二元组。
+        """
         # x: [B, L, embed_dim]；x_kv（交叉注意力时）: [B, L_kv, embed_dim]；输出同 query 长度
         # key_padding_mask（键填充掩码）：形状 [batch, 序列长]，为 True 的位置表示 padding（填充），
         # 注意力会忽略这些位置；与上面 attn_mask 的语义不同。
@@ -243,6 +253,12 @@ class FeedForward(nn.Module):
         # self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
+        """
+        Args:
+            x: 输入张量，[B, L, embed_dim]（或 [..., embed_dim]）。
+        Returns:
+            FFN 输出，形状与输入相同，dtype 同输入。
+        """
         # x: [B, L, embed_dim] -> fc1 -> [B, L, inter_dim] -> SiLU -> fc2 -> [B, L, embed_dim]
         x = F.silu(self.fc1(x))  # Swish/SiLU 激活
         # x = self.dropout(x)
@@ -257,11 +273,22 @@ class Router(nn.Module):
     """
 
     def __init__(self, input_dim, num_experts):
+        """
+        Args:
+            input_dim (int): 输入特征维度。
+            num_experts (int): 专家（可路由目标）数量。
+        """
         super(Router, self).__init__()
         # 门控线性层：input_dim -> num_experts
         self.gating = nn.Linear(input_dim, num_experts)
 
     def forward(self, x):
+        """
+        Args:
+            x: 输入特征，[N, input_dim]（N 为样本数）。
+        Returns:
+            专家选择概率，[N, num_experts] float，每个样本所有专家概率和为 1。
+        """
         # x: [N, input_dim]（N 为样本数）
         # 计算专家 logits（未归一化打分）
         expert_logits = self.gating(x)  # Shape: [batch_size, num_experts]
@@ -578,6 +605,14 @@ class TransformerBlock(nn.Module):
     """
 
     def __init__(self, embed_dim, num_heads, ff_dim, num_experts, capacity):
+        """
+        Args:
+            embed_dim (int): token 特征维度。
+            num_heads (int): 注意力头数。
+            ff_dim (int): （未使用的 FFN 中间维度，当前 MoE 分支未用到）。
+            num_experts (int): MoE 专家数量。
+            capacity (int): 每个输入激活的 top-k 专家数。
+        """
         super(TransformerBlock, self).__init__()
         # self_attn / cross_attn: 可学习成员（Attention），自注意力与交叉注意力
         self.self_attn = Attention(embed_dim, num_heads)   # 自注意力
@@ -592,6 +627,14 @@ class TransformerBlock(nn.Module):
         self.norm3 = RMSNorm(embed_dim, eps=1e-5)
 
     def forward(self, x, cross_input, mask=None):
+        """
+        Args:
+            x: 主序列，[B, L, embed_dim]。
+            cross_input: 交叉注意力的 K/V 来源，[B, L_kv, embed_dim]，不可为 None。
+            mask: 可选注意力掩码，传给内部 Attention，可为 None。
+        Returns:
+            编码后的序列，[B, L, embed_dim]，dtype 同输入。
+        """
         # x / cross_input: [B, L, embed_dim]；cross_input 为交叉注意力的 K/V 来源
         # 自注意力 + 残差 + 归一化
         attn_output = self.self_attn(x, x, x, mask)
@@ -666,6 +709,16 @@ class Transformer(nn.Module):
     """
 
     def __init__(self, num_layers, embed_dim, num_heads, ff_dim, num_experts, capacity, seq_length):
+        """
+        Args:
+            num_layers (int): TransformerBlock 层数。
+            embed_dim (int): token 特征维度。
+            num_heads (int): 注意力头数。
+            ff_dim (int): FFN 中间维度（当前未实际使用）。
+            num_experts (int): MoE 专家数量。
+            capacity (int): 每个输入激活的 top-k 专家数。
+            seq_length (int): 序列长度（被旧实现当作词表大小使用）。
+        """
         super(Transformer, self).__init__()
         # 嵌入层（把 token 索引映射为 embed_dim 向量）
         self.embedding = nn.Embedding(seq_length, embed_dim)
@@ -678,6 +731,14 @@ class Transformer(nn.Module):
         ])
 
     def forward(self, x, cross_input, mask=None):
+        """
+        Args:
+            x: token 索引序列，[B, L]，int64（作为 embedding 的输入）。
+            cross_input: 交叉注意力的 K/V 序列，[B, L_kv, embed_dim]。
+            mask: 可选注意力掩码，可为 None。
+        Returns:
+            逐层编码后的序列，[B, L, embed_dim]，dtype 同 embedding 输出。
+        """
         # 词嵌入 + 位置编码
         x = self.embedding(x) + self.pos_embedding(x)
 
@@ -697,6 +758,18 @@ class Block(nn.Module):
     """
 
     def __init__(self, embed_dim, num_heads, n_routed_experts, n_activated_experts, n_shared_experts, moe_inter_dim, inter_dim = 10944, layer_id=None):
+        """
+        Args:
+            embed_dim (int): token 特征维度。
+            num_heads (int): 注意力头数。
+            n_routed_experts (int): MoE 路由专家总数。
+            n_activated_experts (int): 每个输入激活的专家数（top-k）。
+            n_shared_experts (int): 共享专家数量。
+            moe_inter_dim (int): 每个路由专家的中间维度。
+            inter_dim (int, 默认 10944): dense FFN 的中间维度（浅层用）。
+            layer_id (int, 可为 None): 当前层序号；小于 n_dense_layers 用 FFN，
+                否则用 MoE；None 时强制用 MoE。
+        """
         super(Block, self).__init__()
         # self_attn: 可学习成员（Attention），该块唯一的注意力模块（自/交叉共用）
         self.self_attn = Attention(embed_dim, num_heads)
@@ -720,6 +793,15 @@ class Block(nn.Module):
         self.norm3 = RMSNorm(embed_dim, eps=1e-5)
 
     def forward(self, x, cross_input=None, mask=None):
+        """
+        Args:
+            x: 主序列，[B, L, embed_dim]。
+            cross_input: 交叉注意力的 K/V 序列，[B, L_kv, embed_dim]，可为 None
+                         （None 时走自注意力）。
+            mask: 可选注意力掩码，可为 None。
+        Returns:
+            编码后的序列，[B, L, embed_dim]，dtype 同输入。
+        """
         # x: [B, L, embed_dim]；cross_input: 交叉注意力的 K/V 序列（None 则自注意力）
         # Pre-Norm 后做注意力
         x_norm = self.norm1(x)
@@ -762,6 +844,20 @@ class BlockMoba(nn.Module):
         moba_chunk_size=5,
         moba_topk=2
     ):
+        """
+        Args:
+            embed_dim (int): token 特征维度。
+            num_heads (int): 注意力头数。
+            n_routed_experts (int): MoE 路由专家总数。
+            n_activated_experts (int): 每个输入激活的专家数（top-k）。
+            n_shared_experts (int): 共享专家数量。
+            moe_inter_dim (int): 每个路由专家的中间维度。
+            inter_dim (int, 默认 10944): dense FFN 的中间维度（浅层用）。
+            layer_id (int, 可为 None): 层序号；小于 n_dense_layers(9) 用 FFN，
+                否则用 MoE；None 时强制用 MoE。
+            moba_chunk_size (int, 默认 5): MoBA 块大小（当前未真正使用）。
+            moba_topk (int, 默认 2): MoBA top-k（当前未真正使用）。
+        """
         super(BlockMoba, self).__init__()
         # embed_dim / num_heads: 普通成员（int，不可学习），前向中用于多头拆分
         self.embed_dim = embed_dim
@@ -879,6 +975,20 @@ class TransformerDeepSeek_gaze(nn.Module):
         out_dim=3,
         dropout_rate=0.1
     ):
+        """
+        Args:
+            num_layers (int): BlockMoba 层数。
+            embed_dim (int): 保留参数（当前未实际使用，各层均用 d_model）。
+            inter_dim (int): BlockMoba 中 dense FFN 的中间维度。
+            num_heads (int): 每层注意力的头数。
+            n_routed_experts (int): MoE 路由专家总数。
+            n_activated_experts (int): 每个输入激活的专家数（top-k）。
+            n_shared_experts (int): 共享专家数量。
+            moe_inter_dim (int): 每个路由专家的中间维度。
+            d_model (int, 默认 768): 统一 token 维度（所有特征投影到此维度）。
+            out_dim (int, 默认 3): 输出维度（3D gaze 向量）。
+            dropout_rate (float, 默认 0.1): Dropout 置零概率。
+        """
         super().__init__()
         # d_model: 普通成员（int，不可学习），统一 token 维度
         self.d_model = d_model
@@ -919,6 +1029,18 @@ class TransformerDeepSeek_gaze(nn.Module):
         self.linear_head = nn.Linear(d_model, out_dim)
 
     def forward(self, raw_inputs, mask=None):
+        """
+        Args:
+            raw_inputs (dict): 特征字典，键及对应张量：
+                - "feature_1": [B, 512] float32，CLIP 上下文补偿特征（必需）。
+                - "feature_2": [B, 512] float32，CLIP 任务对齐特征（必需）。
+                - "feature_3": [B, N, 2048] float32，CNN 特征图 token（必需）。
+                - "token_img_patch": [B, P, d_model] float32，ViT patch token（可选，
+                  键不存在或值为 None 时跳过）。
+            mask: 可选注意力掩码，传给各层 BlockMoba，可为 None。
+        Returns:
+            gaze 向量，[B, 3] float32。
+        """
         # ---------- 1. 各特征投影并构造成 token ----------
         # feature_1/feature_2：投影到 d_model 后 unsqueeze(1) 在序列维插入长度 1，
         # 得到各 1 个 token：[B, 512] -> [B, 1, d_model]；每个 token 都过 Dropout

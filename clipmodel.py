@@ -62,6 +62,12 @@ class Bottleneck(nn.Module):
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1):
+        """
+        Args:
+            inplanes (int): 输入通道数。
+            planes (int): 瓶颈中间通道数（输出通道为 planes*4）。
+            stride (int, 默认 1): 空间下采样倍数，>1 时启用 avgpool 下采样与捷径分支。
+        """
         super().__init__()
 
         # 第一个 1x1 卷积：把输入通道 inplanes 压缩到 planes（降维）
@@ -96,6 +102,13 @@ class Bottleneck(nn.Module):
             ]))
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: 输入特征图，[B, inplanes, H, W]，float32/fp16。
+        Returns:
+            输出特征图，[B, planes*4, H', W']（有下采样时 H'=H/stride，否则同输入），
+            dtype 与输入一致。
+        """
         # x: [B, inplanes, H, W]（B 为 batch size，C 通道，H/W 空间高宽）
         # 保存输入作为残差连接的 identity
         identity = x
@@ -129,6 +142,13 @@ class AttentionPool2d(nn.Module):
     """
 
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
+        """
+        Args:
+            spacial_dim (int): 特征图边长（pool 前的空间尺寸，如 7）。
+            embed_dim (int): 输入特征通道数。
+            num_heads (int): 注意力头数。
+            output_dim (int, 可为 None): 输出特征维度；None 时等于 embed_dim。
+        """
         super().__init__()
         # 位置编码：spacial_dim^2 个空间位置 + 1 个 CLS token
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
@@ -143,6 +163,12 @@ class AttentionPool2d(nn.Module):
         # 全部成员均为可学习参数，float32，随模型 .to(device) 移动；生命周期与模型相同。
 
     def forward(self, x):
+        """
+        Args:
+            x: 输入特征图，[B, C, H, W]，C=embed_dim，H=W=spacial_dim，float32/fp16。
+        Returns:
+            聚合后的全局特征，[B, output_dim]，dtype 同输入。
+        """
         # x: [B, C, H, W]（H=W=spacial_dim，C=embed_dim）
         # 输入 x 形状: NCHW，flatten 把 H/W 合并成一维，permute 把空间维移到最前 -> (HW)NC
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
@@ -190,6 +216,15 @@ class ModifiedResNet(nn.Module):
     """
 
     def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
+        """
+        Args:
+            layers (tuple[int, int, int, int]): 4 个残差阶段各自的 Bottleneck 数量，
+                如 (3, 4, 6, 3) 对应 RN50。
+            output_dim (int): 最终输出特征维度（= CLIP 的 embed_dim，通常 512）。
+            heads (int): 末尾注意力池化的头数。
+            input_resolution (int, 默认 224): 期望输入图像边长。
+            width (int, 默认 64): stem 的基础通道数。
+        """
         super().__init__()
         # output_dim: 普通成员（int，不可学习），最终输出特征维度（= embed_dim）
         self.output_dim = output_dim
@@ -228,6 +263,13 @@ class ModifiedResNet(nn.Module):
         """
         构造一个残差阶段：第一个 Bottleneck 可能带 stride（用于下采样），
         其余 blocks-1 个 Bottleneck 保持尺寸不变。
+
+        Args:
+            planes (int): 该阶段瓶颈中间通道数（输出为 planes*4）。
+            blocks (int): 该阶段 Bottleneck 数量。
+            stride (int, 默认 1): 第一个 Bottleneck 的下采样倍数。
+        Returns:
+            nn.Sequential: 由 blocks 个 Bottleneck 组成的残差阶段。
         """
         layers = [Bottleneck(self._inplanes, planes, stride)]
 
@@ -239,6 +281,12 @@ class ModifiedResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        """
+        Args:
+            x: 输入图像，[B, 3, input_resolution, input_resolution]，float32/fp16。
+        Returns:
+            全局图像特征，[B, output_dim]，dtype 同模型权重（fp16 模型返回 fp16）。
+        """
         # 内部函数：执行 3 层 stem
         def stem(x):
             x = self.relu1(self.bn1(self.conv1(x)))
@@ -272,6 +320,12 @@ class LayerNorm(nn.LayerNorm):
     """
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: 任意形状/dtype 的输入张量。
+        Returns:
+            LayerNorm 后的张量，形状与输入相同，dtype 与输入相同。
+        """
         orig_type = x.dtype
         ret = super().forward(x.type(torch.float32))
         return ret.type(orig_type)
@@ -285,6 +339,12 @@ class QuickGELU(nn.Module):
     """
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: 任意形状的输入张量（逐元素作用）。
+        Returns:
+            QuickGELU 激活后的张量，形状与 dtype 同输入。
+        """
         return x * torch.sigmoid(1.702 * x)
 
 
@@ -299,6 +359,13 @@ class ResidualAttentionBlock(nn.Module):
     """
 
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+        """
+        Args:
+            d_model (int): token 特征维度。
+            n_head (int): 注意力头数（d_model 需能被 n_head 整除）。
+            attn_mask (torch.Tensor, 可为 None): 加性注意力掩码，
+                形状 [L, L]，被屏蔽处为 -inf；文本编码器传入因果掩码。
+        """
         super().__init__()
 
         # 多头自注意力
@@ -317,6 +384,12 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
+        """
+        Args:
+            x: 输入序列，[L, B, d_model]（LND 布局），float32/fp16。
+        Returns:
+            自注意力输出，[L, B, d_model]，dtype 同输入。
+        """
         # 将掩码转换到与输入相同的 dtype 和 device
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         # mask（掩码）为"加性掩码"：被屏蔽位置填 -inf，注意力分数加上 -inf 后
@@ -327,6 +400,12 @@ class ResidualAttentionBlock(nn.Module):
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: 输入序列，[L, B, d_model]。
+        Returns:
+            经过 自注意力+MLP 两个残差子层后的序列，[L, B, d_model]，dtype 同输入。
+        """
         # 第一残差：自注意力
         x = x + self.attention(self.ln_1(x))
         # 第二残差：MLP
@@ -340,6 +419,13 @@ class Transformer(nn.Module):
     """
 
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+        """
+        Args:
+            width (int): token 特征维度（d_model）。
+            layers (int): 残差注意力块数量。
+            heads (int): 每块注意力头数。
+            attn_mask (torch.Tensor, 可为 None): 加性掩码 [L, L]，None 表示不屏蔽。
+        """
         super().__init__()
         self.width = width
         self.layers = layers
@@ -347,6 +433,12 @@ class Transformer(nn.Module):
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: 输入序列，[L, B, width]，LND 布局。
+        Returns:
+            逐块编码后的序列，[L, B, width]，dtype 同输入。
+        """
         return self.resblocks(x)
 
 
@@ -361,6 +453,15 @@ class VisionTransformer(nn.Module):
     """
 
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+        """
+        Args:
+            input_resolution (int): 输入图像边长（如 224）。
+            patch_size (int): 每个图像块（patch）的边长（ViT-B/32 为 32）。
+            width (int): token 特征维度（ViT-B/32 为 768）。
+            layers (int): Transformer 层数。
+            heads (int): 每层注意力头数。
+            output_dim (int): 输出嵌入维度（统一嵌入空间，通常 512）。
+        """
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
@@ -391,6 +492,12 @@ class VisionTransformer(nn.Module):
         # dtype 为 float32，随 model.to(device) 一起移动；加载官方权重后随 convert_weights 变为 fp16）。
 
     def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: 输入图像，[B, 3, input_resolution, input_resolution]，float32/fp16。
+        Returns:
+            图像语义向量，[B, output_dim]，dtype 同模型权重（fp16 模型返回 fp16）。
+        """
         # 打印卷积前输入的均值和标准差（调试用）
         print("Before conv1: ", x.mean().item(), x.std().item())
         x = self.conv1(x)  # shape = [*, width, grid, grid]
@@ -445,6 +552,20 @@ class CLIP(nn.Module):
                  transformer_heads: int,
                  transformer_layers: int
                  ):
+        """
+        Args:
+            embed_dim (int): 图像/文本统一嵌入维度（通常 512）。
+            image_resolution (int): 视觉编码器期望的输入图像边长（如 224）。
+            vision_layers (tuple[int,...] 或 int): ResNet 变体为 4 元组（各 stage 块数），
+                ViT 变体为 int（层数）。
+            vision_width (int): 视觉编码器基础宽度（ResNet stem 宽度 / ViT token 维度）。
+            vision_patch_size (int): ViT 的 patch 边长；ResNet 变体传 None。
+            context_length (int): 文本最大 token 数（通常 77）。
+            vocab_size (int): 词表大小。
+            transformer_width (int): 文本 Transformer 的 token 维度。
+            transformer_heads (int): 文本 Transformer 每层注意力头数。
+            transformer_layers (int): 文本 Transformer 层数。
+        """
         super().__init__()
 
         # context_length: 普通成员（int，不可学习），文本最大 token 数（如 77），构造期使用
@@ -501,6 +622,10 @@ class CLIP(nn.Module):
         self.initialize_parameters()
 
     def initialize_parameters(self):
+        """
+        初始化所有可学习参数（词嵌入、位置编码、注意力投影、MLP、bn3 的 gamma 等）。
+        无参数、无返回值；仅在构造期调用一次。
+        """
         # 词嵌入与位置编码初始化
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
@@ -539,6 +664,10 @@ class CLIP(nn.Module):
         """
         构造因果注意力掩码（下三角掩码）。
         PyTorch 使用"加性"掩码，因此用 -inf 填充上三角（被屏蔽的位置）。
+
+        Returns:
+            mask: [context_length, context_length] 的 float32 张量，
+                  下三角为 0（可见），上三角为 -inf（屏蔽）；不参与学习（非 Parameter）。
         """
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
@@ -551,10 +680,23 @@ class CLIP(nn.Module):
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image):
+        """
+        Args:
+            image: 预处理后的图像，[B, 3, H, W]，float32 或 fp16（内部自动对齐模型 dtype）。
+        Returns:
+            图像语义向量，[B, embed_dim]，dtype 同模型权重。
+        """
         # 图像编码：先把输入转成模型 dtype，再送入视觉编码器
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
+        """
+        Args:
+            text: token id 序列，[batch_size, n_ctx]，int64（由 clip.tokenize 生成，
+                  已 padding 到固定长度 n_ctx=context_length）。
+        Returns:
+            文本语义向量，[batch_size, embed_dim]，dtype 同模型权重。
+        """
         # text: [batch_size, n_ctx] 的 token id 序列
         # 词嵌入 -> [batch_size, n_ctx, d_model]
         x = self.token_embedding(text).type(self.dtype)
@@ -578,6 +720,15 @@ class CLIP(nn.Module):
         return x
 
     def forward(self, image, text):
+        """
+        Args:
+            image: 图像张量，[B, 3, H, W]，float32/fp16。
+            text: token id 序列，[B, n_ctx]，int64。
+        Returns:
+            logits_per_image: [B, B] float，行 i 是第 i 张图与所有文本的相似度打分。
+            logits_per_text: [B, B] float，前一者的转置。
+            （对角线位置为配对图文对，对比学习训练时以此为监督信号。）
+        """
         # image: [B, 3, H, W]；text: [B, n_ctx]（token id，int64）
         # 分别编码图像和文本 -> 各 [B, embed_dim]
         image_features = self.encode_image(image)
