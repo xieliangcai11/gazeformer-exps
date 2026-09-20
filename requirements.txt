@@ -1,0 +1,12 @@
+torch
+torchvision
+clip @ git+https://github.com/openai/CLIP.git
+scipy
+timm
+easydict
+ftfy
+regex
+opencv-python
+numpy
+tqdm
+wandb

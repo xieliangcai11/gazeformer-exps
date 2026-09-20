@@ -23,7 +23,10 @@ TEST_DATASET_NAME = "Gaze360"
 IS_TRAIN = False
 TEST_EPOCH = 50
 TEST_CHECKPOINT = f"epoch_{TEST_EPOCH}.pth"
-DATASETS_PATH = Path("datasets")
+# 数据根目录（GazeHub 结构：<data>/<数据集名>/GazeHub/{Image,Label}）。
+# 数据集子目录名必须与 TRAIN_DATASET_NAME / TEST_DATASET_NAME 完全一致（即 Gaze360），
+# 故 Gaze360 数据需位于 data/Gaze360/GazeHub/ 下。
+DATASETS_PATH = Path("data")
 # TRAIN_IMAGES_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image"/"train"
 # TEST_IMAGES_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Image"/"test"
 TRAIN_IMAGES_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image"
@@ -46,7 +49,7 @@ ABLA_CONFIG = {
     'use_feature_4': True,  
 }
 NUM_EPOCHS = 50
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 TEST_STEP = 10
 SAVE_STEP = 10
 NUM_WORKERS = 0

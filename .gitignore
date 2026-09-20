@@ -1,0 +1,18 @@
+# 原始数据与预处理产物（体积大，不入版本库）
+gaze360/
+data/
+.tmp_meta/
+datasets/
+
+# Python
+__pycache__/
+*.pyc
+
+# 训练产物
+out/
+log/
+checkpoints/
+runs/
+wheels/
+*.pt
+*.pth
