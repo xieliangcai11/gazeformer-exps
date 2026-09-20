@@ -54,7 +54,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from flash_attn.modules.mha import MHA
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 # from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
@@ -70,6 +73,31 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 world_size = 1
 rank = 0
 
+class MHA(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, bias=True, batch_first=True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+        
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+    
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        # PyTorch原生SDPA，自动启用Flash Attention加速
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0
+        )
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, N, C)
+        
+        return self.out_proj(attn_out)
 
 @dataclass
 class ModelArgs:
