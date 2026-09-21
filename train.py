@@ -176,9 +176,9 @@ if __name__ == "__main__":
     def _label_file(p: Path, name: str):
         return p / name
 
-    train_images_path = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image" / "train"
-    val_images_path = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image" / "val"
-    test_images_path = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Image" / "test"
+    train_images_path = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image" 
+    val_images_path = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image" 
+    test_images_path = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Image" 
 
     train_label_file = _label_file(TRAIN_LABELS_PATH, "train.label")
     val_label_file = _label_file(TRAIN_LABELS_PATH, "val.label")
