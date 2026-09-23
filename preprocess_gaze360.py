@@ -42,6 +42,7 @@ def ImageProcessing_Gaze360():
         outfiles[i].write("Face Left Right Origin 3DGaze 2DGaze\n")
 
     # process each image
+    missing_imgs = []
     for i in range(total_num):
         im_path = os.path.join(root, "imgs",
             recordings[0, recording_index[0, i]][0],
@@ -49,7 +50,7 @@ def ImageProcessing_Gaze360():
             '%06d.jpg' % frame_index[0, i]
             )
 
-       	progressbar = "".join(["\033[41m%s\033[0m" % '   '] * int(i/total_num * 20))
+        progressbar = "".join(["\033[41m%s\033[0m" % '   '] * int(i/total_num * 20))
         progressbar = "\r" + progressbar + f" {i}|{total_num}"
         print(progressbar, end = "", flush=True)
         if (face_bbox[i] == np.array([-1, -1, -1, -1])).all():
@@ -59,6 +60,10 @@ def ImageProcessing_Gaze360():
         gaze = gazes[i]
 
         img = cv2.imread(im_path)
+        if img is None:
+            missing_imgs.append(im_path)
+            continue
+
         face = CropFaceImg(img, head_bbox[i], face_bbox[i])
         lefteye = CropEyeImg(img, head_bbox[i], lefteye_bbox[i])
         righteye = CropEyeImg(img, head_bbox[i], righteye_bbox[i]) 
@@ -84,6 +89,13 @@ def ImageProcessing_Gaze360():
 
     for i in outfiles:
         i.close()
+
+    if missing_imgs:
+        print("\n跳过图片缺失/损坏: %d 张" % len(missing_imgs))
+        for p in missing_imgs[:10]:
+            print("  [缺失] " + str(p))
+    else:
+        print("\n图片全部读取成功，无缺失/损坏")
     #
 
 def GazeTo2d(gaze):
