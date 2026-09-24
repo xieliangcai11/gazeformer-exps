@@ -19,10 +19,10 @@ from gazehub_datasets import (
 )
 from config import *
 import torch.optim as optim
-from utils import leave_one_out, one
-from models import GEWithCLIPModel_zhao as GEWithCLIPModel
+from util.utils import leave_one_out, one
+from model.models import GEWithCLIPModel_zhao as GEWithCLIPModel
 import torch.nn as nn
-from transformer_models import TransformerDeepSeek_gaze
+from model.transformer_models import TransformerDeepSeek_gaze
 import math
 import os
 from datetime import datetime
