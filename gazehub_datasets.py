@@ -9,7 +9,7 @@ import cv2
 from easydict import EasyDict as edict
 import copy
 from config import *
-from utils import *
+from util.utils import *
 
 # dataset by GazeHub
 
