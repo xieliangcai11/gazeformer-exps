@@ -1,6 +1,4 @@
 
-is_ablation = False  # 消融实验标志，True时不保存checkpoint
-
 import numpy as np
 import torch
 
@@ -18,6 +16,7 @@ from gazehub_datasets import (
     DatasetETHXGazeByGazeHub,
 )
 from config import *
+is_ablation = False  # 消融实验标志，True时不保存checkpoint；此处显式覆盖 config 的默认值
 import torch.optim as optim
 from util.utils import leave_one_out, one
 from model.models import GEWithCLIPModel_zhao as GEWithCLIPModel
@@ -343,7 +342,8 @@ if __name__ == "__main__":
             best_model_path = f"checkpoints/best—separate-added_{TRAIN_DATASET_NAME}.pt"
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': transformer_model.state_dict(),
+                'model_state_dict': model.state_dict(),                      # GEWithCLIPModel_zhao 全套（main_model + fuse_model + CLIP）
+                'transformer_state_dict': transformer_model.state_dict(),    # TransformerDeepSeek_gaze
                 'optimizer_state_dict': optimizer.state_dict(),
                 'mean_test_angle': best_angle
             }, best_model_path)
