@@ -9,19 +9,19 @@ if torch.cuda.is_available():
     print(f"当前GPU设备: {torch.cuda.get_device_name(0)}")
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
-from gazehub_datasets import (
+from gazelab.datasets import (
     DatasetMPIIFaceGazeByGazeHub,
     DatasetEyeDiapByGazeHub,
     DatasetGaze360ByGazeHub,
     DatasetETHXGazeByGazeHub,
 )
-from config import *
+from gazelab.config import *
 is_ablation = False  # 消融实验标志，True时不保存checkpoint；此处显式覆盖 config 的默认值
 import torch.optim as optim
-from util.utils import leave_one_out, one
-from model.models import GEWithCLIPModel_zhao as GEWithCLIPModel
+from gazelab.utils.common import leave_one_out, one
+from gazelab.models.gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
 import torch.nn as nn
-from model.transformer_models import TransformerDeepSeek_gaze
+from gazelab.models.transformers import TransformerDeepSeek_gaze
 import math
 import os
 from datetime import datetime

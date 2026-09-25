@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gazelab"
+version = "0.1.0"
+description = "Gaze estimation framework: CLIP semantic priors + CNN features + MoE Transformer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "xieliangcai11" }]
+dependencies = [
+    "torch",
+    "torchvision",
+    "scipy",
+    "timm",
+    "easydict",
+    "opencv-python",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+inference = ["mediapipe"]
+logging = ["wandb", "tensorboard"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"gazelab" = ["py.typed"]
+
+[project.scripts]
+gazelab-train = "scripts.train:main"
+gazelab-predict = "gazelab.predict:main"

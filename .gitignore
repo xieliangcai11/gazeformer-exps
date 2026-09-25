@@ -1,18 +1,33 @@
-# 原始数据与预处理产物（体积大，不入版本库）
+# ---- 原始数据与预处理产物（体积大，不入版本库）----
 gaze360/
 data/
 .tmp_meta/
 datasets/
 
-# Python
+# ---- Python ----
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
 
-# 训练产物
+# ---- 训练/运行产物 ----
 out/
 log/
+logs/
 checkpoints/
 runs/
 wheels/
+experiments/*.pt
 *.pt
 *.pth
+
+# ---- 推理输出 ----
+*_gaze.png
+
+# ---- 环境/工具 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store

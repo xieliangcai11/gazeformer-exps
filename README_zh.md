@@ -1,99 +1,163 @@
-# GazeFormer：基于 CLIP 与 MoE Transformer 的上下文感知视线估计
+# Gazelab
 
-> 一个用于 3D 视线估计的 PyTorch 框架，通过混合专家（MoE）Transformer 将 CLIP 的语义先验与视觉特征相融合。
+> 3D 视线估计（Gaze Estimation）研究框架：融合 CLIP 语义先验、CNN 视觉特征与 MoE Transformer。
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
-本仓库包含 **GazeFormer** 的官方实现。
+## 项目简介
 
-## 核心特性
+Gazelab 是一个**模块化、可扩展**的视线估计研究框架。核心思想是用 CLIP 的图文语义能力，
+为一张人脸补充"光照 / 头姿 / 背景 / 视线方向"等属性先验，再与 CNN 提取的视觉特征融合，
+经 MoE Transformer 回归 3D 视线方向。
 
-- **文本条件特征融合：** 利用针对光照、头部姿态、视线方向等属性的文本提示，动态引导与视线相关的特征提取。
-- **多源 Token 聚合：** 采用混合专家（MoE）Transformer 架构，融合来自 CLIP 的语义嵌入、CNN 骨干网络的空间特征以及原始图像块（patch）Token。
-- **跨数据集泛化能力：** 针对多个标准视线数据集（Gaze360、ETH-XGaze、MPIIFaceGaze、EyeDiap）设计并验证了鲁棒性，只需极少的改动即可迁移。
-- **便于消融实验：** 通过集中的 `ABLA_CONFIG` 配置即可轻松开启或关闭不同的特征流（`feature_1` 至 `feature_4`），便于进行可控实验。
+设计目标是让"换模型、换数据集、加新功能"都尽可能低成本：
 
-## 架构概览
+- 模型放在 `src/gazelab/models/`，新增一个文件即可接入
+- 数据集适配在 `src/gazelab/datasets.py`
+- 训练 / 测试 / 推理 / 预处理各自独立入口在 `scripts/`
+- 支持多实验目录 `experiments/`
 
-GazeFormer 通过三条并行流处理人脸图像，随后将其 Token 化并送入 Transformer，完成最终的 3D 视线回归。
+---
 
-1.  **CLIP 语义流：** 使用冻结的 CLIP 模型对输入图像和一组文本提示进行编码。通过余弦相似度选出最相关的文本属性嵌入（例如 "一张光线明亮的脸"、"一张望向左侧的脸"），并与图像嵌入相融合，从而生成与任务对齐且经过上下文补偿的特征。
-2.  **CNN 视觉流：** 使用标准 CNN 骨干网络（如 ResNet-50）提取丰富的空间特征图，提供强大的视觉几何先验。
-3.  **融合 Transformer：** 将上述各流的输出投影到统一的 Token 空间。由混合专家（MoE）层增强的 Transformer 对这些 Token 进行聚合，预测最终的 3D 视线向量。
+## 目录结构
 
-## 环境搭建
+```
+gazelab/
+├── src/gazelab/            # 核心包
+│   ├── config.py           # 全局配置（数据集/模型/超参）
+│   ├── datasets.py         # 数据集适配层（Gaze360 / ETH-XGaze / MPIIFaceGaze / EyeDiap）
+│   ├── preprocess.py       # 数据预处理（Gaze360 -> GazeHub 标准格式）
+│   ├── verify.py           # 数据校验
+│   ├── predict.py          # 单图推理 + 箭头可视化（CLI）
+│   ├── models/
+│   │   ├── gazeformer.py   # 主模型：CLIP 语义融合（GEWithCLIPModel / _zhao）
+│   │   ├── transformers.py # MoE Transformer：特征 -> 3D 视线
+│   │   └── clipmodel.py    # CLIP 相关
+│   └── utils/
+│       ├── common.py       # 通用工具（leave_one_out 等）
+│       └── loggers.py      # 日志（TensorBoard / wandb）
+├── scripts/
+│   ├── train.py            # 训练入口
+│   └── train_test.py       # 测试入口
+├── assets/                 # 推理用检测模型（mediapipe / Haar）
+├── configs/                # （预留）配置定义
+├── experiments/            # （预留）多模型 / 多实验
+├── tests/                  # （预留）测试
+├── docs/                   # 文档
+├── pyproject.toml          # 包定义
+└── requirements.txt        # 依赖
+```
 
-### 1. 环境要求
+---
+
+## 安装
+
+### 1. 环境
 
 - Python 3.10+
-- PyTorch 1.2.1+
-- CUDA 11.3+
+- PyTorch（CUDA 版）
+- 建议使用 conda
 
-### 2. 安装
-
-克隆本仓库并安装所需依赖：
+### 2. 安装依赖
 
 ```bash
-git clone https://github.com/your-username/Gazeformer_submission.git
-cd Gazeformer_submission
-pip install -r requirements.txt
+pip install -e .                    # 安装 gazelab 包（editable）
+pip install -r requirements.txt     # 依赖（torch/clip/scipy/timm 等）
+pip install mediapipe               # 推理可选：人脸关键点检测
 ```
 
-`requirements.txt` 应包含以下内容：
+---
 
-```
-torch
-torchvision
-timm
-easydict
-ftfy
-regex
-opencv-python
-numpy
-tqdm
-wandb
-git+https://github.com/openai/CLIP.git
-```
+## 快速开始
 
-### 3. 数据集
+> 注意：`config.py` 中的数据路径是相对**项目根目录**的相对路径，
+> 请从 `gazelab/` 根目录运行以下命令。
 
-下载所需数据集，并按照 GazeHub 的约定进行组织：
+### 单图推理（预测视线 + 画箭头）
 
-```
-datasets/
-├── Gaze360/
-│   └── GazeHub/
-│       ├── Image/
-│       └── Label/
-├── ETH-XGaze/
-│   └── GazeHub/
-│       ├── Image/
-│       └── Label/
-...
+```bash
+python -m gazelab.predict --image 你的图片.jpg
+# 或
+conda run -n dl python -m gazelab.predict --image 你的图片.jpg \
+    --checkpoint checkpoints/best—separate-added_Gaze360.pt \
+    --out result.png
 ```
 
-如果你的目录结构不同，请相应修改 `config.py` 中的路径。
+输出：原图 + 从双眼中心指向视线方向的红色箭头，另打印 3D 视线向量、yaw/pitch。
 
-## 使用方法
+### 数据预处理
+
+```bash
+python -m gazelab.preprocess --input-dir ./gaze360 --output-dir ./data/Gaze360
+```
 
 ### 训练
 
-主训练脚本 `train.py` 负责数据集加载、模型初始化以及训练循环。
-
-运行以下命令开始训练：
-
 ```bash
-python train.py
+python scripts/train.py
 ```
 
-- **配置：** 修改 `config.py` 以设置超参数、选择数据集（`TRAIN_DATASET_NAME`、`TEST_DATASET_NAME`）以及选择 CNN 骨干网络（`CNN_MODEL`）。
-- **消融实验：** 通过编辑 `config.py` 中的 `ABLA_CONFIG` 字典来启用或禁用各特征流。
-- **日志记录：** 训练过程和验证结果会记录到 `log/` 目录，并可通过 TensorBoard 进行监控。
+### 测试
 
-### 评估
+```bash
+python scripts/train_test.py
+```
 
-训练过程中会定期在验证集上对模型进行评估。如需单独进行评估，通常是加载一个检查点（checkpoint）并运行测试循环。
+---
+
+## 模型架构
+
+Gazelab 的 gaze 估计分两个阶段：
+
+1. **特征提取（`models/gazeformer.py`）**
+   - 冻结的 CLIP 编码人脸图像与一组文本提示（光照 / 头姿 / 背景 / 视线方向）
+   - 用余弦相似度选出最匹配的属性向量，与图像特征融合
+   - 得到 `feature_1`（环境：光照+头姿+背景）与 `feature_2`（视线方向）
+   - CNN（如 ResNet-50）提取局部特征图 `feature_3`
+
+2. **回归（`models/transformers.py`）**
+   - 各特征投影成 token 序列，前置 CLS token
+   - 多层 DeepSeek 风格 Block（自注意力 + 交叉注意力 + MoE）
+   - 取 CLS token 经线性头回归 3D 视线方向
+
+训练用 `angular_loss`（角度差）为主，可选 `feature_separation_loss` 辅助。
+
+---
+
+## 扩展指南
+
+### 新增模型
+
+在 `src/gazelab/models/` 新建一个文件，实现 `nn.Module`，并在入口脚本中替换 import 即可。
+
+### 新增数据集
+
+在 `src/gazelab/datasets.py` 新增一个 `Dataset` 子类（参考已有实现），
+并在 `config.py` 中设置 `TRAIN_DATASET_NAME` / `TEST_DATASET_NAME`。
+
+### 消融实验
+
+通过 `config.py` 的 `ABLA_CONFIG` 开关各特征流（`use_feature_1` ~ `use_feature_4`）。
+
+---
+
+## 目录约定
+
+| 目录 | 用途 |
+|---|---|
+| `data/` | 数据集（GazeHub 格式，gitignore 忽略） |
+| `checkpoints/` | 模型权重（gitignore 忽略） |
+| `log/` | 训练日志 |
+| `assets/` | 推理检测模型（需提交） |
+| `experiments/` | 多实验 / 多模型结果 |
+| `docs/` | 项目文档 |
+
+---
+
+## License
+
+MIT
