@@ -27,11 +27,10 @@ Gazelab 是一个**模块化、可扩展**的视线估计研究框架。核心�
 
 ```
 gazelab/
+├── configs/
+│   └── config.py           # 全局配置（数据集/模型/超参）
 ├── src/gazelab/            # 核心包
-│   ├── config.py           # 全局配置（数据集/模型/超参）
 │   ├── datasets.py         # 数据集适配层（Gaze360 / ETH-XGaze / MPIIFaceGaze / EyeDiap）
-│   ├── preprocess.py       # 数据预处理（Gaze360 -> GazeHub 标准格式）
-│   ├── verify.py           # 数据校验
 │   ├── predict.py          # 单图推理 + 箭头可视化（CLI）
 │   ├── models/
 │   │   ├── gazeformer.py   # 主模型：CLIP 语义融合（GEWithCLIPModel / _zhao）
@@ -40,11 +39,14 @@ gazelab/
 │   └── utils/
 │       ├── common.py       # 通用工具（leave_one_out 等）
 │       └── loggers.py      # 日志（TensorBoard / wandb）
+├── tools/
+│   └── data/               # 数据处理脚本
+│       ├── preprocess.py   # 数据预处理（Gaze360 -> GazeHub 标准格式）
+│       └── verify.py       # 数据校验
 ├── scripts/
 │   ├── train.py            # 训练入口
 │   └── train_test.py       # 测试入口
 ├── assets/                 # 推理用检测模型（mediapipe / Haar）
-├── configs/                # （预留）配置定义
 ├── experiments/            # （预留）多模型 / 多实验
 ├── tests/                  # （预留）测试
 ├── docs/                   # 文档
@@ -74,7 +76,7 @@ pip install mediapipe               # 推理可选：人脸关键点检测
 
 ## 快速开始
 
-> 注意：`config.py` 中的数据路径是相对**项目根目录**的相对路径，
+> 注意：`configs/config.py` 中的数据路径是相对**项目根目录**的相对路径，
 > 请从 `gazelab/` 根目录运行以下命令。
 
 ### 单图推理（预测视线 + 画箭头）
@@ -92,7 +94,7 @@ conda run -n dl python -m gazelab.predict --image 你的图片.jpg \
 ### 数据预处理
 
 ```bash
-python -m gazelab.preprocess --input-dir ./gaze360 --output-dir ./data/Gaze360
+python tools/data/preprocess.py --input-dir ./gaze360 --output-dir ./data/Gaze360
 ```
 
 ### 训练
@@ -137,11 +139,11 @@ Gazelab 的 gaze 估计分两个阶段：
 ### 新增数据集
 
 在 `src/gazelab/datasets.py` 新增一个 `Dataset` 子类（参考已有实现），
-并在 `config.py` 中设置 `TRAIN_DATASET_NAME` / `TEST_DATASET_NAME`。
+并在 `configs/config.py` 中设置 `TRAIN_DATASET_NAME` / `TEST_DATASET_NAME`。
 
 ### 消融实验
 
-通过 `config.py` 的 `ABLA_CONFIG` 开关各特征流（`use_feature_1` ~ `use_feature_4`）。
+通过 `configs/config.py` 的 `ABLA_CONFIG` 开关各特征流（`use_feature_1` ~ `use_feature_4`）。
 
 ---
 

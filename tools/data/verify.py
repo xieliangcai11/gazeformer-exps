@@ -25,7 +25,7 @@ from collections import Counter
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from gazelab.config import CLIP_PREPROCESS, CNN_PREPROCESS, BATCH_SIZE, NUM_WORKERS
+from configs.config import CLIP_PREPROCESS, CNN_PREPROCESS, BATCH_SIZE, NUM_WORKERS
 from gazelab.datasets import DatasetGaze360ByGazeHub
 
 SPLITS = ("train", "val", "test")

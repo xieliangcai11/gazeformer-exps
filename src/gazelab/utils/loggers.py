@@ -1,6 +1,6 @@
 import os
 import wandb
-from gazelab.config import *
+from configs.config import *
 from torch.utils.tensorboard import SummaryWriter
 from typing import Tuple, Callable
 

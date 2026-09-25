@@ -37,7 +37,7 @@ import torch.nn as nn
 from torchvision import models
 import copy
 import timm
-from gazelab.config import *
+from configs.config import *
 from torchvision.models.feature_extraction import create_feature_extractor
 
 

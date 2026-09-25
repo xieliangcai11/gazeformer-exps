@@ -26,7 +26,8 @@ inference = ["mediapipe"]
 logging = ["wandb", "tensorboard"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["gazelab*", "configs*", "tools*"]
 
 [tool.setuptools.package-data]
 "gazelab" = ["py.typed"]
