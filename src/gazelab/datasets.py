@@ -14,6 +14,12 @@ from gazelab.utils.common import *
 # dataset by GazeHub
 
 
+def _to_tensor_label(label):
+    """目标变换：把 label 转成 torch.Tensor。用命名函数而非 lambda，
+    以便 DataLoader 多进程(num_workers>0)能 pickle 数据集。"""
+    return torch.tensor(label)
+
+
 class DatasetMPIIFaceGazeByGazeHub(Dataset):
     __transform = transforms.Compose(
         [
@@ -21,7 +27,7 @@ class DatasetMPIIFaceGazeByGazeHub(Dataset):
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ]
     )
-    __target_transform = lambda label: torch.tensor(label)
+    __target_transform = _to_tensor_label
     if TRAIN_DATASET_NAME == "Gaze360" and TEST_DATASET_NAME == "MPIIFaceGaze":
         __coefficients = np.array([-1, -1, 1])
     else:
@@ -98,7 +104,7 @@ class DatasetEyeDiapByGazeHub(Dataset):
     transforms.ToTensor(),
     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
-    __target_transform = lambda label: torch.tensor(label)
+    __target_transform = _to_tensor_label
     if TRAIN_DATASET_NAME == "Gaze360" and TEST_DATASET_NAME == "EyeDiap":
         __coefficients = np.array([-1, -1, 1])
     else:
@@ -170,7 +176,7 @@ class DatasetETHXGazeByGazeHub(Dataset):
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ]
     )
-    __target_transform = lambda label: torch.tensor(label)
+    __target_transform = _to_tensor_label
 
     def __init__(
         self,
