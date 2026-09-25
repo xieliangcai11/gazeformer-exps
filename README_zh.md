@@ -76,8 +76,9 @@ pip install mediapipe               # 推理可选：人脸关键点检测
 
 ## 快速开始
 
-> 注意：`configs/config.py` 中的数据路径是相对**项目根目录**的相对路径，
-> 请从 `gazelab/` 根目录运行以下命令。
+> `configs/config.py` 中的数据路径已基于项目根目录自动推导，
+> 训练/推理脚本也带路径引导，因此**可以从任意目录运行**以下命令。
+> 若用 `python -m gazelab.predict`，需先 `pip install -e .` 或设 `PYTHONPATH=src`。
 
 ### 单图推理（预测视线 + 画箭头）
 
