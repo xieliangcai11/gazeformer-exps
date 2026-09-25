@@ -1,5 +1,12 @@
 # imports, GLOBAL_PARAMS, some that can be placed in the front
 
+import sys
+from pathlib import Path
+# ---- 路径引导：确保从任意工作目录都能导入 gazelab / configs / tools ----
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import torch
 import numpy as np
@@ -11,15 +18,15 @@ from easydict import EasyDict as edict
 from tqdm import tqdm
 import random
 import os
-from loggers import get_tensorboard_writer
-from utils import gaze_dir_3d_to_class, leave_one_out, one
+from gazelab.utils.loggers import get_tensorboard_writer
+from gazelab.utils.common import gaze_dir_3d_to_class, leave_one_out, one
 # from gazehub_datasets import (
 #     DatasetMPIIFaceGazeByGazeHub,
 #     DatasetEyeDiapByGazeHub,
 #     DatasetGaze360ByGazeHub,
 #     DatasetETHXGazeByGazeHub,
 # )
-from models import GEWithCLIPModel
+from gazelab.models.gazeformer import GEWithCLIPModel
 from configs.config import *
 from torch.utils.tensorboard import SummaryWriter
 
