@@ -47,7 +47,7 @@ from configs.config import DEVICE, CNN_PREPROCESS, ABLA_CONFIG
 from gazelab.models.gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
 from gazelab.models.transformers import TransformerDeepSeek_gaze
 
-CHECKPOINT_DEFAULT = "checkpoints/best—separate-added_Gaze360.pt"
+CHECKPOINT_DEFAULT = str(_PROJECT_ROOT / "checkpoints" / "best—separate-added_Gaze360.pt")
 ARROW_LEN_DEFAULT = 120
 
 
@@ -67,7 +67,7 @@ class FaceEyeDetector:
 
     # ---- mediapipe ----
     def _init_mediapipe(self):
-        mp_model = "assets/face_landmarker.task"
+        mp_model = str(_PROJECT_ROOT / "assets" / "face_landmarker.task")
         if not os.path.exists(mp_model):
             print("[提示] mediapipe 模型文件缺失，回退 Haar 检测：", mp_model)
             return
@@ -91,12 +91,12 @@ class FaceEyeDetector:
     # ---- Haar ----
     def _init_haar(self):
         face_names = [
-            "assets/haarcascade_frontalface_default.xml",
+            str(_PROJECT_ROOT / "assets" / "haarcascade_frontalface_default.xml"),
             os.path.join(os.path.dirname(cv2.__file__), "data",
                          "haarcascade_frontalface_default.xml"),
         ]
         eye_names = [
-            "assets/haarcascade_eye.xml",
+            str(_PROJECT_ROOT / "assets" / "haarcascade_eye.xml"),
             os.path.join(os.path.dirname(cv2.__file__), "data",
                          "haarcascade_eye.xml"),
         ]

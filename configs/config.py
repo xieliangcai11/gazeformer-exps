@@ -3,6 +3,8 @@ import torch
 import clip
 from torchvision.transforms import transforms
 
+# 项目根目录 = 本文件(configs/config.py)的上两级；使路径不依赖运行 CWD
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # MPIIFaceGaze
 # EyeDiap
@@ -26,7 +28,7 @@ TEST_CHECKPOINT = f"epoch_{TEST_EPOCH}.pth"
 # 数据根目录（GazeHub 结构：<data>/<数据集名>/GazeHub/{Image,Label}）。
 # 数据集子目录名必须与 TRAIN_DATASET_NAME / TEST_DATASET_NAME 完全一致（即 Gaze360），
 # 故 Gaze360 数据需位于 data/Gaze360/GazeHub/ 下。
-DATASETS_PATH = Path("data")
+DATASETS_PATH = _PROJECT_ROOT / "data"
 # TRAIN_IMAGES_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image"/"train"
 # TEST_IMAGES_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Image"/"test"
 TRAIN_IMAGES_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image"
@@ -36,7 +38,7 @@ TRAIN_LABELS_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Label"
 TEST_LABELS_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Label"
 # TRAIN_LABELS_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Label"
 # TEST_LABELS_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Label"
-OUT_PATH = Path("out")
+OUT_PATH = _PROJECT_ROOT / "out"
 CHECKPOINTS_PATH = OUT_PATH / "checkpoints"
 LOGS_PATH = OUT_PATH / "logs"
 RUNS_PATH = OUT_PATH / "runs"
