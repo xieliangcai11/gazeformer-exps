@@ -20,7 +20,7 @@ from utils import gaze_dir_3d_to_class, leave_one_out, one
 #     DatasetETHXGazeByGazeHub,
 # )
 from models import GEWithCLIPModel
-from gazelab.config import *
+from configs.config import *
 from torch.utils.tensorboard import SummaryWriter
 
 

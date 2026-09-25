@@ -36,7 +36,7 @@ import cv2
 import numpy as np
 import torch
 
-from gazelab.config import DEVICE, CNN_PREPROCESS, ABLA_CONFIG
+from configs.config import DEVICE, CNN_PREPROCESS, ABLA_CONFIG
 from gazelab.models.gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
 from gazelab.models.transformers import TransformerDeepSeek_gaze
 
@@ -320,7 +320,7 @@ def predict_single_image(image_path, ckpt_path, out_path, arrow_len):
     # 2. 预处理
     from PIL import Image
     face_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
-    from gazelab.config import CLIP_PREPROCESS
+    from configs.config import CLIP_PREPROCESS
     face_t = CLIP_PREPROCESS(face_pil).unsqueeze(0).to(DEVICE)
     other_face_t = CNN_PREPROCESS(face_pil).unsqueeze(0).to(DEVICE)
 

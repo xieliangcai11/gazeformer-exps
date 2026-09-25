@@ -15,7 +15,7 @@ from gazelab.datasets import (
     DatasetGaze360ByGazeHub,
     DatasetETHXGazeByGazeHub,
 )
-from gazelab.config import *
+from configs.config import *
 is_ablation = False  # 消融实验标志，True时不保存checkpoint；此处显式覆盖 config 的默认值
 import torch.optim as optim
 from gazelab.utils.common import leave_one_out, one

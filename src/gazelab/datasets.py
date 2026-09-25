@@ -8,7 +8,7 @@ from typing import Callable, Optional
 import cv2
 from easydict import EasyDict as edict
 import copy
-from gazelab.config import *
+from configs.config import *
 from gazelab.utils.common import *
 
 # dataset by GazeHub
