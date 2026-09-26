@@ -23,11 +23,11 @@ from gazelab.datasets import (
     DatasetGaze360ByGazeHub,
     DatasetETHXGazeByGazeHub,
 )
-from configs.config import *
+from configs.gaze360_config import *
 is_ablation = False  # 消融实验标志，True时不保存checkpoint；此处显式覆盖 config 的默认值
 import torch.optim as optim
 from gazelab.utils.common import leave_one_out, one
-from gazelab.models.gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
+from gazelab.models.gaze360_gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
 import torch.nn as nn
 from gazelab.models.transformers import TransformerDeepSeek_gaze
 import math

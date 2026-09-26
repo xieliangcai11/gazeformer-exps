@@ -26,8 +26,8 @@ from gazelab.utils.common import gaze_dir_3d_to_class, leave_one_out, one
 #     DatasetGaze360ByGazeHub,
 #     DatasetETHXGazeByGazeHub,
 # )
-from gazelab.models.gazeformer import GEWithCLIPModel
-from configs.config import *
+from gazelab.models.gaze360_gazeformer import GEWithCLIPModel
+from configs.gaze360_config import *
 from torch.utils.tensorboard import SummaryWriter
 
 

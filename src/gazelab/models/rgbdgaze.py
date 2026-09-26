@@ -18,7 +18,7 @@ from torchvision import models
 import timm
 from torchvision.models.feature_extraction import create_feature_extractor
 
-from configs.config import CLIP_MODEL, CNN_MODEL, DEVICE
+from configs.gaze360_config import CLIP_MODEL, CNN_MODEL, DEVICE
 import clip
 
 
