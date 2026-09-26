@@ -37,7 +37,7 @@ def _to_tensor_label(label):
 
 # ---- 图像预处理（numpy BGR -> torch tensor） ----
 # RGB 用 ImageNet 归一化（与 CLIP 编码器输入约定不同，CLIP 用自身 preprocess；
-# 这里给出两套：clip 归一化（CLIP_PREPROCESS 在 configs.config 中，需要 PIL）与
+# 这里给出两套：clip 归一化（CLIP_PREPROCESS 在 configs.gaze360_config 中，需要 PIL）与
 # CNN 风格。为避免依赖 PIL，这里用 numpy 版实现（ToTensor + Normalize）。
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)

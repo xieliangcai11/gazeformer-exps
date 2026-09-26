@@ -35,7 +35,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from configs.config import DEVICE as DEFAULT_DEVICE
+from configs.gaze360_config import DEVICE as DEFAULT_DEVICE
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
 from gazelab.datasets.rgbdgaze import (RGBDGazeDataset, rgb_preprocess,
                                        depth_preprocess)
