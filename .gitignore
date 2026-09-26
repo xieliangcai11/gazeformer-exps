@@ -2,7 +2,7 @@
 gaze360/
 /data/
 .tmp_meta/
-datasets/
+/datasets/
 
 # ---- Python ----
 __pycache__/
