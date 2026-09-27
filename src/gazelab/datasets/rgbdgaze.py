@@ -95,6 +95,21 @@ class RGBDGazeDataset(Dataset):
             target_transform if target_transform is not None else _to_tensor_label
         )
 
+        # 每样本的"像素 -> 厘米"换算系数（来自 index，用于把预测误差转成物理 cm）
+        try:
+            self.cm_px = np.array(
+                [[float(r["cm_px_x"]), float(r["cm_px_y"])] for r in self.rows],
+                dtype=np.float32,
+            )
+            self.screen_size = np.array(
+                [[float(r["screen_w"]), float(r["screen_h"])] for r in self.rows],
+                dtype=np.int32,
+            )
+        except KeyError:
+            # 旧版 index 无 cm 列时退化为近似（角标）
+            self.cm_px = np.full((len(self.rows), 2), 0.0182, dtype=np.float32)
+            self.screen_size = np.ones((len(self.rows), 2), dtype=np.int32)
+
     def __len__(self):
         return len(self.rows)
 
