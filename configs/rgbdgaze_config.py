@@ -45,5 +45,8 @@ CROP_MARGIN = 1.2
 # 标签归一化：2D 屏幕坐标。true 则除以屏幕尺寸归一化到 [0,1]
 NORMALIZE_GAZE = True
 
+# 用户眼睛到屏幕中心的基准距离（正视），用于把屏幕坐标误差换算成视线角度
+VIEWING_DISTANCE_CM = 30.0
+
 # 归一化后 gaze 目标范围（用于回归，配合 sigmoid/tanh 或直接回归）
 # 若 NORMALIZE_GAZE: 目标在 [0,1] 左右
