@@ -113,17 +113,22 @@ def main():
 
     train_dl = build_dataloader("train", index_dir, args.batch_size, True,
                                 args.num_workers)
+    val_dl = build_dataloader("val", index_dir, args.batch_size, False,
+                              args.num_workers)
     test_dl = build_dataloader("test", index_dir, args.batch_size, False,
                                args.num_workers)
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    n_train, n_test = len(train_dl.dataset), len(test_dl.dataset)
+    n_train, n_val, n_test = (len(train_dl.dataset), len(val_dl.dataset),
+                              len(test_dl.dataset))
     header = (f"{'='*60}\n"
               f"  RGBDGaze 训练启动\n"
-              f"  训练集: {n_train} 样本 / 测试集: {n_test} 样本\n"
+              f"  训练集: {n_train} 样本 / 验证集: {n_val} 样本 / 测试集: {n_test} 样本\n"
               f"  batch_size: {args.batch_size}  epochs: {args.epochs}\n"
               f"  学习率: {args.lr}  设备: {device}\n"
               f"  模型参数: {sum(p.numel() for p in model.parameters()):,}\n"
+              f"  选模型依据: 每 epoch 用 val 集评估，best 存 checkpoints\n"
+              f"  最终评估: 训练结束后用 test 集独立评估\n"
               f"{'='*60}")
 
     def emit(msg):
@@ -133,7 +138,7 @@ def main():
     emit(header)
     emit(f"[rgbdgaze] 写入: log -> {log_file} | checkpoint -> {save_dir}")
 
-    best_test = float("inf")
+    best_val = float("inf")
     for epoch in range(args.epochs):
         epoch_t0 = time.time()
         model.train()
@@ -156,44 +161,74 @@ def main():
                        f"loss {loss.item():.6f}  lr {lr_now:.2e}  "
                        f"{time.time()-epoch_t0:.1f}s")
                 emit(msg)
-                epoch_t0 = time.time()  # 计时归零便于看 step 间隔
+                epoch_t0 = time.time()
 
-        # 测试
+        # 每 epoch 用验证集评估（据此选 best，避免测试集泄漏）
         model.eval()
-        test_err = 0.0
-        test_err_x = 0.0
-        test_err_y = 0.0
+        val_err = 0.0
+        val_err_x = 0.0
+        val_err_y = 0.0
         cnt = 0
-        t_test = time.time()
+        t_val = time.time()
         with torch.no_grad():
-            for inp, label in test_dl:
+            for inp, label in val_dl:
                 face = inp.face.to(device).float()
                 depth = inp.other_face.to(device).float()
                 label = label.to(device)
                 pred = model(face, depth)
                 diff = (pred - label)
-                test_err += diff.norm(dim=-1).sum().item()
-                test_err_x += diff[:, 0].abs().sum().item()
-                test_err_y += diff[:, 1].abs().sum().item()
+                val_err += diff.norm(dim=-1).sum().item()
+                val_err_x += diff[:, 0].abs().sum().item()
+                val_err_y += diff[:, 1].abs().sum().item()
                 cnt += label.size(0)
 
         mean_train = run_loss / max(n_step, 1)
-        mean_err = test_err / max(cnt, 1)
-        mean_err_x = test_err_x / max(cnt, 1)
-        mean_err_y = test_err_y / max(cnt, 1)
+        mean_val = val_err / max(cnt, 1)
+        mean_val_x = val_err_x / max(cnt, 1)
+        mean_val_y = val_err_y / max(cnt, 1)
         saved = ""
-        if mean_err < best_test:
-            best_test = mean_err
-            ckpt_name = f"best_{args.epochs}ep.pt"
+        if mean_val < best_val:
+            best_val = mean_val
+            ckpt_name = "best.pt"
             torch.save(model.state_dict(), os.path.join(save_dir, ckpt_name))
-            saved = f"  [保存 best → {ckpt_name} ({mean_err:.4f})]"
+            saved = f"  [保存 best → {ckpt_name} (val {mean_val:.4f})]"
 
         msg = (f"[epoch {epoch}]  train_loss {mean_train:.6f}  "
-               f"test_L2 {mean_err:.4f} (x:{mean_err_x:.4f} y:{mean_err_y:.4f})  "
-               f"测试耗时 {time.time()-t_test:.1f}s{saved}")
+               f"val_L2 {mean_val:.4f} (x:{mean_val_x:.4f} y:{mean_val_y:.4f})  "
+               f"验证耗时 {time.time()-t_val:.1f}s{saved}")
         emit(msg)
 
-    emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best test_L2 = {best_test:.4f}")
+    # ---- 训练结束：用测试集做最终独立评估（加载 best 权重） ----
+    emit("=" * 60)
+    emit("[final] 用验证集最优权重在测试集上做最终评估...")
+    best_ckpt = os.path.join(save_dir, "best.pt")
+    if os.path.exists(best_ckpt):
+        model.load_state_dict(torch.load(best_ckpt, map_location=device,
+                                         weights_only=False))
+    model.eval()
+    test_err = 0.0
+    test_err_x = 0.0
+    test_err_y = 0.0
+    cnt = 0
+    with torch.no_grad():
+        for inp, label in test_dl:
+            face = inp.face.to(device).float()
+            depth = inp.other_face.to(device).float()
+            label = label.to(device)
+            pred = model(face, depth)
+            diff = (pred - label)
+            test_err += diff.norm(dim=-1).sum().item()
+            test_err_x += diff[:, 0].abs().sum().item()
+            test_err_y += diff[:, 1].abs().sum().item()
+            cnt += label.size(0)
+    mean_test = test_err / max(cnt, 1)
+    mean_test_x = test_err_x / max(cnt, 1)
+    mean_test_y = test_err_y / max(cnt, 1)
+    emit(f"[final] test_L2 {mean_test:.4f} (x:{mean_test_x:.4f} y:{mean_test_y:.4f}) "
+         f"样本 {cnt}")
+    emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best val_L2 = {best_val:.4f}，"
+         f"最终 test_L2 = {mean_test:.4f}")
+    emit("=" * 60)
 
 
 if __name__ == "__main__":
