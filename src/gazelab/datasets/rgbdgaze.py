@@ -116,16 +116,20 @@ class RGBDGazeDataset(Dataset):
     def _make_face_pair(self, rgb_path, depth_path, bbox_xywh):
         """读 RGB + depth，用人脸 bbox 各裁一帧返回 dict
 
-        注：RGB 与 depth 都是原图，bbox 坐标是在 RGB 分辨率上的。
-        depth 图分辨率不同，按比例缩放 bbox。
+        重要：原始 RGB/depth 图是横向存储的，但作者 bbox 坐标基于
+        逆时针旋转 90° 后的竖图。故先对两图都 np.rot90(img, 1)，再按
+        作者 bbox 裁剪（bbox 即竖图坐标），depth 再按旋转后尺寸比例缩放。
         返回 (rgb_224, depth_224) 均 resize 成 IMAGE_SIZE。
         """
         rgb = cv2.imread(str(rgb_path))
         depth = cv2.imread(str(depth_path))
 
-        # 本轮先把裁剪逻辑放这里，供 preprocess 与推理复用同一份
+        # 图片需逆时针旋转 90°（作者 bbox 基于竖图坐标系）
+        rgb = np.rot90(rgb, 1)
+        depth = np.rot90(depth, 1)
+
         rgb_face = self._crop(rgb, bbox_xywh, rgb.shape[1], rgb.shape[0])
-        # depth 分辨率缩放
+        # depth 分辨率缩放（相对旋转后的尺寸）
         dw, dh = depth.shape[1], depth.shape[0]
         sc = (dw / rgb.shape[1], dh / rgb.shape[0])
         bx, by, bw, bh = bbox_xywh
