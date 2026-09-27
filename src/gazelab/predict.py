@@ -43,11 +43,14 @@ import cv2
 import numpy as np
 import torch
 
-from configs.gaze360_config import DEVICE, CNN_PREPROCESS, ABLA_CONFIG
+from configs.gaze360_config import DEVICE, CNN_PREPROCESS, ABLA_CONFIG, experiment_dirs
 from gazelab.models.gaze360_gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
 from gazelab.models.transformers import TransformerDeepSeek_gaze
 
-CHECKPOINT_DEFAULT = str(_PROJECT_ROOT / "checkpoints" / "best—separate-added_Gaze360.pt")
+# 默认权重路径：out/gaze360/train/checkpoints/（与训练输出规范一致）
+CHECKPOINT_DEFAULT = str(
+    experiment_dirs("gaze360", "train")["checkpoint"] / "best—separate-added_Gaze360.pt"
+)
 ARROW_LEN_DEFAULT = 120
 
 
