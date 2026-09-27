@@ -33,6 +33,7 @@ for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import time
 from torch.utils.data import DataLoader
 
 from datetime import datetime
@@ -82,6 +83,8 @@ def parse():
     p.add_argument("--device", default="auto")
     p.add_argument("--save-dir", default=None,
                    help="权重输出目录（默认 out/rgbdgaze/train/checkpoints）")
+    p.add_argument("--num-workers", type=int, default=4,
+                   help="DataLoader 工作进程数（默认 4）")
     return p.parse_args()
 
 
@@ -108,19 +111,34 @@ def main():
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    train_dl = build_dataloader("train", index_dir, args.batch_size, True)
-    test_dl = build_dataloader("test", index_dir, args.batch_size, False)
+    train_dl = build_dataloader("train", index_dir, args.batch_size, True,
+                                args.num_workers)
+    test_dl = build_dataloader("test", index_dir, args.batch_size, False,
+                               args.num_workers)
 
     save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[rgbdgaze] 训练集 {len(train_dl.dataset)} 样本 / 测试集 "
-          f"{len(test_dl.dataset)} 样本")
-    print(f"[rgbdgaze] 模型参数: {sum(p.numel() for p in model.parameters()):,}")
-    write_log(f"[rgbdgaze] 训练集 {len(train_dl.dataset)} 样本 / 测试集 {len(test_dl.dataset)} 样本")
+    n_train, n_test = len(train_dl.dataset), len(test_dl.dataset)
+    header = (f"{'='*60}\n"
+              f"  RGBDGaze 训练启动\n"
+              f"  训练集: {n_train} 样本 / 测试集: {n_test} 样本\n"
+              f"  batch_size: {args.batch_size}  epochs: {args.epochs}\n"
+              f"  学习率: {args.lr}  设备: {device}\n"
+              f"  模型参数: {sum(p.numel() for p in model.parameters()):,}\n"
+              f"{'='*60}")
+
+    def emit(msg):
+        print(msg)
+        write_log(msg)
+
+    emit(header)
+    emit(f"[rgbdgaze] 写入: log -> {log_file} | checkpoint -> {save_dir}")
 
     best_test = float("inf")
     for epoch in range(args.epochs):
+        epoch_t0 = time.time()
         model.train()
         run_loss = 0.0
+        n_step = 0
         for i, (inp, label) in enumerate(train_dl):
             face = inp.face.to(device).float()
             depth = inp.other_face.to(device).float()
@@ -131,28 +149,51 @@ def main():
             loss.backward()
             optimizer.step()
             run_loss += loss.item()
-            if i % 50 == 0:
-                print(f"[{epoch}] step {i} loss {loss.item():.6f}")
+            n_step += 1
+            if i % 50 == 0 or i == len(train_dl) - 1:
+                lr_now = optimizer.param_groups[0]["lr"]
+                msg = (f"[epoch {epoch}] step {i}/{len(train_dl)}  "
+                       f"loss {loss.item():.6f}  lr {lr_now:.2e}  "
+                       f"{time.time()-epoch_t0:.1f}s")
+                emit(msg)
+                epoch_t0 = time.time()  # 计时归零便于看 step 间隔
+
         # 测试
         model.eval()
         test_err = 0.0
+        test_err_x = 0.0
+        test_err_y = 0.0
         cnt = 0
+        t_test = time.time()
         with torch.no_grad():
             for inp, label in test_dl:
                 face = inp.face.to(device).float()
                 depth = inp.other_face.to(device).float()
                 label = label.to(device)
                 pred = model(face, depth)
-                err = (pred - label).norm(dim=-1).sum().item()
-                test_err += err
+                diff = (pred - label)
+                test_err += diff.norm(dim=-1).sum().item()
+                test_err_x += diff[:, 0].abs().sum().item()
+                test_err_y += diff[:, 1].abs().sum().item()
                 cnt += label.size(0)
+
+        mean_train = run_loss / max(n_step, 1)
         mean_err = test_err / max(cnt, 1)
-        print(f"[{epoch}] train_loss {run_loss/len(train_dl):.6f} "
-              f"test_mean_L2 {mean_err:.4f}")
+        mean_err_x = test_err_x / max(cnt, 1)
+        mean_err_y = test_err_y / max(cnt, 1)
+        saved = ""
         if mean_err < best_test:
             best_test = mean_err
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "best.pt"))
-            print(f"  saved best ({mean_err:.4f})")
+            ckpt_name = f"best_{args.epochs}ep.pt"
+            torch.save(model.state_dict(), os.path.join(save_dir, ckpt_name))
+            saved = f"  [保存 best → {ckpt_name} ({mean_err:.4f})]"
+
+        msg = (f"[epoch {epoch}]  train_loss {mean_train:.6f}  "
+               f"test_L2 {mean_err:.4f} (x:{mean_err_x:.4f} y:{mean_err_y:.4f})  "
+               f"测试耗时 {time.time()-t_test:.1f}s{saved}")
+        emit(msg)
+
+    emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best test_L2 = {best_test:.4f}")
 
 
 if __name__ == "__main__":
