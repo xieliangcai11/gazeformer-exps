@@ -275,9 +275,11 @@ if __name__ == "__main__":
     )
 
 
-    os.makedirs("log", exist_ok=True)
+# 输出目录统一到 out/gaze360/train/{logs,checkpoints}（experiment_dirs 定义）
+    run_dirs = experiment_dirs(TRAIN_DATASET_NAME.lower(), "train")
     log_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = f"log/{log_time}_{TRAIN_DATASET_NAME}-{TEST_DATASET_NAME}_log.txt"
+    log_path = run_dirs["log"] / f"{log_time}_{TRAIN_DATASET_NAME}_{TEST_DATASET_NAME}_log.txt"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
 
     def write_log(msg):
@@ -285,7 +287,7 @@ if __name__ == "__main__":
             f.write(msg + "\n")
 
 
-    os.makedirs("checkpoints", exist_ok=True)
+    run_dirs["checkpoint"].mkdir(parents=True, exist_ok=True)
     best_angle = float('inf')
     best_model_path = None
     scaler = GradScaler()
@@ -347,7 +349,7 @@ if __name__ == "__main__":
         # 保存最佳模型（非消融实验时才保存）
         if not is_ablation and mean_test_angle < best_angle:
             best_angle = mean_test_angle
-            best_model_path = f"checkpoints/best—separate-added_{TRAIN_DATASET_NAME}.pt"
+            best_model_path = run_dirs["checkpoint"] / f"best—separate-added_{TRAIN_DATASET_NAME}.pt"
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),                      # GEWithCLIPModel_zhao 全套（main_model + fuse_model + CLIP）

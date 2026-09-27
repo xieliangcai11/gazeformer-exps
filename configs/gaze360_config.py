@@ -42,6 +42,24 @@ OUT_PATH = _PROJECT_ROOT / "out"
 CHECKPOINTS_PATH = OUT_PATH / "checkpoints"
 LOGS_PATH = OUT_PATH / "logs"
 RUNS_PATH = OUT_PATH / "runs"
+
+
+def experiment_dirs(dataset: str, task: str) -> dict:
+    """返回按数据集+任务分层的输出目录。
+
+    规范：out/<dataset>/<task>/{logs, checkpoints, runs}
+      - out/gaze360/train/{logs, checkpoints, runs}
+      - out/rgbdgaze/train/{logs, checkpoints, runs}
+
+    各脚本请用此函数生成统一的输出路径，勿再硬编码相对 CWD 的 'log/' 等。
+    """
+    base = OUT_PATH / dataset / task
+    return {
+        "root": base,
+        "log": base / "logs",
+        "checkpoint": base / "checkpoints",
+        "run": base / "runs",
+    }
 SEED = 0
 is_ablation = True
 ABLA_CONFIG = {

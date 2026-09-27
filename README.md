@@ -16,7 +16,7 @@ Gazelab 是一个**模块化、可扩展**的视线估计研究框架。核心�
 
 设计目标是让"换模型、换数据集、加新功能"都尽可能低成本：
 - 模型放在 `src/gazelab/models/`，新增一个文件即可接入
-- 数据集适配在 `src/gazelab/datasets.py`
+- 数据集适配在 `src/gazelab/datasets/`（`gaze360_dataset.py` / `rgbdgaze.py`）
 - 训练 / 测试 / 推理 / 预处理各自独立入口在 `scripts/`
 - 支持多实验目录 `experiments/`
 
@@ -26,25 +26,32 @@ Gazelab 是一个**模块化、可扩展**的视线估计研究框架。核心�
 
 ```
 gazelab/
-├── configs/
-│   └── config.py           # 全局配置（数据集/模型/超参）
-├── src/gazelab/            # 核心包
-│   ├── datasets.py         # 数据集适配层（Gaze360 / ETH-XGaze / MPIIFaceGaze / EyeDiap）
-│   ├── predict.py          # 单图推理 + 箭头可视化（CLI）
+├── configs/                 # 配置（按数据集分）
+│   ├── gaze360_config.py    # Gaze360 配置（路径/超参/输出目录）
+│   └── rgbdgaze_config.py   # RGBDGaze 配置
+├── src/gazelab/             # 核心包
+│   ├── datasets/            # 数据集（统一 re-export）
+│   │   ├── gazelab/__init__.py    # 数据集导出层
+│   │   ├── gaze360_dataset.py     # Gaze360 的 GazeHub 格式数据集
+│   │   └── rgbdgaze.py            # RGBDGaze 双流数据集
 │   ├── models/
-│   │   ├── gazeformer.py   # 主模型：CLIP 语义融合（GEWithCLIPModel / _zhao）
-│   │   ├── transformers.py # MoE Transformer：特征 -> 3D 视线
-│   │   └── clipmodel.py    # CLIP 相关
+│   │   ├── gaze360_gazeformer.py  # Gaze360 主模型（CLIP 语义融合）
+│   │   ├── transformers.py        # MoE Transformer：特征 -> 3D 视线
+│   │   ├── rgbdgaze.py            # RGBDGaze 双流模型
+│   │   └── clipmodel.py           # CLIP 相关
 │   └── utils/
-│       ├── common.py       # 通用工具（leave_one_out 等）
-│       └── loggers.py      # 日志（TensorBoard / wandb）
+│       ├── common.py              # 通用工具
+│       └── loggers.py             # 日志（TensorBoard / wandb）
 ├── tools/
 │   └── data/               # 数据处理脚本
-│       ├── preprocess.py   # 数据预处理（Gaze360 -> GazeHub 标准格式）
+│       ├── preprocess.py   # Gaze360 -> GazeHub 标准格式
 │       └── verify.py       # 数据校验
 ├── scripts/
-│   ├── train.py            # 训练入口
-│   └── train_test.py       # 测试入口
+│   ├── train_gaze360.py     # Gaze360 训练入口
+│   ├── train_rgbdgaze.py    # RGBDGaze 训练入口
+│   └── train_test.py        # 通用测试入口
+├── out/                     # 训练产物（日志/权重/tensorboard，gitignore 忽略）
+│   └── {dataset}/{task}/{logs,checkpoints,runs}
 ├── assets/                 # 推理用检测模型（mediapipe / Haar）
 ├── experiments/            # （预留）多模型 / 多实验
 ├── tests/                  # （预留）测试
@@ -75,7 +82,7 @@ pip install mediapipe               # 推理可选：人脸关键点检测
 
 ## 快速开始
 
-> `configs/config.py` 中的数据路径已基于项目根目录自动推导，
+> `configs/gaze360_config.py` 中的数据路径已基于项目根目录自动推导，
 > 训练/推理脚本也带路径引导，因此**可以从任意目录运行**以下命令。
 > 若用 `python -m gazelab.predict`，需先 `pip install -e .` 或设 `PYTHONPATH=src`。
 
@@ -85,22 +92,31 @@ pip install mediapipe               # 推理可选：人脸关键点检测
 python -m gazelab.predict --image 你的图片.jpg
 # 或
 conda run -n dl python -m gazelab.predict --image 你的图片.jpg \
-    --checkpoint checkpoints/best—separate-added_Gaze360.pt \
+    --checkpoint out/gaze360/train/checkpoints/best—separate-added_Gaze360.pt \
     --out result.png
 ```
 
 输出：原图 + 从双眼中心指向视线方向的红色箭头，另打印 3D 视线向量、yaw/pitch。
 
-### 数据预处理
+### 数据预处理（Gaze360）
 
 ```bash
 python tools/data/preprocess.py --input-dir ./gaze360 --output-dir ./data/Gaze360
 ```
 
-### 训练
+### 训练 Gaze360
 
 ```bash
-python scripts/train.py
+python scripts/train_gaze360.py
+```
+
+### 训练 RGBDGaze
+
+```bash
+# 1. 先建索引（sample=随机 / subject=按人 / activity=按活动）
+conda run -n dl python -m tools.data.rgbdgaze_preprocess --split sample
+# 2. 训练
+conda run -n dl python scripts/train_rgbdgaze.py --epochs 30 --batch-size 64 --lr 1e-4
 ```
 
 ### 测试
@@ -115,7 +131,7 @@ python scripts/train_test.py
 
 Gazelab 的 gaze 估计分两个阶段：
 
-1. **特征提取（`models/gazeformer.py`）**
+1. **特征提取（`models/gaze360_gazeformer.py`）**
    - 冻结的 CLIP 编码人脸图像与一组文本提示（光照 / 头姿 / 背景 / 视线方向）
    - 用余弦相似度选出最匹配的属性向量，与图像特征融合
    - 得到 `feature_1`（环境：光照+头姿+背景）与 `feature_2`（视线方向）
@@ -130,6 +146,26 @@ Gazelab 的 gaze 估计分两个阶段：
 
 ---
 
+## 训练产物目录规范
+
+所有日志、权重、tensorboard 统一输出到 `out/{dataset}/{task}/` 下，由
+`configs/gaze360_config.py` 的 `experiment_dirs()` 生成各数据集一致结构：
+
+```
+out/{dataset}/{task}/
+├── logs/           # 训练/测试日志（含时间戳）
+├── checkpoints/    # 模型权重
+└── runs/           # tensorboard events
+```
+
+例如：
+- Gaze360 训练：日志与权重在 `out/gaze360/train/{logs,checkpoints}`
+- RGBDGaze 训练：在 `out/rgbdgaze/train/{logs,checkpoints}`
+
+各训练脚本通过 `experiment_dirs(dataset, task)` 获取这三类路径，避免硬编码相对 CWD。
+
+---
+
 ## 扩展指南
 
 ### 新增模型
@@ -138,12 +174,13 @@ Gazelab 的 gaze 估计分两个阶段：
 
 ### 新增数据集
 
-在 `src/gazelab/datasets.py` 新增一个 `Dataset` 子类（参考已有实现），
-并在 `configs/config.py` 中设置 `TRAIN_DATASET_NAME` / `TEST_DATASET_NAME`。
+在 `src/gazelab/datasets/` 新建一个数据集文件（参考 `gaze360_dataset.py` / `rgbdgaze.py`），
+在 `src/gazelab/datasets/__init__.py` 的 re-export 层暴露，
+并在对应 `configs/*_config.py` 中设置路径与超参。
 
 ### 消融实验
 
-通过 `configs/config.py` 的 `ABLA_CONFIG` 开关各特征流（`use_feature_1` ~ `use_feature_4`）。
+通过 `configs/gaze360_config.py` 的 `ABLA_CONFIG` 开关各特征流（`use_feature_1` ~ `use_feature_4`）。
 
 ---
 
@@ -151,9 +188,11 @@ Gazelab 的 gaze 估计分两个阶段：
 
 | 目录 | 用途 |
 |---|---|
-| `data/` | 数据集（GazeHub 格式，gitignore 忽略） |
-| `checkpoints/` | 模型权重（gitignore 忽略） |
-| `log/` | 训练日志 |
+| `data/` | 数据集（原始 + GazeHub 格式，gitignore 忽略） |
+| `out/{dataset}/{task}/logs` | 训练/测试日志 |
+| `out/{dataset}/{task}/checkpoints` | 模型权重 |
+| `out/{dataset}/{task}/runs` | tensorboard events |
+| `configs/` | 各数据集的配置 |
 | `assets/` | 推理检测模型（需提交） |
 | `experiments/` | 多实验 / 多模型结果 |
 | `docs/` | 项目文档 |

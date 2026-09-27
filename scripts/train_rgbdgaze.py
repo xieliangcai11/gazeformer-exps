@@ -35,7 +35,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from configs.gaze360_config import DEVICE as DEFAULT_DEVICE
+from datetime import datetime
+from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
 from gazelab.datasets.rgbdgaze import (RGBDGazeDataset, rgb_preprocess,
                                        depth_preprocess)
@@ -79,7 +80,8 @@ def parse():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--device", default="auto")
-    p.add_argument("--save-dir", default=str(Path("out/rgbdgaze")))
+    p.add_argument("--save-dir", default=None,
+                   help="权重输出目录（默认 out/rgbdgaze/train/checkpoints）")
     return p.parse_args()
 
 
@@ -87,6 +89,18 @@ def main():
     args = parse()
     device = args.device if args.device != "auto" else DEFAULT_DEVICE
     index_dir = Path(args.index_dir)
+
+    # 统一输出目录布局（experiment_dirs 在 configs 定义，各脚本复用）
+    run_dirs = experiment_dirs("rgbdgaze", "train")
+    save_dir = Path(args.save_dir) if args.save_dir else run_dirs["checkpoint"]
+    log_dir = run_dirs["log"]
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"{log_time}_train_rgbdgaze_log.txt"
+
+    def write_log(msg):
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
 
     # 模型
     model = RGBDGazeModel().to(device)
@@ -97,10 +111,11 @@ def main():
     train_dl = build_dataloader("train", index_dir, args.batch_size, True)
     test_dl = build_dataloader("test", index_dir, args.batch_size, False)
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    save_dir.mkdir(parents=True, exist_ok=True)
     print(f"[rgbdgaze] 训练集 {len(train_dl.dataset)} 样本 / 测试集 "
           f"{len(test_dl.dataset)} 样本")
     print(f"[rgbdgaze] 模型参数: {sum(p.numel() for p in model.parameters()):,}")
+    write_log(f"[rgbdgaze] 训练集 {len(train_dl.dataset)} 样本 / 测试集 {len(test_dl.dataset)} 样本")
 
     best_test = float("inf")
     for epoch in range(args.epochs):
