@@ -69,12 +69,64 @@ def build_dataloader(split: str, index_dir: Path, batch_size: int,
             return len(self.idces)
         def __getitem__(self, i):
             return self.base[self.idces[i]]
+        @property
+        def cm_px(self):
+            """该子集每个样本的 (cm/px_x, cm/px_y)，与数据顺序一致。"""
+            return self.base.cm_px[self.idces]
+        @property
+        def screen_size(self):
+            """该子集每个样本的 (px宽, px高)，与数据顺序一致。"""
+            return self.base.screen_size[self.idces]
     sub = Subset(ds, idx)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers)
 
 
+def evaluate_split(model, dl, device):
+    """在 DataLoader(不 shuffle) 上评估，返回可解释指标。
+
+    diff 是归一化 [0,1] 空间误差。
+    cm 换算：cm = 归一化误差 * screen_尺寸(px) * (cm/px)
+      norm_diff * screen_w * cm_px_x = 厘米误差(x)
+    """
+    import numpy as np
+    model.eval()
+    dset = dl.dataset
+    cm_arr = np.asarray(dset.cm_px, dtype=np.float32)      # [N,2] cm/px
+    scr = np.asarray(dset.screen_size, dtype=np.float32)    # [N,2] px
+    L2n = 0.0; xA = 0.0; yA = 0.0; cnt = 0
+    start = 0
+    cma = [0.0, 0.0, 0.0]
+    with torch.no_grad():
+        for inp, label in dl:
+            face = inp.face.to(device).float()
+            depth = inp.other_face.to(device).float()
+            label = label.to(device)
+            pred = model(face, depth)
+            diff = (pred - label)                     # [B,2] 归一化误差
+            B = label.size(0)
+            cm_b = torch.from_numpy(cm_arr[start:start+B]).to(device)
+            scr_b = torch.from_numpy(scr[start:start+B]).to(device)
+            cm_x = diff[:, 0] * scr_b[:, 0] * cm_b[:, 0]
+            cm_y = diff[:, 1] * scr_b[:, 1] * cm_b[:, 1]
+            cm_dist = torch.sqrt(cm_x**2 + cm_y**2)
+            L2n += diff.norm(dim=-1).sum().item()
+            xA += diff[:, 0].abs().sum().item()
+            yA += diff[:, 1].abs().sum().item()
+            cma[0] += cm_dist.sum().item()
+            cma[1] += cm_x.abs().sum().item()
+            cma[2] += cm_y.abs().sum().item()
+            cnt += B
+            start += B
+    return dict(
+        l2_norm=L2n/max(cnt,1), l2_x=xA/max(cnt,1), l2_y=yA/max(cnt,1),
+        em_dist=cma[0]/max(cnt,1),
+        em_x=cma[1]/max(cnt,1), em_y=cma[2]/max(cnt,1),
+        count=cnt,
+    )
+
 def parse():
+    p = argparse.ArgumentParser()
     p = argparse.ArgumentParser()
     p.add_argument("--index-dir", default=str(RGBDGaze_INDEX_DIR))
     p.add_argument("--batch-size", type=int, default=64)
@@ -164,37 +216,20 @@ def main():
                 epoch_t0 = time.time()
 
         # 每 epoch 用验证集评估（据此选 best，避免测试集泄漏）
-        model.eval()
-        val_err = 0.0
-        val_err_x = 0.0
-        val_err_y = 0.0
-        cnt = 0
         t_val = time.time()
-        with torch.no_grad():
-            for inp, label in val_dl:
-                face = inp.face.to(device).float()
-                depth = inp.other_face.to(device).float()
-                label = label.to(device)
-                pred = model(face, depth)
-                diff = (pred - label)
-                val_err += diff.norm(dim=-1).sum().item()
-                val_err_x += diff[:, 0].abs().sum().item()
-                val_err_y += diff[:, 1].abs().sum().item()
-                cnt += label.size(0)
-
+        vres = evaluate_split(model, val_dl, device)
         mean_train = run_loss / max(n_step, 1)
-        mean_val = val_err / max(cnt, 1)
-        mean_val_x = val_err_x / max(cnt, 1)
-        mean_val_y = val_err_y / max(cnt, 1)
+        mean_val = vres["l2_norm"]
+        mean_val_cm = vres["em_dist"]
         saved = ""
-        if mean_val < best_val:
-            best_val = mean_val
+        if mean_val_cm < best_val:
+            best_val = mean_val_cm
             ckpt_name = "best.pt"
             torch.save(model.state_dict(), os.path.join(save_dir, ckpt_name))
-            saved = f"  [保存 best → {ckpt_name} (val {mean_val:.4f})]"
+            saved = f"  [保存 best → {ckpt_name} (val {mean_val_cm:.2f}cm)]"
 
         msg = (f"[epoch {epoch}]  train_loss {mean_train:.6f}  "
-               f"val_L2 {mean_val:.4f} (x:{mean_val_x:.4f} y:{mean_val_y:.4f})  "
+               f"val_L2 {mean_val:.4f}  val_em {mean_val_cm:.2f}cm  "
                f"验证耗时 {time.time()-t_val:.1f}s{saved}")
         emit(msg)
 
@@ -205,29 +240,13 @@ def main():
     if os.path.exists(best_ckpt):
         model.load_state_dict(torch.load(best_ckpt, map_location=device,
                                          weights_only=False))
-    model.eval()
-    test_err = 0.0
-    test_err_x = 0.0
-    test_err_y = 0.0
-    cnt = 0
-    with torch.no_grad():
-        for inp, label in test_dl:
-            face = inp.face.to(device).float()
-            depth = inp.other_face.to(device).float()
-            label = label.to(device)
-            pred = model(face, depth)
-            diff = (pred - label)
-            test_err += diff.norm(dim=-1).sum().item()
-            test_err_x += diff[:, 0].abs().sum().item()
-            test_err_y += diff[:, 1].abs().sum().item()
-            cnt += label.size(0)
-    mean_test = test_err / max(cnt, 1)
-    mean_test_x = test_err_x / max(cnt, 1)
-    mean_test_y = test_err_y / max(cnt, 1)
-    emit(f"[final] test_L2 {mean_test:.4f} (x:{mean_test_x:.4f} y:{mean_test_y:.4f}) "
-         f"样本 {cnt}")
-    emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best val_L2 = {best_val:.4f}，"
-         f"最终 test_L2 = {mean_test:.4f}")
+    fres = evaluate_split(model, test_dl, device)
+    mean_test = fres["l2_norm"]
+    mean_test_cm = fres["em_dist"]
+    emit(f"[final] test_L2 {mean_test:.4f}  test_em {mean_test_cm:.2f}cm  "
+         f"(x:{fres['em_x']:.2f} y:{fres['em_y']:.2f})  样本 {fres['count']}")
+    emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best val = {best_val:.2f}cm，"
+         f"最终 test = {mean_test_cm:.2f}cm")
     emit("=" * 60)
 
 

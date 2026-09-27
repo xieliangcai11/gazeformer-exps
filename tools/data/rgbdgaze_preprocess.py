@@ -42,7 +42,7 @@ def _norm(s: str) -> str:
 
 
 def load_screen_spec() -> dict:
-    """读 iphone_spec.csv -> {归一化设备名: (w_pt, h_pt, w_cm, h_cm)}"""
+    """读 iphone_spec.csv -> {归一化名: (w_pt, h_pt, w_cm, h_cm)}"""
     spec = {}
     with open(IPHONE_SPEC_CSV, encoding="utf-8") as f:
         for row in csv.reader(f):
@@ -50,10 +50,11 @@ def load_screen_spec() -> dict:
                 continue
             name = row[0].strip()
             try:
-                w_pt, h_pt = float(row[1]), float(row[2])
+                w_pt, h_pt, w_cm, h_cm = (float(row[1]), float(row[2]),
+                                           float(row[3]), float(row[4]))
             except (ValueError, IndexError):
                 continue
-            spec[_norm(name)] = (w_pt, h_pt)
+            spec[_norm(name)] = (w_pt, h_pt, w_cm, h_cm)
     return spec
 
 
@@ -97,7 +98,9 @@ def discover_samples():
                 if key not in spec:
                     # 设备不在屏幕规格表（如一些古老机型），跳过
                     continue
-                w_pt, h_pt = spec[key]
+                w_pt, h_pt, w_cm, h_cm = spec[key]
+                cm_px_x = w_cm / w_pt   # 每像素对应的物理宽度(厘米)
+                cm_px_y = h_cm / h_pt   # 每像素对应的物理高度(厘米)
                 rgb = act_dir / "rgb" / f"{uid}.jpg"
                 depth = act_dir / "depth" / f"{uid}.jpg"
                 if not rgb.exists() or not depth.exists():
@@ -108,6 +111,7 @@ def discover_samples():
                     bbox_xywh=(bx, by, bw, bh),
                     device=device, screen_w=w_pt, screen_h=h_pt,
                     gaze_x=gx, gaze_y=gy,
+                    cm_px_x=cm_px_x, cm_px_y=cm_px_y,
                     subject=subj, activity=act,
                 ))
     return samples
@@ -121,12 +125,14 @@ def write_index(samples, index_dir: Path):
         w = csv.writer(f)
         w.writerow(["rgb_path", "depth_path", "bbox_x", "bbox_y", "bbox_w",
                     "bbox_h", "device", "screen_w", "screen_h", "gaze_x",
-                    "gaze_y", "subject", "activity"])
+                    "gaze_y", "cm_px_x", "cm_px_y", "subject", "activity"])
         for s in samples:
             bx, by, bw, bh = s["bbox_xywh"]
             w.writerow([s["rgb"], s["depth"], bx, by, bw, bh,
                         s["device"], s["screen_w"], s["screen_h"],
-                        s["gaze_x"], s["gaze_y"], s["subject"], s["activity"]])
+                        s["gaze_x"], s["gaze_y"],
+                        s["cm_px_x"], s["cm_px_y"],
+                        s["subject"], s["activity"]])
     subject_set = OrderedDict()
     for s in samples:
         subject_set.setdefault(s["subject"], 0)
