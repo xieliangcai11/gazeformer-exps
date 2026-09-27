@@ -85,28 +85,39 @@ def build_dataloader(split: str, index_dir: Path, batch_size: int,
 def evaluate_split(model, dl, device):
     """在 DataLoader(不 shuffle) 上评估，返回可解释指标。
 
-    diff 是归一化 [0,1] 空间误差。
-    cm 换算：cm = 归一化误差 * screen_尺寸(px) * (cm/px)
-      norm_diff * screen_w * cm_px_x = 厘米误差(x)
+    label 是归一化 [0,1] 屏幕坐标（0=左/上，1=右/下）。
+    1. cm 误差：归一化误差 * screen(px) * cm/px = 物理厘米（每设备真实尺寸）
+    2. 角度误差：屏幕坐标 -> 视线方向，夹角（度）。
+       几何：用户眼睛位于屏幕中心正前方 VIEWING_DISTANCE_CM(默认30) cm，
+       屏幕坐标 (归一化) -> 物理厘米 (x_cm, y_cm)，
+       视线方向向量 = (x_cm - 屏中心, y_cm - 屏中心, VIEWING_DISTANCE_CM) 归一化。
+       预测方向与真值方向的夹角即角度误差（度）。
+       返回 mean 与 95 分位。
     """
     import numpy as np
+    from configs.rgbdgaze_config import VIEWING_DISTANCE_CM
+
     model.eval()
     dset = dl.dataset
     cm_arr = np.asarray(dset.cm_px, dtype=np.float32)      # [N,2] cm/px
     scr = np.asarray(dset.screen_size, dtype=np.float32)    # [N,2] px
+    D = VIEWING_DISTANCE_CM
+
     L2n = 0.0; xA = 0.0; yA = 0.0; cnt = 0
-    start = 0
     cma = [0.0, 0.0, 0.0]
+    ang_acc = []
+    start = 0
     with torch.no_grad():
         for inp, label in dl:
             face = inp.face.to(device).float()
             depth = inp.other_face.to(device).float()
             label = label.to(device)
             pred = model(face, depth)
-            diff = (pred - label)                     # [B,2] 归一化误差
+            diff = (pred - label)
             B = label.size(0)
             cm_b = torch.from_numpy(cm_arr[start:start+B]).to(device)
             scr_b = torch.from_numpy(scr[start:start+B]).to(device)
+            # cm 误差（物理距离）
             cm_x = diff[:, 0] * scr_b[:, 0] * cm_b[:, 0]
             cm_y = diff[:, 1] * scr_b[:, 1] * cm_b[:, 1]
             cm_dist = torch.sqrt(cm_x**2 + cm_y**2)
@@ -116,12 +127,40 @@ def evaluate_split(model, dl, device):
             cma[0] += cm_dist.sum().item()
             cma[1] += cm_x.abs().sum().item()
             cma[2] += cm_y.abs().sum().item()
+
+            # 角度误差：每个样本 绝对注视点 -> 视线方向 -> 夹角
+            # 归一化坐标 -> 物理厘米（相对屏幕左上角）
+            # 屏中心在 (scr_w_cm/2, scr_h_cm/2)，视线方向再看向屏幕点
+            scr_w_cm = scr_b[:, 0] * cm_b[:, 0]   # [B] 每设备屏宽 cm
+            scr_h_cm = scr_b[:, 1] * cm_b[:, 1]   # [B] 每设备屏高 cm
+            px_cm = pred[:, 0] * scr_w_cm          # 预测点 x cm
+            py_cm = pred[:, 1] * scr_h_cm
+            tx_cm = label[:, 0] * scr_w_cm
+            ty_cm = label[:, 1] * scr_h_cm
+            # 相对屏中心
+            px = px_cm - scr_w_cm / 2
+            py = py_cm - scr_h_cm / 2
+            tx = tx_cm - scr_w_cm / 2
+            ty = ty_cm - scr_h_cm / 2
+            # 视线方向（眼睛在 z=D 前方）
+            p_vec = torch.stack([px, py, torch.full_like(px, D)], dim=-1)
+            t_vec = torch.stack([tx, ty, torch.full_like(tx, D)], dim=-1)
+            p_n = p_vec / p_vec.norm(dim=-1, keepdim=True)
+            t_n = t_vec / t_vec.norm(dim=-1, keepdim=True)
+            cosim = (p_n * t_n).sum(dim=-1).clamp(-1.0, 1.0)
+            angle_deg = torch.acos(cosim) * 180.0 / 3.141592653589793
+            ang_acc.append(angle_deg.cpu().numpy())
+
             cnt += B
             start += B
+
+    ang_all = np.concatenate(ang_acc) if ang_acc else np.array([0.0])
     return dict(
         l2_norm=L2n/max(cnt,1), l2_x=xA/max(cnt,1), l2_y=yA/max(cnt,1),
         em_dist=cma[0]/max(cnt,1),
         em_x=cma[1]/max(cnt,1), em_y=cma[2]/max(cnt,1),
+        ang_mean=float(ang_all.mean()),
+        ang_p95=float(np.percentile(ang_all, 95)),
         count=cnt,
     )
 
