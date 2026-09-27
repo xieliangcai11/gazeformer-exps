@@ -6,6 +6,9 @@
 
 from pathlib import Path
 
+# 项目根目录 = 本文件(configs/rgbdgaze_config.py)的上一级；使路径不依赖运行 CWD
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 # RGBDGaze 目录结构（官方）
 # data/RGBDGaze_dataset/
 # ├── p{1..45}/
@@ -19,13 +22,13 @@ from pathlib import Path
 # └── (p*/intrinsic.json)
 
 # 原始数据根目录（官方目录，只读）
-RGBDGaze_RAW_ROOT = Path("data/RGBDGaze/RGBDGaze_dataset")
+RGBDGaze_RAW_ROOT = _PROJECT_ROOT / "data" / "RGBDGaze" / "RGBDGaze_dataset"
 
 # 活动中包含的姿态
 ACTIVITIES = ("sitting", "standing", "walking", "lying")
 
 # 索引输出（构建后的统一标签/清单）
-RGBDGaze_INDEX_DIR = Path("data/RGBDGaze/index")
+RGBDGaze_INDEX_DIR = _PROJECT_ROOT / "data" / "RGBDGaze" / "index"
 
 # 屏幕规格表（device -> 屏幕像素宽高 (w_pt, h_pt)，来自 iphone_spec.csv）
 IPHONE_SPEC_CSV = RGBDGaze_RAW_ROOT / "iphone_spec.csv"
