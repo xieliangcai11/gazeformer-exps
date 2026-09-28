@@ -44,6 +44,30 @@ from gazelab.datasets.rgbdgaze import (RGBDGazeDataset, rgb_preprocess,
 from gazelab.models.rgbdgaze import RGBDGazeModel
 
 
+class Subset(torch.utils.data.Dataset):
+    """按 idces 对基础数据集取样（模块级，可被 DataLoader 多进程 pickle）。"""
+
+    def __init__(self, base, idces):
+        self.base = base
+        self.idces = idces
+
+    def __len__(self):
+        return len(self.idces)
+
+    def __getitem__(self, i):
+        return self.base[self.idces[i]]
+
+    @property
+    def cm_px(self):
+        """该子集每个样本的 (cm/px_x, cm/px_y)，与数据顺序一致。"""
+        return self.base.cm_px[self.idces]
+
+    @property
+    def screen_size(self):
+        """该子集每个样本的 (px宽, px高)，与数据顺序一致。"""
+        return self.base.screen_size[self.idces]
+
+
 def build_dataloader(split: str, index_dir: Path, batch_size: int,
                      shuffle: bool, num_workers: int = 0):
     index_csv = index_dir / "index.csv"
@@ -61,22 +85,7 @@ def build_dataloader(split: str, index_dir: Path, batch_size: int,
     ds = RGBDGazeDataset(index_csv,
                          color_transform=rgb_preprocess,
                          depth_transform=depth_preprocess)  # 全量
-    # 过滤出属于该 split 的子集（通过取样包装）
-    class Subset(torch.utils.data.Dataset):
-        def __init__(self, base, idces):
-            self.base = base; self.idces = idces
-        def __len__(self):
-            return len(self.idces)
-        def __getitem__(self, i):
-            return self.base[self.idces[i]]
-        @property
-        def cm_px(self):
-            """该子集每个样本的 (cm/px_x, cm/px_y)，与数据顺序一致。"""
-            return self.base.cm_px[self.idces]
-        @property
-        def screen_size(self):
-            """该子集每个样本的 (px宽, px高)，与数据顺序一致。"""
-            return self.base.screen_size[self.idces]
+    # 过滤出属于该 split 的子集（用模块级 Subset，可多进程 pickle）
     sub = Subset(ds, idx)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers)
@@ -269,6 +278,7 @@ def main():
 
         msg = (f"[epoch {epoch}]  train_loss {mean_train:.6f}  "
                f"val_L2 {mean_val:.4f}  val_em {mean_val_cm:.2f}cm  "
+               f"val_angle {vres['ang_mean']:.2f}°(p95 {vres['ang_p95']:.2f}°)  "
                f"验证耗时 {time.time()-t_val:.1f}s{saved}")
         emit(msg)
 
@@ -283,7 +293,9 @@ def main():
     mean_test = fres["l2_norm"]
     mean_test_cm = fres["em_dist"]
     emit(f"[final] test_L2 {mean_test:.4f}  test_em {mean_test_cm:.2f}cm  "
-         f"(x:{fres['em_x']:.2f} y:{fres['em_y']:.2f})  样本 {fres['count']}")
+         f"(x:{fres['em_x']:.2f} y:{fres['em_y']:.2f})")
+    emit(f"[final] test_angle mean {fres['ang_mean']:.2f}°  "
+         f"p95 {fres['ang_p95']:.2f}°  样本 {fres['count']}")
     emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best val = {best_val:.2f}cm，"
          f"最终 test = {mean_test_cm:.2f}cm")
     emit("=" * 60)
