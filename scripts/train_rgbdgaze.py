@@ -164,12 +164,20 @@ def evaluate_split(model, dl, device):
             start += B
 
     ang_all = np.concatenate(ang_acc) if ang_acc else np.array([0.0])
+    # 统计口径（对齐任务规格）
+    n = len(ang_all)
+    target_angle = 1.91  # 规格：1.91°@95% 样本满足
+    sorted_a = np.sort(ang_all)
+    top95_mean = float(sorted_a[:int(n * 0.95)].mean()) if n > 0 else 0.0
     return dict(
         l2_norm=L2n/max(cnt,1), l2_x=xA/max(cnt,1), l2_y=yA/max(cnt,1),
         em_dist=cma[0]/max(cnt,1),
         em_x=cma[1]/max(cnt,1), em_y=cma[2]/max(cnt,1),
         ang_mean=float(ang_all.mean()),
+        ang_median=float(np.median(ang_all)),
+        ang_top95_mean=top95_mean,
         ang_p95=float(np.percentile(ang_all, 95)),
+        ang_ratio_le_191=float((ang_all <= target_angle).mean() * 100),
         count=cnt,
     )
 
@@ -294,8 +302,12 @@ def main():
     mean_test_cm = fres["em_dist"]
     emit(f"[final] test_L2 {mean_test:.4f}  test_em {mean_test_cm:.2f}cm  "
          f"(x:{fres['em_x']:.2f} y:{fres['em_y']:.2f})")
-    emit(f"[final] test_angle mean {fres['ang_mean']:.2f}°  "
-         f"p95 {fres['ang_p95']:.2f}°  样本 {fres['count']}")
+    emit(f"[final] test_angle  平均 {fres['ang_mean']:.2f}° | "
+         f"中位 {fres['ang_median']:.2f}° | "
+         f"95%分位 {fres['ang_p95']:.2f}° | "
+         f"前95%平均 {fres['ang_top95_mean']:.2f}°")
+    emit(f"[final] ≤1.91° 样本占比 {fres['ang_ratio_le_191']:.1f}%  "
+         f"样本 {fres['count']}")
     emit(f"[rgbdgaze] 训练完成 {args.epochs} epochs，best val = {best_val:.2f}cm，"
          f"最终 test = {mean_test_cm:.2f}cm")
     emit("=" * 60)
