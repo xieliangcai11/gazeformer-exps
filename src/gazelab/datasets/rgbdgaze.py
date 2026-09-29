@@ -23,10 +23,23 @@ from easydict import EasyDict as edict
 
 from configs.rgbdgaze_config import (
     RGBDGaze_INDEX_DIR,
+    PROJECT_ROOT,
     IMAGE_SIZE,
     CROP_MARGIN,
     NORMALIZE_GAZE,
 )
+
+
+def _resolve_data_path(p: str) -> Path:
+    """把 index 里的相对路径（相对项目根）解析成绝对路径；绝对路径则原样返回。
+
+    兼容性：index.csv 存的是"相对项目根 + 前向斜杠"的路径，在任意机器上
+    都能用当前项目的 PROJECT_ROOT 拼回正确位置。
+    """
+    p = Path(p)
+    if p.is_absolute():
+        return p
+    return PROJECT_ROOT / p
 
 
 def _to_tensor_label(label):
@@ -176,8 +189,8 @@ class RGBDGazeDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.rows[idx]
-        rgb_path = Path(row["rgb_path"])
-        depth_path = Path(row["depth_path"])
+        rgb_path = _resolve_data_path(row["rgb_path"])
+        depth_path = _resolve_data_path(row["depth_path"])
         # bbox 放在 index 的附加列（preprocess 写入）
         bbox = (float(row["bbox_x"]), float(row["bbox_y"]),
                 float(row["bbox_w"]), float(row["bbox_h"]))
