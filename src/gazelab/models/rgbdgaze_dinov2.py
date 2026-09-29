@@ -24,12 +24,15 @@
 import torch
 import torch.nn as nn
 import timm
+from pathlib import Path
 
 from gazelab.models.transformers import RMSNorm, BlockMoba
 
 from timm.layers.pos_embed import resample_abs_pos_embed
 
-DINOV2_CKPT = "model/dinov2_vits14_pretrain.pth"
+# 项目根 = 本文件 src/gazelab/models/ 向上 4 级；使权重路径不依赖运行 CWD
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+DINOV2_CKPT = str(_PROJECT_ROOT / "model" / "dinov2_vits14_pretrain.pth")
 DINOV2_MODEL = "vit_small_patch14_dinov2"
 # 数据统一 224；DINOv2 原生 518，用插值 pos_embed 让模型接受 224 输入
 DINOV2_IMG_SIZE = 224
