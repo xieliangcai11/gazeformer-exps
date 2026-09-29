@@ -131,6 +131,38 @@ Gazelab 的 gaze 估计分两个阶段：
 
 ---
 
+## RGBDGaze 新模型（DINOv2，屏幕注视 2D 回归）
+
+项目主注意力已转向 **RGBDGaze**（RGB 人脸 + 深度人脸 → 屏幕上的 2D 注视点）。
+
+新模型 `src/gazelab/models/rgbdgaze_dinov2.py`：
+
+- **RGB 流**：DINOv2（ViT-S/14，**冻结**，定位视觉特征提取器）→ cls + patch tokens。
+- **深度流**：`inverse_depth_preprocess` 把深度图（灰度单通道）换算成**逆深度**单通道，
+  经 grid 池化 + 线性嵌入为少量 depth tokens（几何补充，RGB 仍为主角，不喧宾夺主）。
+- **融合**：复用 `transformers.py` 的 `BlockMoba`（自注意力 + MoE/FFN）把
+  `[汇总CLS, rgb_cls, depth_tokens, rgb_patch_tokens]` 一起融合，取 CLS 经线性头输出 2D 坐标。
+- **损失**：MSE(2D) + 几何角度损失（训练与验收同用"角度"这把尺子）。
+
+说明：不直接复用 `TransformerDeepSeek_gaze`（其 `proj_f1/f2/f3` 写死 512/512/2048，面向
+CLIP 语义流；无 CLIP 时强行复用会产生巨量、错误投影），故构造 RGBD 专用但复用同一 `BlockMoba` 块。
+
+### 权重要求
+
+DINOv2 官方权重需放在 `model/dinov2_vits14_pretrain.pth`（此目录已 gitignore，不随仓库提交）。
+获取方式：`facebookresearch/dinov2` 的 `dinov2_vits14` 预训练权重。缺失时模型构造会报错。
+
+### 跑 1 epoch（冒烟测试）
+
+```bash
+python scripts/train_rgbdgaze_dinov2.py --epochs 1 --batch-size 48
+```
+
+### 老奶奶版理解文档
+详见 `docs/新模型_从原始数据开始_老奶奶版.md`。
+
+---
+
 ## 扩展指南
 
 ### 新增模型
