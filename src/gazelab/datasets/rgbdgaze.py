@@ -211,4 +211,13 @@ class RGBDGazeDataset(Dataset):
             label = np.array([float(row["gaze_x"]), float(row["gaze_y"])],
                              dtype=np.float32)
 
-        return edict(rgb=rgb_face, depth=depth_face), self.target_transform(label)
+        # 每样本屏幕物理尺寸(cm)，供"训练时按验收几何算角度"使用（消融/可选）
+        # 向后兼容：旧消费者只取 rgb/depth/label，忽略该额外字段
+        screen_cm = torch.tensor(
+            [float(row["screen_w"]) * float(row["cm_px_x"]),
+             float(row["screen_h"]) * float(row["cm_px_y"])],
+            dtype=torch.float32,
+        )
+
+        return edict(rgb=rgb_face, depth=depth_face,
+                     screen_cm=screen_cm), self.target_transform(label)

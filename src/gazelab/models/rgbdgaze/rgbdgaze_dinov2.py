@@ -48,7 +48,10 @@ class DINOv2Backbone(nn.Module):
     因为不同 timm 版本会把 cluster token 塞进 pos_embed；用 hook 取 blocks 输出最稳。
     """
 
-    def __init__(self, model_name=DINOV2_MODEL, ckpt=DINOV2_CKPT, freeze=True):
+    def __init__(self, model_name=DINOV2_MODEL, ckpt=DINOV2_CKPT,
+                 freeze=True, unfreeze_last=0):
+        """freeze: 是否冻结 DINOv2；unfreeze_last: 解冻最后 N 个 block 参与微调。
+        unfreeze_last>0 时允许任务相关微调（代价是显存/耗时增加）。"""
         super().__init__()
         backbone = timm.create_model(model_name, pretrained=False,
                                      img_size=DINOV2_IMG_SIZE)
@@ -72,9 +75,19 @@ class DINOv2Backbone(nn.Module):
             raise ValueError(f"[DINOv2] 缺失键: {missing}")
         self.backbone = backbone
         self._frozen = freeze
+        self._unfreeze_last = unfreeze_last
         if freeze:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+            if unfreeze_last > 0:
+                # 解冻最后 N 个 block 用于任务微调
+                blocks = list(self.backbone.blocks)
+                for blk in blocks[-unfreeze_last:]:
+                    for p in blk.parameters():
+                        p.requires_grad = True
+        # 只有"全部冻结"才用 no_grad 包前向；一旦有任何可训练参数就不能包
+        self._no_grad = bool(freeze and unfreeze_last == 0)
+        if self._no_grad:
             self.backbone.eval()  # 冻结时锁死内部 dropout/训练态，保证确定性
         self._tokens = None
         # 抓最后一个 Block 的输出（在 final norm / head 之前），含 cls + patches
@@ -84,10 +97,9 @@ class DINOv2Backbone(nn.Module):
         self._tokens = output
 
     def forward(self, x):
-        # 冻结时：无条件 eval + no_grad，避免外层 model.train() 把 DINOv2 内部
-        # dropout/随机深度重新打开（那会令冻结模型前向不确定）。
-        # no_grad 下产出的张量仍会流入后续可训练层并回传梯度到它们，功能正确。
-        if self._frozen:
+        # 全部冻结时：eval + no_grad（外层 model.train() 不会干扰冻结部分）。
+        # 若有可训练参数（未冻结/解冻），正常走训练态并保留梯度。
+        if self._no_grad:
             self.backbone.eval()
             with torch.no_grad():
                 self.backbone(x)
@@ -149,6 +161,8 @@ class RGBDGazeDINOv2(nn.Module):
         inter_dim=1536,
         depth_grid=8,
         freeze_dino=True,
+        use_depth=True,
+        unfreeze_last=0,
         dino_model=DINOV2_MODEL,
         dino_ckpt=DINOV2_CKPT,
     ):
@@ -156,15 +170,20 @@ class RGBDGazeDINOv2(nn.Module):
         if d_model % num_heads != 0:
             raise ValueError(f"d_model({d_model}) 必须能被 num_heads({num_heads}) 整除")
 
-        # ---- RGB 流：冻结 DINOv2 ----
-        self.rgb = DINOv2Backbone(dino_model, dino_ckpt, freeze=freeze_dino)
+        # ---- RGB 流：冻结 DINOv2（可选解冻最后 N 层微调） ----
+        self.rgb = DINOv2Backbone(dino_model, dino_ckpt, freeze=freeze_dino,
+                                  unfreeze_last=unfreeze_last)
         dino_dim = self.rgb.embed_dim
         self.proj_rgb_cls = nn.Linear(dino_dim, d_model)
         self.proj_rgb_patch = nn.Linear(dino_dim, d_model)
 
-        # ---- Depth 流 ----（投影在本模块内完成，无对外的 Linear）
-        self.depth_patch = DepthPatchEmbed(in_channels=1, grid=depth_grid, d_model=d_model)
-        # proj 输入为 1 通道 grid（网格内特征本质上是逆深度值），Linear(1, d_model)
+        # ---- Depth 流（可关，做 RGB-only 消融） ----
+        self.use_depth = use_depth
+        if use_depth:
+            self.depth_patch = DepthPatchEmbed(in_channels=1, grid=depth_grid,
+                                               d_model=d_model)
+        else:
+            self.depth_patch = None
 
         # ---- 融合：BlockMoba 栈 + 汇总 token ----
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -181,26 +200,27 @@ class RGBDGazeDINOv2(nn.Module):
         self.head = nn.Linear(d_model, gaze_dim)
 
     def forward(self, face, depth):
-        # 1) RGB：DINOv2（冻结）-> cls + patches
+        # 1) RGB：DINOv2（冻结/部分解冻）-> cls + patches
         tokens = self.rgb(face)                      # [B, 1+N, C]
         cls = tokens[:, 0]                           # [B, C]
         patches = tokens[:, 1:]                      # [B, N, C]
         rgb_cls = self.proj_rgb_cls(cls).unsqueeze(1)    # [B, 1, d_model]
         rgb_patch = self.proj_rgb_patch(patches)         # [B, N, d_model]
 
-        # 2) Depth：逆深度单通道 -> grid depth tokens
-        depth_tokens = self.depth_patch(depth)        # [B, N_d, d_model]
-
-        # 3) 拼接全部 token：汇总CLS + rgb_cls + depth + rgb_patches
+        # 2) 拼接：汇总CLS + rgb_cls [+ depth] + rgb_patches
+        if self.use_depth:
+            depth_tokens = self.depth_patch(depth)       # [B, N_d, d_model]
+            seq = torch.cat([rgb_cls, depth_tokens, rgb_patch], dim=1)
+        else:
+            seq = torch.cat([rgb_cls, rgb_patch], dim=1)
         B = depth.size(0)
-        seq = torch.cat([rgb_cls, depth_tokens, rgb_patch], dim=1)
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+1+N_d+N, d_model]
+        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+1+[N_d]+N, d_model]
 
-        # 4) BlockMoba 栈（自注意力融合）
+        # 3) BlockMoba 栈（自注意力融合）
         for layer in self.layers:
             x = layer(x, cross_input=None, mask=None)
 
-        # 5) 汇总 CLS -> 2D
+        # 4) 汇总 CLS -> 2D
         out = self.head(self.norm(x[:, 0, :]))
         return out
