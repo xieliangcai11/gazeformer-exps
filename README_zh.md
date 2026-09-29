@@ -135,7 +135,7 @@ Gazelab 的 gaze 估计分两个阶段：
 
 项目主注意力已转向 **RGBDGaze**（RGB 人脸 + 深度人脸 → 屏幕上的 2D 注视点）。
 
-新模型 `src/gazelab/models/rgbdgaze_dinov2.py`：
+新模型 `src/gazelab/models/rgbdgaze/`（`rgbdgaze_dinov2.py`）：
 
 - **RGB 流**：DINOv2（ViT-S/14，**冻结**，定位视觉特征提取器）→ cls + patch tokens。
 - **深度流**：`inverse_depth_preprocess` 把深度图（灰度单通道）换算成**逆深度**单通道，
@@ -152,10 +152,8 @@ CLIP 语义流；无 CLIP 时强行复用会产生巨量、错误投影），故
 DINOv2 官方权重需放在 `model/dinov2_vits14_pretrain.pth`（此目录已 gitignore，不随仓库提交）。
 获取方式：`facebookresearch/dinov2` 的 `dinov2_vits14` 预训练权重。缺失时模型构造会报错。
 
-### 跑 1 epoch（冒烟测试）
-
 ```bash
-python scripts/train_rgbdgaze_dinov2.py --epochs 1 --batch-size 48
+python scripts/rgbdgaze/train.py --epochs 1 --batch-size 48
 ```
 
 ### 老奶奶版理解文档

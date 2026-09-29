@@ -23,7 +23,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 # ---- 路径引导：确保从任意工作目录都能导入 configs / gazelab / tools ----
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)

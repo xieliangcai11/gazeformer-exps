@@ -1,9 +1,9 @@
 """RGBDGaze 新模型（DINOv2 + 逆深度 + BlockMoba）训练入口。
 
-数据/目录/输出全部复用 train_rgbdgaze.py 的规范，仅换模型与损失。
+数据/目录/输出全部复用原 RGBDGaze 训练规范（train_baseline.py），仅换模型与损失。
 
 用法：
-    python scripts/train_rgbdgaze_dinov2.py [--epochs N] [--batch-size B]
+    python scripts/rgbdgaze/train.py [--epochs N] [--batch-size B]
                                            [--lr LR] [--device cuda]
                                            [--save-dir DIR] [--dino-ckpt PATH]
 
@@ -19,7 +19,7 @@ import os
 import sys
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -36,7 +36,7 @@ from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM
 from gazelab.datasets.rgbdgaze import (RGBDGazeDataset, rgb_preprocess,
                                        inverse_depth_preprocess)
-from gazelab.models.rgbdgaze_dinov2 import RGBDGazeDINOv2, DINOV2_CKPT
+from gazelab.models.rgbdgaze import RGBDGazeDINOv2, DINOV2_CKPT
 
 
 class Subset(torch.utils.data.Dataset):

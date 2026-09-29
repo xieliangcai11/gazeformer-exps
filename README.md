@@ -27,35 +27,38 @@ Gazelab 是一个**模块化、可扩展**的视线估计研究框架。核心�
 ```
 gazelab/
 ├── configs/                 # 配置（按数据集分）
-│   ├── gaze360_config.py    # Gaze360 配置（路径/超参/输出目录）
-│   └── rgbdgaze_config.py   # RGBDGaze 配置
+│   ├── gaze360_config.py    # Gaze360 配置（参考/遗留）
+│   └── rgbdgaze_config.py   # RGBDGaze 配置（主推）
 ├── src/gazelab/             # 核心包
-│   ├── datasets/            # 数据集（统一 re-export）
-│   │   ├── gazelab/__init__.py    # 数据集导出层
-│   │   ├── gaze360_dataset.py     # Gaze360 的 GazeHub 格式数据集
-│   │   └── rgbdgaze.py            # RGBDGaze 双流数据集
-│   ├── models/
-│   │   ├── gaze360_gazeformer.py  # Gaze360 主模型（CLIP 语义融合）
-│   │   ├── transformers.py        # MoE Transformer：特征 -> 3D 视线
-│   │   ├── rgbdgaze.py            # RGBDGaze 双流模型
-│   │   └── clipmodel.py           # CLIP 相关
+│   ├── datasets/            # 数据集
+│   │   ├── gaze360_dataset.py
+│   │   └── rgbdgaze.py      # RGBDGaze：RGB+depth 双流，返回 (edict(rgb,depth), gaze)
+│   ├── models/              # 模型（按工作流分子包）
+│   │   ├── gaze360/         # Gaze360 主模型（参考/遗留）
+│   │   │   ├── gaze360_gazeformer.py
+│   │   │   └── clipmodel.py
+│   │   ├── rgbdgaze/        # RGBDGaze 模型家族（主推）
+│   │   │   ├── rgbdgaze.py            # 旧版基线（CLIP+ResNet）
+│   │   │   └── rgbdgaze_dinov2.py     # 新版（DINOv2+逆深度+BlockMoba）
+│   │   └── transformers.py  # 共享融合块（BlockMoba / MoE / Transformer）
 │   └── utils/
-│       ├── common.py              # 通用工具
-│       └── loggers.py             # 日志（TensorBoard / wandb）
+│       ├── common.py
+│       └── loggers.py
 ├── tools/
-│   └── data/               # 数据处理脚本
-│       ├── preprocess.py   # Gaze360 -> GazeHub 标准格式
-│       └── verify.py       # 数据校验
-├── scripts/
-│   ├── train_gaze360.py     # Gaze360 训练入口
-│   ├── train_rgbdgaze.py    # RGBDGaze 训练入口
-│   └── train_test.py        # 通用测试入口
-├── out/                     # 训练产物（日志/权重/tensorboard，gitignore 忽略）
+│   └── data/
+│       ├── gaze360/         # preprocess.py / verify.py（参考）
+│       └── rgbdgaze/        # preprocess.py（建索引+划分）
+├── scripts/                 # 训练/推理入口（按工作流分子包）
+│   ├── gaze360/             # （参考/遗留）train.py / train_test.py / predict.py
+│   └── rgbdgaze/            # （主推）
+│       ├── train.py             # DINOv2 新模型训练（主入口）
+│       ├── train_baseline.py    # 旧基线训练
+│       └── predict.py           # 单样本推理+可视化
+├── out/                     # 训练产物（日志/权重，gitignore 忽略）
 │   └── {dataset}/{task}/{logs,checkpoints,runs}
 ├── assets/                 # 推理用检测模型（mediapipe / Haar）
-├── experiments/            # （预留）多模型 / 多实验
-├── tests/                  # （预留）测试
 ├── docs/                   # 文档
+├── model/                  # 预训练权重（如 DINOv2，gitignore 忽略）
 ├── pyproject.toml          # 包定义
 └── requirements.txt        # 依赖
 ```
@@ -114,9 +117,11 @@ python scripts/train_gaze360.py
 
 ```bash
 # 1. 先建索引（sample=随机 / subject=按人 / activity=按活动）
-conda run -n dl python -m tools.data.rgbdgaze_preprocess --split sample
-# 2. 训练
-conda run -n dl python scripts/train_rgbdgaze.py --epochs 30 --batch-size 64 --lr 1e-4
+conda run -n dl python -m tools.data.rgbdgaze.preprocess --split sample
+# 2a. 新模型（DINOv2 + 逆深度 + BlockMoba，推荐）
+conda run -n dl python scripts/rgbdgaze/train.py --epochs 30 --batch-size 48
+# 2b. 旧基线（CLIP + ResNet）
+conda run -n dl python scripts/rgbdgaze/train_baseline.py --epochs 30 --batch-size 64 --lr 1e-4
 ```
 
 ### 测试

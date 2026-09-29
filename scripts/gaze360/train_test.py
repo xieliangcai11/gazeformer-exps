@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 # ---- 路径引导：确保从任意工作目录都能导入 gazelab / configs / tools ----
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -26,7 +26,7 @@ from gazelab.utils.common import gaze_dir_3d_to_class, leave_one_out, one
 #     DatasetGaze360ByGazeHub,
 #     DatasetETHXGazeByGazeHub,
 # )
-from gazelab.models.gaze360_gazeformer import GEWithCLIPModel
+from gazelab.models.gaze360 import GEWithCLIPModel
 from configs.gaze360_config import *
 from torch.utils.tensorboard import SummaryWriter
 

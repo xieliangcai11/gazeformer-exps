@@ -1,10 +1,10 @@
 """RGBDGaze 训练入口（独立脚本，不依赖 train.py / Gaze360 管线）。
 
 运行前先构建索引：
-    python -m tools.data.rgbdgaze_preprocess --split sample
+    python -m tools.data.rgbdgaze.preprocess --split sample
 
 用法：
-    python scripts/train_rgbdgaze.py [--epochs N] [--batch-size B]
+    python scripts/rgbdgaze/train_baseline.py [--epochs N] [--batch-size B]
                                      [--lr L] [--index-dir DIR] [--device cuda]
                                      [--save-dir DIR]
 
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 # 路径引导（同其他脚本）
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
