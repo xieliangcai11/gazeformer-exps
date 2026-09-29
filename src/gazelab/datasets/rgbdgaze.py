@@ -67,6 +67,24 @@ def depth_preprocess(img_bgr: np.ndarray) -> torch.Tensor:
     return (t - mean) / std
 
 
+def inverse_depth_preprocess(img_bgr: np.ndarray) -> torch.Tensor:
+    """Depth 人脸 -> 逆深度单通道 [1, H, W]（适配 DINOv2 新模型）。
+
+    思路（对齐"深度图是灰度单值"这一实测事实）：
+      1. 深度图三通道 R==G==B，取第 0 通道即灰度深度值。
+      2. 转浮点并归一化到 [0,1]（相对距离，大=近）。
+      3. 取逆深度 1/(z+eps)，放大近处几何信息（逆深度与视差成正比，是立体几何的标准范式）。
+      4. 返回 [1, H, W] float32。
+    """
+    z = img_bgr[:, :, 0].astype(np.float32)          # [H,W] 深度灰度
+    z = np.clip(z, 0.0, 255.0) / 255.0                # -> [0,1]
+    inv = 1.0 / (z + 1e-3)                            # 逆深度，近处大
+    # 归一化到 [0,1] 附近，避免量纲过大
+    inv = np.clip(inv, 0.0, 255.0) / 255.0
+    t = torch.from_numpy(inv).unsqueeze(0).float()    # [1,H,W]
+    return t
+
+
 class RGBDGazeDataset(Dataset):
     """RGBDGaze 数据集：从索引文件加载 (RGB 路径, depth 路径, 设备, 注视点)。
 
