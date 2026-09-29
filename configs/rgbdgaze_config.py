@@ -8,6 +8,8 @@ from pathlib import Path
 
 # 项目根目录 = 本文件(configs/rgbdgaze_config.py)的上一级；使路径不依赖运行 CWD
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 公开的项目根（供各模块复用，避免各自数 __file__ 层级导致脆弱）
+PROJECT_ROOT = _PROJECT_ROOT
 
 # RGBDGaze 目录结构（官方）
 # data/RGBDGaze_dataset/
