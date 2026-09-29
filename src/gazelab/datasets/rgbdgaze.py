@@ -152,7 +152,13 @@ class RGBDGazeDataset(Dataset):
         返回 (rgb_224, depth_224) 均 resize 成 IMAGE_SIZE。
         """
         rgb = cv2.imread(str(rgb_path))
+        if rgb is None:
+            raise FileNotFoundError(
+                f"无法读取 RGB 图像: {rgb_path}（文件缺失或损坏？）")
         depth = cv2.imread(str(depth_path))
+        if depth is None:
+            raise FileNotFoundError(
+                f"无法读取 depth 图像: {depth_path}（文件缺失或损坏？）")
 
         # 图片需逆时针旋转 90°（作者 bbox 基于竖图坐标系）
         rgb = np.rot90(rgb, 1)
