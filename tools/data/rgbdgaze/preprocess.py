@@ -106,8 +106,12 @@ def discover_samples():
                 if not rgb.exists() or not depth.exists():
                     # RGB 与 depth 数量一致（论文所述），跳过缺任一
                     continue
+                # 存"相对项目根" + 前向斜杠的路径，跨 Windows/Linux 通用
+                # （读取端再用 configs.rgbdgaze_config.PROJECT_ROOT 拼回绝对路径）
+                rgb_rel = rgb.relative_to(_PROJECT_ROOT).as_posix()
+                depth_rel = depth.relative_to(_PROJECT_ROOT).as_posix()
                 samples.append(dict(
-                    rgb=str(rgb), depth=str(depth),
+                    rgb=rgb_rel, depth=depth_rel,
                     bbox_xywh=(bx, by, bw, bh),
                     device=device, screen_w=w_pt, screen_h=h_pt,
                     gaze_x=gx, gaze_y=gy,
