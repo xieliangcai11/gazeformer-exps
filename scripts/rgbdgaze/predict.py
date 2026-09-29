@@ -11,7 +11,7 @@ predict_rgbdgaze.py — RGBDGaze 单张样本推理：预测屏幕注视点并�
   4. 在手机屏幕示意上标注预测点，并打印坐标 / 物理cm / 角度
 
 用法：
-    python scripts/inference/predict_rgbdgaze.py \
+    python scripts/rgbdgaze/predict.py \
         --rgb 图片路径 --depth 深度图路径 \
         [--checkpoint 权重] [--out 输出png] [--screen-w 16 --screen-h 8]
 

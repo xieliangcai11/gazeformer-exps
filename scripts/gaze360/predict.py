@@ -44,7 +44,7 @@ import numpy as np
 import torch
 
 from configs.gaze360_config import DEVICE, CNN_PREPROCESS, ABLA_CONFIG, experiment_dirs
-from gazelab.models.gaze360_gazeformer import GEWithCLIPModel_zhao as GEWithCLIPModel
+from gazelab.models.gaze360 import GEWithCLIPModel_zhao as GEWithCLIPModel
 from gazelab.models.transformers import TransformerDeepSeek_gaze
 
 # 默认权重路径：out/gaze360/train/checkpoints/（与训练输出规范一致）

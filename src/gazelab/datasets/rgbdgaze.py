@@ -8,7 +8,7 @@
     gaze  = 归一化后的 2D 屏幕注视坐标 (x, y)
 
 依赖 configs/rgbdgaze_config.py 中的路径与超参。
-数据索引由 tools/data/rgbdgaze_preprocess.py 生成（index csv）。
+数据索引由 tools/data/rgbdgaze/preprocess.py 生成（index csv）。
 """
 
 from pathlib import Path
