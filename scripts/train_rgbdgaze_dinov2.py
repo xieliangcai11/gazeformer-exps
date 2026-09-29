@@ -123,8 +123,8 @@ def evaluate_split(model, dl, device):
     start = 0
     with torch.no_grad():
         for inp, label in dl:
-            face = inp.face.to(device).float()
-            depth = inp.other_face.to(device).float()
+            face = inp.rgb.to(device).float()
+            depth = inp.depth.to(device).float()
             label = label.to(device)
             pred = model(face, depth)
             diff = (pred - label)
@@ -239,8 +239,8 @@ def main():
         run_loss = 0.0
         n_step = 0
         for i, (inp, label) in enumerate(train_dl):
-            face = inp.face.to(device).float()
-            depth = inp.other_face.to(device).float()  # [B,1,H,W] 逆深度
+            face = inp.rgb.to(device).float()
+            depth = inp.depth.to(device).float()  # [B,1,H,W] 逆深度
             label = label.to(device)
             optimizer.zero_grad()
             pred = model(face, depth)  # [B,2]

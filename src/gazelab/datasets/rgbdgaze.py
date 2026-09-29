@@ -1,12 +1,11 @@
 """RGBDGaze 数据集类。
 
-遵循 src/gazelab/datasets.py 的返回协议：
-    __getitem__ 返回 (edict(face=..., other_face=...), label)
+遵循统一返回协议，`__getitem__` 返回 `(edict(rgb=..., depth=...), gaze)`：
 
 但 RGBDGaze 是双流（RGB + depth）+ 2D 屏幕坐标目标：
-    face        = RGB 人脸裁剪图（走 CLIP/主视觉流）
-    other_face  = depth 人脸裁剪图（走 CNN/几何流）
-    label       = 归一化后的 2D 屏幕注视坐标 (x, y)
+    rgb   = RGB 人脸裁剪图（走视觉流，ImageNet 归一化）
+    depth = 深度人脸几何图（逆深度单通道 [1,H,W] 或灰度）
+    gaze  = 归一化后的 2D 屏幕注视坐标 (x, y)
 
 依赖 configs/rgbdgaze_config.py 中的路径与超参。
 数据索引由 tools/data/rgbdgaze_preprocess.py 生成（index csv）。
@@ -193,4 +192,4 @@ class RGBDGazeDataset(Dataset):
             label = np.array([float(row["gaze_x"]), float(row["gaze_y"])],
                              dtype=np.float32)
 
-        return edict(face=rgb_face, other_face=depth_face), self.target_transform(label)
+        return edict(rgb=rgb_face, depth=depth_face), self.target_transform(label)
