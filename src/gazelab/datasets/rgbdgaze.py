@@ -219,5 +219,12 @@ class RGBDGazeDataset(Dataset):
             dtype=torch.float32,
         )
 
+        # IMU 重力向量（若 index 含该列则返回，供 use_imu 模型使用；否则零向量占位）
+        try:
+            imu = torch.tensor([float(row["imu_x"]), float(row["imu_y"]),
+                                float(row["imu_z"])], dtype=torch.float32)
+        except (KeyError, ValueError):
+            imu = torch.zeros(3, dtype=torch.float32)
+
         return edict(rgb=rgb_face, depth=depth_face,
-                     screen_cm=screen_cm), self.target_transform(label)
+                     screen_cm=screen_cm, imu=imu), self.target_transform(label)
