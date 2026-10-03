@@ -92,6 +92,10 @@ def discover_samples():
                     gx = float(row[col["gt_x_pt"]])
                     gy = float(row[col["gt_y_pt"]])
                     device = row[col["device"]]
+                    # IMU 重力向量（数据集自带但论文未使用，留作未来工作）
+                    imu_x = float(row[col["imu_x"]]) if "imu_x" in col else 0.0
+                    imu_y = float(row[col["imu_y"]]) if "imu_y" in col else 0.0
+                    imu_z = float(row[col["imu_z"]]) if "imu_z" in col else 0.0
                 except (KeyError, IndexError, ValueError):
                     continue  # 跳过坏行
                 key = _norm(device)
@@ -116,6 +120,7 @@ def discover_samples():
                     device=device, screen_w=w_pt, screen_h=h_pt,
                     gaze_x=gx, gaze_y=gy,
                     cm_px_x=cm_px_x, cm_px_y=cm_px_y,
+                    imu_x=imu_x, imu_y=imu_y, imu_z=imu_z,
                     subject=subj, activity=act,
                 ))
     return samples
@@ -129,13 +134,15 @@ def write_index(samples, index_dir: Path):
         w = csv.writer(f)
         w.writerow(["rgb_path", "depth_path", "bbox_x", "bbox_y", "bbox_w",
                     "bbox_h", "device", "screen_w", "screen_h", "gaze_x",
-                    "gaze_y", "cm_px_x", "cm_px_y", "subject", "activity"])
+                    "gaze_y", "cm_px_x", "cm_px_y", "imu_x", "imu_y", "imu_z",
+                    "subject", "activity"])
         for s in samples:
             bx, by, bw, bh = s["bbox_xywh"]
             w.writerow([s["rgb"], s["depth"], bx, by, bw, bh,
                         s["device"], s["screen_w"], s["screen_h"],
                         s["gaze_x"], s["gaze_y"],
                         s["cm_px_x"], s["cm_px_y"],
+                        s["imu_x"], s["imu_y"], s["imu_z"],
                         s["subject"], s["activity"]])
     subject_set = OrderedDict()
     for s in samples:

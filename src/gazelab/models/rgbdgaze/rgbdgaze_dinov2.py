@@ -122,6 +122,50 @@ class DINOv2Backbone(nn.Module):
             pass
 
 
+class DepthAttentionFusion(nn.Module):
+    """深度特征图 -> 空间注意力权重图 -> 与 RGB 特征图逐像素相乘（论文同款机制）。
+
+    结构（对应 RGBDGaze 论文 Figure 3 的 CNN Spatial Attention Unit）：
+        depth [B,1,H,W]
+          -> 轻量 CNN（几层 3x3）得 depth 特征 [B, C_d, H', W']
+          -> 1x1 conv 出单通道空间权重图 [B, 1, H', W']（sigmoid）
+          -> RGB 特征图与权重图逐元素相乘后重新投影到 d_model
+    保留深度空间结构（相比旧版压成 64 个 token，信息不再被池化丢弃）。
+
+    为什么加 RGB 特征图：RGB tokens 是 DINOv2 输出（[B,N,C]，N=256, 网格16x16），
+    深度注意力图下采样到 16x16 与之对齐，乘法融合后得到"被深度引导"的 RGB 表征，
+    再与原 RGB 表征并联，保证不丢原信息。
+    """
+
+    def __init__(self, dino_dim: int, d_model: int, hidden: int = 32, grid: int = 16):
+        super().__init__()
+        self.grid = grid
+        # 轻量 CNN：1通道逆深度 -> hidden 特征
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
+        )
+        # 1x1 conv 出空间注意力图（单通道）
+        self.attn = nn.Conv2d(hidden, 1, 1)
+        # 融合后投影回 d_model（输入 = RGB特征(被门控) + 原RGB特征 拼接? 简化为乘法后直接投影）
+        self.proj = nn.Linear(dino_dim, d_model)
+        self.gate = nn.Parameter(torch.zeros(1))  # 融合强度门控（可学习，初始0=不干扰）
+
+    def forward(self, depth: torch.Tensor, rgb_tokens: torch.Tensor):
+        """depth: [B,1,H,W] 逆深度; rgb_tokens: [B, N, dino_dim] (无cls)。
+        返回 [B, N, d_model] 的深度门控 RGB 表征。
+        """
+        B = depth.size(0)
+        # 1) 深度特征 -> 注意力图，池化到 patch 网格
+        feat = self.cnn(depth)                                # [B, hidden, H, W]
+        attn = torch.sigmoid(self.attn(feat))                 # [B, 1, H, W]
+        attn = nn.functional.adaptive_avg_pool2d(attn, (self.grid, self.grid))
+        attn = attn.reshape(B, 1, self.grid * self.grid)      # [B, 1, N]
+        # 2) 门控乘法：深度引导的 RGB 表征 = 原 tokens * (1 + gate * attn)
+        gated = rgb_tokens * (1.0 + self.gate * attn.permute(0, 2, 1))  # [B,N,C]
+        return self.proj(gated)                               # [B, N, d_model]
+
+
 class DepthPatchEmbed(nn.Module):
     """把逆深度单通道图嵌入为 depth tokens（少量，几何补充）。
 
@@ -163,6 +207,8 @@ class RGBDGazeDINOv2(nn.Module):
         freeze_dino=True,
         use_depth=True,
         unfreeze_last=0,
+        depth_mode="token",
+        use_imu=False,
         dino_model=DINOV2_MODEL,
         dino_ckpt=DINOV2_CKPT,
     ):
@@ -177,13 +223,31 @@ class RGBDGazeDINOv2(nn.Module):
         self.proj_rgb_cls = nn.Linear(dino_dim, d_model)
         self.proj_rgb_patch = nn.Linear(dino_dim, d_model)
 
-        # ---- Depth 流（可关，做 RGB-only 消融） ----
+        # ---- Depth 流（可关；两种用法可选，做消融） ----
+        # depth_mode:
+        #   "none"      : 关闭深度
+        #   "attn"      : 轻量 CNN 特征图 + 与 RGB 特征图空间注意力相乘（论文同款机制）
+        #   "token"     : 旧版逆深度 grid token（消融已证弱，保留作对照）
         self.use_depth = use_depth
+        self.depth_mode = depth_mode
         if use_depth:
-            self.depth_patch = DepthPatchEmbed(in_channels=1, grid=depth_grid,
-                                               d_model=d_model)
+            if depth_mode == "attn":
+                self.depth_attn = DepthAttentionFusion(dino_dim, d_model)
+                self.depth_patch = None
+            elif depth_mode == "token":
+                self.depth_patch = DepthPatchEmbed(in_channels=1, grid=depth_grid,
+                                                   d_model=d_model)
+                self.depth_attn = None
+            else:
+                raise ValueError(f"未知 depth_mode: {depth_mode}")
         else:
             self.depth_patch = None
+            self.depth_attn = None
+
+        # ---- IMU 姿态 token（可选） ----
+        self.use_imu = use_imu
+        if use_imu:
+            self.proj_imu = nn.Linear(3, d_model)
 
         # ---- 融合：BlockMoba 栈 + 汇总 token ----
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -199,7 +263,7 @@ class RGBDGazeDINOv2(nn.Module):
         self.norm = RMSNorm(d_model, eps=1e-5)
         self.head = nn.Linear(d_model, gaze_dim)
 
-    def forward(self, face, depth):
+    def forward(self, face, depth, imu=None):
         # 1) RGB：DINOv2（冻结/部分解冻）-> cls + patches
         tokens = self.rgb(face)                      # [B, 1+N, C]
         cls = tokens[:, 0]                           # [B, C]
@@ -208,14 +272,26 @@ class RGBDGazeDINOv2(nn.Module):
         rgb_patch = self.proj_rgb_patch(patches)         # [B, N, d_model]
 
         # 2) 拼接：汇总CLS + rgb_cls [+ depth] + rgb_patches
-        if self.use_depth:
+        if self.use_depth and self.depth_mode == "attn":
+            # 深度空间注意力融合：门控增强后的 RGB patch 表征
+            d_patch = self.depth_attn(depth, patches)    # [B, N, d_model]
+            seq = torch.cat([rgb_cls, d_patch, rgb_patch], dim=1)
+        elif self.use_depth and self.depth_mode == "token":
             depth_tokens = self.depth_patch(depth)       # [B, N_d, d_model]
             seq = torch.cat([rgb_cls, depth_tokens, rgb_patch], dim=1)
         else:
             seq = torch.cat([rgb_cls, rgb_patch], dim=1)
+
+        # 2b) IMU 姿态 token（可选，1 个 token）
+        if self.use_imu:
+            if imu is None:
+                raise ValueError("use_imu=True 但 forward 未提供 imu")
+            imu_tok = self.proj_imu(imu).unsqueeze(1)    # [B, 1, d_model]
+            seq = torch.cat([imu_tok, seq], dim=1)
+
         B = depth.size(0)
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+1+[N_d]+N, d_model]
+        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+1+[imu]+[N_d]+N, d_model]
 
         # 3) BlockMoba 栈（自注意力融合）
         for layer in self.layers:

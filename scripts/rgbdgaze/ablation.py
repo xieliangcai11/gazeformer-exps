@@ -127,7 +127,8 @@ def evaluate_split(model, dl, device):
             face = inp.rgb.to(device).float()
             depth = inp.depth.to(device).float()
             label = label.to(device)
-            pred = model(face, depth)
+            imu = inp.imu.to(device).float() if getattr(model, "use_imu", False) else None
+            pred = model(face, depth, imu=imu)
             diff = pred - label
             B = label.size(0)
             cm_b = torch.from_numpy(cm_arr[start:start+B]).to(device)
@@ -188,8 +189,14 @@ def parse():
                    default=True, help="使用逆深度分支（默认开）")
     p.add_argument("--no-depth", dest="use_depth", action="store_false",
                    help="只用 RGB，关闭逆深度分支")
+    p.add_argument("--depth-mode", choices=["token", "attn"], default="token",
+                   help="深度用法：token=旧版grid token；attn=特征图空间注意力相乘(论文同款)")
     p.add_argument("--unfreeze", type=int, default=0,
                    help="解冻 DINOv2 最后 N 个 block（0=全冻结）")
+    p.add_argument("--diff-lr", action="store_true",
+                   help="差分学习率：解冻的骨干用小lr(0.1x)，其余用 --lr")
+    p.add_argument("--use-imu", action="store_true",
+                   help="注入 IMU 姿态 token（需 index 含 imu 列）")
     p.add_argument("--tag", default=None,
                    help="输出目录标识（默认由超参自动生成）")
     return p.parse_args()
@@ -201,7 +208,9 @@ def main():
 
     if args.tag is None:
         args.tag = (f"loss{args.loss}_depth{args.use_depth}"
-                    f"_unfreeze{args.unfreeze}")
+                    f"{args.depth_mode}_unfreeze{args.unfreeze}"
+                    + ("_difflr" if args.diff_lr else "")
+                    + ("_imu" if args.use_imu else ""))
     run_dirs = experiment_dirs("rgbdgaze", "ablation")
     save_dir = run_dirs["checkpoint"] / args.tag
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -218,9 +227,23 @@ def main():
     model = RGBDGazeDINOv2(
         use_depth=args.use_depth,
         unfreeze_last=args.unfreeze,
+        depth_mode=args.depth_mode,
+        use_imu=args.use_imu,
     ).to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if args.diff_lr:
+        # 差分学习率：被解冻的骨干层用 0.1x，其余（投影/融合/头）用全量 lr
+        backbone_params, other_params = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (backbone_params if n.startswith("rgb.backbone") else other_params).append(p)
+        optimizer = optim.Adam([
+            {"params": backbone_params, "lr": args.lr * 0.1},
+            {"params": other_params, "lr": args.lr},
+        ])
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     train_dl = build_dataloader("train", Path(args.index_dir), args.batch_size,
                                 True, args.num_workers)
@@ -247,8 +270,9 @@ def main():
             face = inp.rgb.to(device).float()
             depth = inp.depth.to(device).float()
             label = label.to(device)
+            imu = inp.imu.to(device).float() if args.use_imu else None
             optimizer.zero_grad()
-            pred = model(face, depth)
+            pred = model(face, depth, imu=imu)
             loss_coord = criterion(pred, label)
             loss = loss_coord
             if args.loss == "mse_angle":
