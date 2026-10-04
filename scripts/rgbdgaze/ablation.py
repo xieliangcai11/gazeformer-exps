@@ -175,6 +175,44 @@ def evaluate_split(model, dl, device):
     )
 
 
+class ModelEMA:
+    """模型权重的指数移动平均（Exponential Moving Average）。
+
+    训练时每步更新：ema = decay * ema + (1 - decay) * model_params。
+    验证/保存用 EMA 权重（更平滑、泛化通常更好），这是视觉训练的标准技巧。
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone().float()
+                       for k, v in model.state_dict().items()
+                       if v.dtype.is_floating_point}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module):
+        """把 EMA 权重临时写入模型（保存原权重以便恢复）。"""
+        self._backup = {k: v.detach().clone()
+                        for k, v in model.state_dict().items()
+                        if k in self.shadow}
+        model.load_state_dict({**model.state_dict(), **self.shadow}, strict=False)
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        if self._backup is not None:
+            model.load_state_dict({**model.state_dict(), **self._backup}, strict=False)
+            self._backup = None
+
+    def state_dict(self):
+        return {k: v for k, v in self.shadow.items()}
+
+
 def parse():
     p = argparse.ArgumentParser(description="RGBDGaze DINOv2 消融实验")
     p.add_argument("--index-dir", default=str(RGBDGaze_INDEX_DIR))
@@ -197,6 +235,8 @@ def parse():
                    help="差分学习率：解冻的骨干用小lr(0.1x)，其余用 --lr")
     p.add_argument("--use-imu", action="store_true",
                    help="注入 IMU 姿态 token（需 index 含 imu 列）")
+    p.add_argument("--ema", action="store_true",
+                   help="使用 EMA 权重做验证与保存（decay=0.999）")
     p.add_argument("--tag", default=None,
                    help="输出目录标识（默认由超参自动生成）")
     return p.parse_args()
@@ -210,7 +250,8 @@ def main():
         args.tag = (f"loss{args.loss}_depth{args.use_depth}"
                     f"{args.depth_mode}_unfreeze{args.unfreeze}"
                     + ("_difflr" if args.diff_lr else "")
-                    + ("_imu" if args.use_imu else ""))
+                    + ("_imu" if args.use_imu else "")
+                    + ("_ema" if args.ema else ""))
     run_dirs = experiment_dirs("rgbdgaze", "ablation")
     save_dir = run_dirs["checkpoint"] / args.tag
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -244,6 +285,7 @@ def main():
         ])
     else:
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    ema = ModelEMA(model) if args.ema else None
 
     train_dl = build_dataloader("train", Path(args.index_dir), args.batch_size,
                                 True, args.num_workers)
@@ -282,6 +324,8 @@ def main():
                 loss = loss_coord + loss_ang
             loss.backward()
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
             run_loss += loss.item()
             n_step += 1
             if i % 100 == 0 or i == len(train_dl) - 1:
@@ -290,19 +334,35 @@ def main():
                 t0 = time.time()
 
         vres = evaluate_split(model, val_dl, device)
+        if ema is not None:
+            # 用 EMA 权重评估（训练权重继续训练，EMA 更平滑）
+            ema.apply_to(model)
+            vres_ema = evaluate_split(model, val_dl, device)
+            ema.restore(model)
+            if vres_ema["ang_mean"] < vres["ang_mean"]:
+                vres = vres_ema
+                saved_ema = " [EMA]"
+            else:
+                saved_ema = " [raw更优]"
         mean_train = run_loss / max(n_step, 1)
         mean_ang = vres["ang_mean"]
         saved = ""
         if mean_ang < best_val:
             best_val = mean_ang
             ckpt = save_dir / "best.pt"
-            torch.save(model.state_dict(), ckpt)
+            if ema is not None:
+                ema.apply_to(model)
+                torch.save(model.state_dict(), ckpt)
+                ema.restore(model)
+            else:
+                torch.save(model.state_dict(), ckpt)
             saved = f"  [保存 → {ckpt} ({mean_ang:.2f}°)]"
         write_log(f"[epoch {epoch}]  train_loss {mean_train:.4f}  "
                   f"val_L2 {vres['l2_norm']:.4f}  val_em {vres['em_dist']:.2f}cm  "
                   f"val_ang 平均 {vres['ang_mean']:.2f}° | 中位 {vres['ang_median']:.2f}° | "
                   f"95%分位 {vres['ang_p95']:.2f}° | 前95%平均 {vres['ang_top95_mean']:.2f}° | "
-                  f"≤1.91° {vres['ang_ratio_le_191']:.1f}%{saved}")
+                  f"≤1.91° {vres['ang_ratio_le_191']:.1f}%"
+                  + (saved_ema if ema is not None else "") + f"{saved}")
 
 
 if __name__ == "__main__":
