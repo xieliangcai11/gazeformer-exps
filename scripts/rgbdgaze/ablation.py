@@ -291,12 +291,14 @@ def main():
                                 True, args.num_workers)
     val_dl = build_dataloader("val", Path(args.index_dir), args.batch_size,
                               False, args.num_workers)
+    test_dl = build_dataloader("test", Path(args.index_dir), args.batch_size,
+                               False, args.num_workers)
 
     tr_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"
               f" loss={args.loss} depth={args.use_depth} "
               f"unfreeze={args.unfreeze}\n"
-              f" 训练集 {len(train_dl.dataset)} / 验证集 {len(val_dl.dataset)}\n"
+              f" 训练集 {len(train_dl.dataset)} / 验证集 {len(val_dl.dataset)} / 测试集 {len(test_dl.dataset)}\n"
               f" batch={args.batch_size} lr={args.lr} epochs={args.epochs}\n"
               f" 可训练参数: {tr_params:,}\n"
               f" 输出: {save_dir}\n{'='*70}")
@@ -363,6 +365,29 @@ def main():
                   f"95%分位 {vres['ang_p95']:.2f}° | 前95%平均 {vres['ang_top95_mean']:.2f}° | "
                   f"≤1.91° {vres['ang_ratio_le_191']:.1f}%"
                   + (saved_ema if ema is not None else "") + f"{saved}")
+
+    # ---- 训练结束：用 best 权重在 test 集做独立终评（test 不参与选模） ----
+    best_ckpt = save_dir / "best.pt"
+    if best_ckpt.exists():
+        model.load_state_dict(torch.load(best_ckpt, map_location=device,
+                                         weights_only=False))
+        fres = evaluate_split(model, test_dl, device)
+        write_log("=" * 70)
+        write_log(f"[final] 用 best 权重（val {best_val:.2f}°）在 test 集独立终评:")
+        write_log(f"[final] test_L2 {fres['l2_norm']:.4f}  "
+                  f"test_em {fres['em_dist']:.2f}cm "
+                  f"(x:{fres['em_x']:.2f} y:{fres['em_y']:.2f})")
+        write_log(f"[final] test_ang 平均 {fres['ang_mean']:.2f}° | "
+                  f"中位 {fres['ang_median']:.2f}° | "
+                  f"95%分位 {fres['ang_p95']:.2f}° | "
+                  f"前95%平均 {fres['ang_top95_mean']:.2f}° | "
+                  f"≤1.91° {fres['ang_ratio_le_191']:.1f}% "
+                  f"(n={fres['count']})")
+        write_log(f"[final] 对比基线: 论文 RGBD 1.89cm | "
+                  f"{'已超越基线' if fres['em_dist'] < 1.89 else '未达基线'}")
+        write_log("=" * 70)
+    else:
+        write_log("[final] 未找到 best.pt，跳过 test 终评")
 
 
 if __name__ == "__main__":
