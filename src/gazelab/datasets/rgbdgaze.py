@@ -111,6 +111,9 @@ class RGBDGazeDataset(Dataset):
         color_transform: Optional[Callable] = None,
         depth_transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
+        augment: bool = False,
+        crop_jitter: float = 0.0,
+        image_size: int = None,
     ):
         super().__init__()
         self.index_csv = Path(index_csv)
@@ -124,6 +127,15 @@ class RGBDGazeDataset(Dataset):
         self.target_transform = (
             target_transform if target_transform is not None else _to_tensor_label
         )
+
+        # ---- 数据增强（只应训练集开启） ----
+        # augment     : 水平翻转(注视点x镜像) + 光度扰动
+        # crop_jitter : 裁剪框随机抖动比例（相对bbox边长，如0.05=±5%）
+        self.augment = augment
+        self.crop_jitter = float(crop_jitter) if augment else 0.0
+        self._rng = np.random.RandomState()
+        # 输入分辨率（None = 使用配置的 IMAGE_SIZE）
+        self.image_size = int(image_size) if image_size else IMAGE_SIZE
 
         # 每样本的"像素 -> 厘米"换算系数（来自 index，用于把预测误差转成物理 cm）
         try:
@@ -143,7 +155,8 @@ class RGBDGazeDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
-    def _make_face_pair(self, rgb_path, depth_path, bbox_xywh):
+    def _make_face_pair(self, rgb_path, depth_path, bbox_xywh,
+                        jitter=0.0, rng=None):
         """读 RGB + depth，用人脸 bbox 各裁一帧返回 dict
 
         重要：原始 RGB/depth 图是横向存储的，但作者 bbox 坐标基于
@@ -164,13 +177,15 @@ class RGBDGazeDataset(Dataset):
         rgb = np.rot90(rgb, 1)
         depth = np.rot90(depth, 1)
 
-        rgb_face = self._crop(rgb, bbox_xywh, rgb.shape[1], rgb.shape[0])
+        rgb_face = self._crop(rgb, bbox_xywh, rgb.shape[1], rgb.shape[0],
+                              jitter=jitter, rng=rng)
         # depth 分辨率缩放（相对旋转后的尺寸）
         dw, dh = depth.shape[1], depth.shape[0]
         sc = (dw / rgb.shape[1], dh / rgb.shape[0])
         bx, by, bw, bh = bbox_xywh
         depth_bbox = (bx * sc[0], by * sc[1], bw * sc[0], bh * sc[1])
-        depth_face = self._crop(depth, depth_bbox, dw, dh)
+        depth_face = self._crop(depth, depth_bbox, dw, dh,
+                                jitter=jitter, rng=rng)
 
         if self.color_transform is not None:
             rgb_face = self.color_transform(rgb_face)
@@ -178,20 +193,42 @@ class RGBDGazeDataset(Dataset):
             depth_face = self.depth_transform(depth_face)
         return rgb_face, depth_face
 
-    @staticmethod
-    def _crop(img, bbox_xywh, W, H):
-        """按 bbox 裁人脸 (中心 + 边长*CROP_MARGIN)，resize 到 IMAGE_SIZE。"""
+    def _augment_pair(self, rgb_t, depth_t, gx):
+        """对已裁剪归一化的 (rgb, depth, gaze_x) 应用增强，返回增强后三元组。
+
+        水平翻转：人脸左右镜像时，注视点 x 必须镜像 gx -> 1-gx（正确性关键）。
+        光度扰动：只作用于 rgb（亮度/对比度/通道级微扰），depth 不动。
+        """
+        if self._rng.random() < 0.5:
+            rgb_t = torch.flip(rgb_t, dims=[2])
+            depth_t = torch.flip(depth_t, dims=[2])
+            gx = 1.0 - gx
+        # 光度扰动：亮度 ±20%，对比度 ±20%，以 1.0 为中性
+        rgb_t = rgb_t * self._rng.uniform(0.8, 1.2) + self._rng.uniform(-0.05, 0.05)
+        rgb_t = torch.clamp(rgb_t, -2.5, 2.5)  # ImageNet 归一化后合理范围
+        return rgb_t, depth_t, gx
+
+    def _crop(self, img, bbox_xywh, W, H, jitter=0.0, rng=None):
+        """按 bbox 裁人脸 (中心 + 边长*CROP_MARGIN)，resize 到 IMAGE_SIZE。
+
+        jitter>0 时对裁剪中心与边长做随机抖动（数据增强用）：
+            中心偏移 ±jitter*side，边长缩放 [1-jitter, 1+jitter]。
+        """
         import math
         x, y, w, h = bbox_xywh
         cx, cy = x + w / 2, y + h / 2
         side = max(w, h) * CROP_MARGIN
+        if jitter > 0 and rng is not None:
+            cx += rng.uniform(-1, 1) * jitter * side
+            cy += rng.uniform(-1, 1) * jitter * side
+            side *= rng.uniform(1 - jitter, 1 + jitter)
         half = side / 2
         x0 = max(0, int(cx - half)); x1 = min(W, int(cx + half))
         y0 = max(0, int(cy - half)); y1 = min(H, int(cy + half))
         crop = img[y0:y1, x0:x1]
         if crop.size == 0:
             crop = np.zeros((2, 2, 3), dtype=np.uint8)
-        return cv2.resize(crop, (IMAGE_SIZE, IMAGE_SIZE))
+        return cv2.resize(crop, (self.image_size, self.image_size))
 
     def __getitem__(self, idx):
         row = self.rows[idx]
@@ -200,16 +237,23 @@ class RGBDGazeDataset(Dataset):
         # bbox 放在 index 的附加列（preprocess 写入）
         bbox = (float(row["bbox_x"]), float(row["bbox_y"]),
                 float(row["bbox_w"]), float(row["bbox_h"]))
-        rgb_face, depth_face = self._make_face_pair(rgb_path, depth_path, bbox)
+        rgb_face, depth_face = self._make_face_pair(
+            rgb_path, depth_path, bbox,
+            jitter=self.crop_jitter, rng=self._rng)
 
         if NORMALIZE_GAZE:
             # gaze 归一化到 [0,1]（除以设备屏幕像素尺寸）
             gx = float(row["gaze_x"]) / float(row["screen_w"])
             gy = float(row["gaze_y"]) / float(row["screen_h"])
-            label = np.array([gx, gy], dtype=np.float32)
         else:
-            label = np.array([float(row["gaze_x"]), float(row["gaze_y"])],
-                             dtype=np.float32)
+            gx = float(row["gaze_x"])
+            gy = float(row["gaze_y"])
+
+        # 数据增强（训练集）：翻转时注视点 x 必须同步镜像
+        if self.augment:
+            rgb_face, depth_face, gx = self._augment_pair(rgb_face, depth_face, gx)
+
+        label = np.array([gx, gy], dtype=np.float32)
 
         # 每样本屏幕物理尺寸(cm)，供"训练时按验收几何算角度"使用（消融/可选）
         # 向后兼容：旧消费者只取 rgb/depth/label，忽略该额外字段

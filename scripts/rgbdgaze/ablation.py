@@ -67,9 +67,10 @@ class Subset(torch.utils.data.Dataset):
         return self.base.screen_size[self.idces]
 
 
-def build_dataloader(split, index_dir, batch_size, shuffle, num_workers=0):
-    index_csv = index_dir / "index.csv"
-    list_txt = index_dir / f"{split}.txt"
+def build_dataloader(split, index_dir, batch_size, shuffle, num_workers,
+                     augment=False, crop_jitter=0.0, resolution=None):
+    index_csv = Path(index_dir) / "index.csv"
+    list_txt = Path(index_dir) / f"{split}.txt"
     paths = [l.strip() for l in list_txt.read_text(encoding="utf-8").splitlines()
              if l.strip()]
     import csv
@@ -80,7 +81,9 @@ def build_dataloader(split, index_dir, batch_size, shuffle, num_workers=0):
 
     ds = RGBDGazeDataset(index_csv,
                          color_transform=rgb_preprocess,
-                         depth_transform=inverse_depth_preprocess)
+                         depth_transform=inverse_depth_preprocess,
+                         augment=augment, crop_jitter=crop_jitter,
+                         image_size=resolution)
     sub = Subset(ds, idx)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers)
@@ -237,6 +240,12 @@ def parse():
                    help="注入 IMU 姿态 token（需 index 含 imu 列）")
     p.add_argument("--ema", action="store_true",
                    help="使用 EMA 权重做验证与保存（decay=0.999）")
+    p.add_argument("--augment", action="store_true",
+                   help="训练集数据增强（水平翻转+注视镜像、裁剪抖动、光度扰动）")
+    p.add_argument("--crop-jitter", type=float, default=0.05,
+                   help="裁剪框抖动比例（默认0.05，配合 --augment）")
+    p.add_argument("--resolution", type=int, default=224,
+                   help="模型输入分辨率（224 或 448）")
     p.add_argument("--tag", default=None,
                    help="输出目录标识（默认由超参自动生成）")
     return p.parse_args()
@@ -251,7 +260,9 @@ def main():
                     f"{args.depth_mode}_unfreeze{args.unfreeze}"
                     + ("_difflr" if args.diff_lr else "")
                     + ("_imu" if args.use_imu else "")
-                    + ("_ema" if args.ema else ""))
+                    + ("_ema" if args.ema else "")
+                    + ("_aug" if args.augment else "")
+                    + (f"_res{args.resolution}" if args.resolution != 224 else ""))
     run_dirs = experiment_dirs("rgbdgaze", "ablation")
     save_dir = run_dirs["checkpoint"] / args.tag
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -270,6 +281,7 @@ def main():
         unfreeze_last=args.unfreeze,
         depth_mode=args.depth_mode,
         use_imu=args.use_imu,
+        img_size=args.resolution,
     ).to(device)
     criterion = nn.MSELoss()
     if args.diff_lr:
@@ -288,11 +300,17 @@ def main():
     ema = ModelEMA(model) if args.ema else None
 
     train_dl = build_dataloader("train", Path(args.index_dir), args.batch_size,
-                                True, args.num_workers)
+                                True, args.num_workers,
+                                augment=args.augment, crop_jitter=args.crop_jitter,
+                                resolution=args.resolution)
     val_dl = build_dataloader("val", Path(args.index_dir), args.batch_size,
-                              False, args.num_workers)
+                              False, args.num_workers,
+                              augment=False, crop_jitter=0.0,
+                              resolution=args.resolution)
     test_dl = build_dataloader("test", Path(args.index_dir), args.batch_size,
-                               False, args.num_workers)
+                               False, args.num_workers,
+                               augment=False, crop_jitter=0.0,
+                               resolution=args.resolution)
 
     tr_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"

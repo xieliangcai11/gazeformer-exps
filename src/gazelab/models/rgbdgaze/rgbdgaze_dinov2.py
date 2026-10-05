@@ -49,20 +49,19 @@ class DINOv2Backbone(nn.Module):
     """
 
     def __init__(self, model_name=DINOV2_MODEL, ckpt=DINOV2_CKPT,
-                 freeze=True, unfreeze_last=0):
+                 freeze=True, unfreeze_last=0, img_size=DINOV2_IMG_SIZE):
         """freeze: 是否冻结 DINOv2；unfreeze_last: 解冻最后 N 个 block 参与微调。
-        unfreeze_last>0 时允许任务相关微调（代价是显存/耗时增加）。"""
+        unfreeze_last>0 时允许任务相关微调（代价是显存/耗时增加）。
+        img_size: 输入分辨率（pos_embed 会插值到对应网格）。"""
         super().__init__()
         backbone = timm.create_model(model_name, pretrained=False,
-                                     img_size=DINOV2_IMG_SIZE)
+                                     img_size=img_size)
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
         # DINOv2 官方权重额外带 'mask_token'（预训练专用），加载时忽略
         state.pop("mask_token", None)
-        # 权重是 518 训练的，输入 224 时需把 pos_embed 插值到 224 对应格数
+        # 权重是 518 训练的，输入分辨率不同时需把 pos_embed 插值到对应网格
         if "pos_embed" in state:
-            # 权重是 518 训练的，输入 224 时把 pos_embed 从 37x37 网格插值到 16x16。
-            # new_size 传 patch 网格 (16,16)；其余 prefix(cls) 由库内 num_prefix_tokens 保留。
-            grid = DINOV2_IMG_SIZE // backbone.patch_embed.patch_size[0]
+            grid = img_size // backbone.patch_embed.patch_size[0]
             state["pos_embed"] = resample_abs_pos_embed(
                 state["pos_embed"],
                 (grid, grid),
@@ -209,6 +208,7 @@ class RGBDGazeDINOv2(nn.Module):
         unfreeze_last=0,
         depth_mode="token",
         use_imu=False,
+        img_size=DINOV2_IMG_SIZE,
         dino_model=DINOV2_MODEL,
         dino_ckpt=DINOV2_CKPT,
     ):
@@ -218,7 +218,8 @@ class RGBDGazeDINOv2(nn.Module):
 
         # ---- RGB 流：冻结 DINOv2（可选解冻最后 N 层微调） ----
         self.rgb = DINOv2Backbone(dino_model, dino_ckpt, freeze=freeze_dino,
-                                  unfreeze_last=unfreeze_last)
+                                  unfreeze_last=unfreeze_last,
+                                  img_size=img_size)
         dino_dim = self.rgb.embed_dim
         self.proj_rgb_cls = nn.Linear(dino_dim, d_model)
         self.proj_rgb_patch = nn.Linear(dino_dim, d_model)
@@ -232,7 +233,10 @@ class RGBDGazeDINOv2(nn.Module):
         self.depth_mode = depth_mode
         if use_depth:
             if depth_mode == "attn":
-                self.depth_attn = DepthAttentionFusion(dino_dim, d_model)
+                # patch 网格 = img_size / 14（DINOv2 patch 大小），如 224/14=16, 448/14=32
+                patch_grid = img_size // 14
+                self.depth_attn = DepthAttentionFusion(dino_dim, d_model,
+                                                       grid=patch_grid)
                 self.depth_patch = None
             elif depth_mode == "token":
                 self.depth_patch = DepthPatchEmbed(in_channels=1, grid=depth_grid,
