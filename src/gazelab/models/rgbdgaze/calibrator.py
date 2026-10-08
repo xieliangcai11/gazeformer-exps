@@ -43,24 +43,18 @@ def extract_features(model, face, depth, imu=None):
     tokens = model.rgb(face)
     cls = tokens[:, 0]
     patches = tokens[:, 1:]
-    rgb_cls = model.proj_rgb_cls(cls).unsqueeze(1)
-    rgb_patch = model.proj_rgb_patch(patches)
+    # 校准器特征来源：DINOv2 骨干的原始 CLS token（而非融合 Transformer 后的 CLS）。
+    # 原因：融合后的 CLS 已被压缩为"全局摘要"，帧间差异极小（实测 norm 几乎恒定），
+    # 导致校准器退化为输出恒定值。骨干原始 CLS 保留了逐帧细节变化，适合校准。
+    # 将骨干 384 维投影到模型的 d_model 空间以保持维度一致。
+    raw_cls_feat = model.proj_rgb_cls(cls)  # [B, d_model]
 
-    if model.use_depth and model.depth_mode == "attn":
-        d_patch = model.depth_attn(depth, patches)
-        seq = torch.cat([rgb_cls, d_patch, rgb_patch], dim=1)
-    elif model.use_depth and model.depth_mode == "token":
-        seq = torch.cat([rgb_cls, model.depth_patch(depth), rgb_patch], dim=1)
-    else:
-        seq = torch.cat([rgb_cls, rgb_patch], dim=1)
+    # 同时拼接 patch tokens 的平均池化（提供空间聚合信息，增加帧间差异性）
+    patch_mean = model.proj_rgb_patch(patches.mean(dim=1))  # [B, d_model]
 
-    if model.use_imu:
-        if imu is None:
-            imu = face.new_zeros(face.size(0), 3)
-        seq = torch.cat([model.proj_imu(imu).unsqueeze(1), seq], dim=1)
+    return torch.cat([raw_cls_feat, patch_mean], dim=-1)  # [B, 2*d_model]
 
-    B = face.size(0)
-    x = torch.cat([model.cls_token.expand(B, -1, -1), seq], dim=1)
-    for layer in model.layers:
-        x = layer(x, cross_input=None, mask=None)
-    return model.norm(x[:, 0, :])  # [B, d_model] — 校准器输入
+
+def calibrator_feature_dim(model) -> int:
+    """返回校准器输入的特征维度。"""
+    return model.proj_rgb_cls.out_features * 2
