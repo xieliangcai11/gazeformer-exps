@@ -1,12 +1,15 @@
-"""RGBDGaze 一次校准实验（per-user one-time calibration）。
+"""RGBDGaze 一次校准实验 — 方案：学习"被试的系统性偏移修正"。
+
+核心思想（区别于之前的失败版本）：
+    之前的校准器试图从骨干特征重新映射到注视点（数据太少→退化为均值预测→崩溃）。
+    现在改为：模型已有的预测已经很好，校准器只需要学习一个 **2 维修正偏移量**。
+        corrected_gaze = model_prediction + offset(feature)
+    校准器从一个 2 维回归问题（远比 768→2 的全映射简单）中学习。
 
 流程：
-    1. 加载骨干模型（g5_nodepth_448_aug, test 1.68cm）。
-    2. 对每个测试被试：按时间顺序取前 calib_ratio% 帧作为校准集，
-       剩余帧作为测试集。
-    3. 用校准集的 (骨干特征, 真实注视点) 训练 Calibrator MLP。
-    4. 用校准后的 MLP 在该被试剩余帧上评估。
-    5. 对所有测试被试取平均 → 校准后整体性能。
+    1. 加载骨干模型，对每个测试被试取前 calib_ratio% 帧做校准。
+    2. 计算校准帧的 模型预测 与 GT 之间的偏移 → 训练一个轻量偏移预测器。
+    3. 测试时：最终预测 = 模型预测 + 校准器预测的偏移。
 """
 
 from __future__ import annotations
@@ -14,8 +17,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
-import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +32,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 
 from configs.gaze360_config import DEVICE as DEFAULT_DEVICE
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
@@ -37,96 +39,81 @@ from gazelab.datasets.rgbdgaze import (
     RGBDGazeDataset, rgb_preprocess, inverse_depth_preprocess,
 )
 from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import RGBDGazeDINOv2
-from gazelab.models.rgbdgaze.calibrator import Calibrator, extract_features
+from gazelab.models.rgbdgaze.calibrator import extract_features
 
 
-class FeatureDataset(Dataset):
-    def __init__(self, features, labels):
-        self.features = features
-        self.labels = labels
+class OffsetCalibrator(nn.Module):
+    """学习"骨干特征 → 2D偏移修正量"的轻量模块。"""
 
-    def __len__(self):
-        return len(self.features)
+    def __init__(self, feature_dim: int, hidden: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2),
+        )
 
-    def __getitem__(self, i):
-        return self.features[i], self.labels[i]
+    def forward(self, x):
+        return self.net(x)
 
 
 def frame_sort_key(path_str):
     return int(path_str.replace("\\", "/").split("/")[-1].split(".")[0])
 
 
-def build_subject_split(indices, rows, calib_ratio):
-    """对每个测试被试，按时间顺序取前 calib_ratio% 做校准，剩余做测试。"""
-    groups = defaultdict(list)
-    for idx in indices:
-        r = rows[idx]
-        groups[r["subject"]].append((frame_sort_key(r["rgb_path"]), idx))
-    result = {}
-    for subj, frames in groups.items():
-        frames.sort()
-        n = len(frames)
-        n_calib = max(1, int(n * calib_ratio))
-        result[subj] = {
-            "calib": [idx for _, idx in frames[:n_calib]],
-            "test": [idx for _, idx in frames[n_calib:]],
-        }
-    return result
-
-
 @torch.no_grad()
-def extract_all_features(model, indices, dataset, device, batch_size=32):
-    model.eval()
-    all_feats, all_labels = [], []
+def predict_batch(model, indices, dataset, device, batch_size=32):
+    """批量获取模型预测和 GT。"""
+    preds, labels = {}, {}
     for start in range(0, len(indices), batch_size):
-        batch_idx = indices[start:start + batch_size]
-        faces, depths, labels = [], [], []
-        for idx in batch_idx:
+        batch = indices[start:start+batch_size]
+        faces, depths = [], []
+        for idx in batch:
             inp, label = dataset[idx]
             faces.append(inp.rgb)
             depths.append(inp.depth)
-            labels.append(label)
+            labels[idx] = label.numpy()
+        f = torch.stack(faces).to(device).float()
+        d = torch.stack(depths).to(device).float()
+        out = model(f, d)
+        for i, idx in enumerate(batch):
+            preds[idx] = out[i].cpu().numpy()
+    return preds, labels
+
+
+@torch.no_grad()
+def feature_batch(model, indices, dataset, device, batch_size=32):
+    """批量提取骨干特征。"""
+    feats = {}
+    for start in range(0, len(indices), batch_size):
+        batch = indices[start:start+batch_size]
+        faces, depths = [], []
+        for idx in batch:
+            inp, _ = dataset[idx]
+            faces.append(inp.rgb)
+            depths.append(inp.depth)
         f = torch.stack(faces).to(device).float()
         d = torch.stack(depths).to(device).float()
         feat = extract_features(model, f, d)
-        all_feats.append(feat.cpu())
-        all_labels.append(torch.stack(labels))
-    return torch.cat(all_feats), torch.cat(all_labels)
-
-
-def train_calibrator(feats, labels, device, epochs=200, lr=1e-3, hidden=128):
-    calibrator = Calibrator(feature_dim=feats.shape[1], hidden=hidden).to(device)
-    optimizer = optim.Adam(calibrator.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-    feats, labels = feats.to(device), labels.to(device)
-    dataset = FeatureDataset(feats, labels)
-    loader = DataLoader(dataset, batch_size=min(64, len(dataset)), shuffle=True)
-    calibrator.train()
-    for epoch in range(epochs):
-        for f_batch, l_batch in loader:
-            optimizer.zero_grad()
-            pred = calibrator(f_batch)
-            loss = criterion(pred, l_batch)
-            loss.backward()
-            optimizer.step()
-    calibrator.eval()
-    return calibrator
+        for i, idx in enumerate(batch):
+            feats[idx] = feat[i].cpu()
+    return feats
 
 
 def main():
-    p = argparse.ArgumentParser(description="RGBDGaze 一次校准实验")
+    p = argparse.ArgumentParser(description="RGBDGaze 一次校准实验（偏移修正方案）")
     p.add_argument("--backbone-ckpt", required=True)
     p.add_argument("--resolution", type=int, default=448)
     p.add_argument("--calib-ratios", type=float, nargs="+", default=[0.05, 0.10, 0.15])
-    p.add_argument("--calib-epochs", type=int, default=200)
-    p.add_argument("--calib-lr", type=float, default=1e-3)
+    p.add_argument("--calib-epochs", type=int, default=50)
+    p.add_argument("--calib-lr", type=float, default=1e-4)
     p.add_argument("--device", default="auto")
     args = p.parse_args()
 
     device = args.device if args.device != "auto" else DEFAULT_DEVICE
     run_dirs = Path("out/rgbdgaze/calibration")
     run_dirs.mkdir(parents=True, exist_ok=True)
-    log_file = run_dirs / f"{datetime.now():%Y%m%d_%H%M%S}_calibration_log.txt"
+    log_file = run_dirs / f"{datetime.now():%Y%m%d_%H%M%S}_calibration_offset_log.txt"
 
     def emit(msg):
         print(msg)
@@ -134,20 +121,21 @@ def main():
             f.write(msg + "\n")
 
     emit("=" * 60)
-    emit(" 一次校准实验")
+    emit(" 一次校准实验（偏移修正方案）")
     emit(f" 骨干: {args.backbone_ckpt}")
-    emit(f" 分辨率: {args.resolution}  校准比例: {args.calib_ratios}")
+    emit(f" 分辨率: {args.resolution}")
+    emit(f" 校准比例: {args.calib_ratios}")
     emit("=" * 60)
 
-    # 1) 加载骨干
+    # 加载模型
     model = RGBDGazeDINOv2(use_depth=False, unfreeze_last=12, img_size=args.resolution)
     model.load_state_dict(torch.load(args.backbone_ckpt, map_location="cpu", weights_only=False))
     model.to(device).eval()
     for param in model.parameters():
         param.requires_grad = False
-    emit("[calib] 骨干模型已加载并冻结")
+    emit(f"[calib] 骨干模型已加载并冻结")
 
-    # 2) 读取测试集
+    # 读取测试集
     rows = list(csv.DictReader(open(RGBDGaze_INDEX_DIR / "index.csv", encoding="utf-8")))
     path_to_idx = {r["rgb_path"]: i for i, r in enumerate(rows)}
     test_indices = [path_to_idx[l.strip()] for l in
@@ -159,58 +147,108 @@ def main():
                               image_size=args.resolution)
     emit(f"[calib] 测试集: {len(test_indices)} 样本")
 
-    # 3) 提取特征（一次性）
-    emit("[calib] 提取骨干特征...")
-    t0 = time.time()
-    all_feats, all_labels = extract_all_features(model, test_indices, dataset, device)
-    emit(f"[calib] 特征提取完成: {all_feats.shape}, 耗时 {time.time()-t0:.0f}s")
+    # 按被试分组
+    groups = defaultdict(list)
+    for idx in test_indices:
+        r = rows[idx]
+        groups[r["subject"]].append((frame_sort_key(r["rgb_path"]), idx))
+    subject_frames = {sub: sorted(frames) for sub, frames in groups.items()}
 
-    idx_to_pos = {idx: pos for pos, idx in enumerate(test_indices)}
+    # ---- 无校准基准 ----
+    emit("\n[baseline] 无校准基准:")
+    preds_all, labels_all = predict_batch(model, test_indices, dataset, device)
+    base_errors = []
+    base_by_sub = defaultdict(list)
+    for idx in test_indices:
+        r = rows[idx]
+        gx = float(r["gaze_x"]) / float(r["screen_w"])
+        gy = float(r["gaze_y"]) / float(r["screen_h"])
+        sw_cm = float(r["screen_w"]) * float(r["cm_px_x"])
+        sh_cm = float(r["screen_h"]) * float(r["cm_px_y"])
+        e = math.hypot((preds_all[idx][0]-gx)*sw_cm, (preds_all[idx][1]-gy)*sh_cm)
+        base_errors.append(e)
+        base_by_sub[r["subject"]].append(e)
+    baseline_cm = np.mean(base_errors)
+    emit(f"  test 平均: {baseline_cm:.2f}cm")
+    for sub in sorted(base_by_sub.keys()):
+        emit(f"  {sub}: {np.mean(base_by_sub[sub]):.2f}cm")
 
-    # 4) 对每个 calib_ratio 执行
+    # ---- 校准实验 ----
     for ratio in args.calib_ratios:
         emit(f"\n{'='*60}")
         emit(f"[calib] 校准比例: {ratio*100:.0f}%")
-        subject_splits = build_subject_split(test_indices, rows, ratio)
-        total_err, total_count = 0.0, 0
-        per_subject = []
+        all_corrected_errors = []
 
-        for subj, split in sorted(subject_splits.items()):
-            calib_idx = split["calib"]
-            test_idx = split["test"]
-            calib_feats = all_feats[[idx_to_pos[i] for i in calib_idx]]
-            calib_labels = all_labels[[idx_to_pos[i] for i in calib_idx]]
-            test_feats = all_feats[[idx_to_pos[i] for i in test_idx]]
-            test_labels = all_labels[[idx_to_pos[i] for i in test_idx]]
+        for sub in sorted(subject_frames.keys()):
+            frames = subject_frames[sub]
+            n_calib = max(1, int(len(frames) * ratio))
+            calib_ids = [idx for _, idx in frames[:n_calib]]
+            test_ids = [idx for _, idx in frames[n_calib:]]
 
-            calibrator = train_calibrator(calib_feats, calib_labels, device,
-                                          epochs=args.calib_epochs, lr=args.calib_lr)
-            with torch.no_grad():
-                calibrator.eval()
-                pred = calibrator(test_feats.to(device)).cpu()
-            diff = pred - test_labels
+            if len(test_ids) == 0:
+                continue
 
-            subj_rows = [rows[i] for i in test_idx]
-            sw = np.array([float(r["screen_w"]) * float(r["cm_px_x"]) for r in subj_rows])
-            sh = np.array([float(r["screen_h"]) * float(r["cm_px_y"]) for r in subj_rows])
-            cm_err = np.sqrt((diff[:, 0].numpy() * sw) ** 2 + (diff[:, 1].numpy() * sh) ** 2)
-            mean_cm = float(cm_err.mean())
-            per_subject.append((subj, len(test_idx), mean_cm))
-            total_err += cm_err.sum()
-            total_count += len(test_idx)
-            emit(f"  {subj}: test {len(test_idx)} 帧, 校准 {len(calib_idx)} 帧, 误差 {mean_cm:.2f}cm")
+            # 校准帧的特征 + 模型预测 + GT
+            calib_feats = feature_batch(model, calib_ids, dataset, device)
+            offsets_target = []
+            for idx in calib_ids:
+                r = rows[idx]
+                gx = float(r["gaze_x"]) / float(r["screen_w"])
+                gy = float(r["gaze_y"]) / float(r["screen_h"])
+                mp = preds_all[idx]
+                offsets_target.append([gx - mp[0], gy - mp[1]])
+            offsets_target = np.array(offsets_target, dtype=np.float32)
+            calib_feat_tensor = torch.stack([calib_feats[i] for i in calib_ids])
 
-        overall = total_err / total_count
-        emit(f"[calib] 校准后整体误差: {overall:.2f}cm (n={total_count})")
-        emit(f"[calib] 无校准基准: 1.68cm → 校准后 {overall:.2f}cm "
-             f"| {'有效' if overall < 1.68 else '无效'} | 提升 {(1-overall/1.68)*100:.1f}%")
+            # 训练偏移校准器
+            calibrator = OffsetCalibrator(calib_feat_tensor.shape[1], hidden=32).to(device)
+            optimizer = optim.Adam(calibrator.parameters(), lr=args.calib_lr,
+                                   weight_decay=0.01)
+            criterion = nn.MSELoss()
+            target_t = torch.tensor(offsets_target, device=device)
+            feat_t = calib_feat_tensor.to(device)
+            for epoch in range(args.calib_epochs):
+                calibrator.train()
+                optimizer.zero_grad()
+                loss = criterion(calibrator(feat_t), target_t)
+                loss.backward()
+                optimizer.step()
 
-        result_file = run_dirs / f"calibration_ratio{int(ratio*100)}.json"
+            # 在测试帧上评估
+            test_feats = feature_batch(model, test_ids, dataset, device)
+            calibrator.eval()
+            mean_offset = np.mean(offsets_target, axis=0)
+            sub_errors = []
+            for idx in test_ids:
+                r = rows[idx]
+                gx = float(r["gaze_x"]) / float(r["screen_w"])
+                gy = float(r["gaze_y"]) / float(r["screen_h"])
+                sw_cm = float(r["screen_w"]) * float(r["cm_px_x"])
+                sh_cm = float(r["screen_h"]) * float(r["cm_px_y"])
+                # 校准: 模型预测 + 特征级偏移修正
+                feat = test_feats[idx].unsqueeze(0).to(device)
+                with torch.no_grad():
+                    offset = calibrator(feat).cpu().numpy()[0]
+                mp = preds_all[idx]
+                corrected_x = mp[0] + offset[0]
+                corrected_y = mp[1] + offset[1]
+                e = math.hypot((corrected_x-gx)*sw_cm, (corrected_y-gy)*sh_cm)
+                sub_errors.append(e)
+                all_corrected_errors.append(e)
+            emit(f"  {sub}: calib={n_calib} test={len(test_ids)} "
+                 f"平均={np.mean(sub_errors):.2f}cm")
+
+        overall = np.mean(all_corrected_errors) if all_corrected_errors else 0
+        emit(f"[calib] 校准后整体: {overall:.2f}cm (n={len(all_corrected_errors)})")
+        emit(f"[calib] 无校准: {baseline_cm:.2f}cm → 校准后 {overall:.2f}cm "
+             f"| 提升 {(1-overall/baseline_cm)*100:.1f}%")
+
+        result_file = run_dirs / f"calibration_offset_r{int(ratio*100)}.json"
         result_file.write_text(json.dumps({
-            "ratio": ratio, "overall_cm": overall,
-            "per_subject": {s: cm for s, _, cm in per_subject},
-        }, ensure_ascii=False, indent=2))
-        emit(f"[calib] 结果保存: {result_file}")
+            "ratio": ratio, "baseline_cm": baseline_cm,
+            "calibrated_cm": overall,
+            "improvement_pct": (1 - overall / baseline_cm) * 100,
+        }, indent=2))
 
 
 if __name__ == "__main__":
