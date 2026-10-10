@@ -107,6 +107,12 @@ def crop_face_square(img: np.ndarray, bbox_xywh, margin: float, size: int,
     return cv2.resize(crop, (size, size))
 
 
+def geom_vector(w_cm: float, h_cm: float) -> torch.Tensor:
+    """由物理屏幕尺寸(cm)构造几何 token 向量 [宽高比, log(宽), log(h)]。"""
+    return torch.tensor(
+        [w_cm / h_cm, math.log(w_cm), math.log(h_cm)], dtype=torch.float32)
+
+
 def screen_geometry(screen_w: float, screen_h: float,
                     cm_px_x: float, cm_px_y: float) -> torch.Tensor:
     """屏幕几何向量 [宽高比, log(物理宽cm), log(物理高cm)]，供模型的几何 token。
@@ -118,8 +124,7 @@ def screen_geometry(screen_w: float, screen_h: float,
     (2) 物理尺寸决定同一归一化偏移对应多大的视角（实测 11.94~25.47 cm）。
     两者都无法从人脸图推断（屏幕在正面摄像头画面里不可见），必须显式提供。
 
-    log 是为了让 5~20cm 的跨度在数值上更均匀。物理尺寸未知时（NaN）用 0 占位
-    （exp(0)=1cm），并在调用方保证不参与关键计算。
+    log 是为了让 5~20cm 的跨度在数值上更均匀。物理尺寸未知时（NaN）用 1cm 占位。
     """
     w_cm = screen_w * cm_px_x
     h_cm = screen_h * cm_px_y
@@ -127,7 +132,42 @@ def screen_geometry(screen_w: float, screen_h: float,
         w_cm = 1.0
     if not math.isfinite(h_cm) or h_cm <= 0:
         h_cm = 1.0
-    return torch.tensor(
-        [screen_w / screen_h, math.log(w_cm), math.log(h_cm)],
-        dtype=torch.float32,
-    )
+    return geom_vector(w_cm, h_cm)
+
+
+def randomize_screen_geometry(u: float, v: float, w_cm: float, h_cm: float, rng,
+                              aspect_range, width_range, height_range,
+                              max_tries: int = 8):
+    """几何域随机化：把 (标签, 屏幕几何) 重投影到一个"合成设备"上。
+
+    物理模型（已在 GazeCapture 真实数据上逐位验证）：
+      · 相机在屏幕上的归一化位置 u_c 对同一机型是**严格常数**
+        （实测 iPad Air 2 / iPhone 5 / 5S 的 u_c = 0.5000 ± 0.0000，
+          iPhone 6 = 0.3181 ± 0.0000）；
+      · 横向尺度严格等于屏幕物理宽：XCam = W_cm · (u - u_c)。
+    因此，在"相机相对屏幕中心的物理位置不变、只更换屏幕尺寸"的假设下，
+    同一个物理注视点在合成屏幕上的归一化坐标是**纯比例变换**：
+
+        u' = 0.5 + (u - 0.5) · (W_cm / W')
+        v' = 0.5 + (v - 0.5) · (H_cm / H')
+
+    为什么需要它：GazeCapture 只有 0.562 / 0.563 / 0.750 三种宽高比，而
+    RGBDGaze（现代 19.5:9 手机）是 0.462 —— 比预训练见过的最窄还要窄 22%，
+    属于**外推**。用真实物理标签重投影到合成几何，可把这一维从"外推"变成"内插"；
+    物理标注是真实的，只有"假设的屏幕形状"是合成的，不属于编造数据。
+
+    参数范围来自 configs（aspect_range / width_range / height_range）。
+    返回 (u', v', geom)；若合成点落到屏幕外、或多次抽样都没抽到合理的
+    (宽, 高) 组合，则返回 None，调用方应放弃本次随机化（用真实标签）。
+    """
+    for _ in range(max_tries):
+        aspect = rng.uniform(*aspect_range)
+        w = rng.uniform(*width_range)
+        h = w / aspect
+        if not (height_range[0] <= h <= height_range[1]):
+            continue
+        up = 0.5 + (u - 0.5) * (w_cm / w)
+        vp = 0.5 + (v - 0.5) * (h_cm / h)
+        if 0.0 <= up <= 1.0 and 0.0 <= vp <= 1.0:
+            return up, vp, geom_vector(w, h)
+    return None
