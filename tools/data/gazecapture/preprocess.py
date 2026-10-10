@@ -187,17 +187,22 @@ def cm_per_point(spec, device, screen_w=None, screen_h=None):
 # --------------------------------------------------------------------------
 # 解压
 # --------------------------------------------------------------------------
-def extract_archives(archive_dir: Path, extract_dir: Path, log, force=False) -> None:
+def extract_archives(archive_dir: Path, extract_dir: Path, log, force=False,
+                     subjects=None) -> None:
     """把 archive_dir 下所有 *.tar.gz 解压到 extract_dir（顶层 NNNNN/ 原样释放）。
 
-    已存在的被试目录默认跳过（--force-extract 可强制重解）。
+    subjects: 只解压这些被试的归档（分批解压用，避免一次性占满磁盘）。
+    force   : 已存在的被试目录也重新解压。
     """
     archives = sorted(archive_dir.glob("*.tar.gz"))
+    if subjects:
+        want = set(subjects)
+        archives = [a for a in archives if a.name.split(".")[0] in want]
     if not archives:
-        log(f"[extract] {archive_dir} 下没有 *.tar.gz，跳过解压")
+        log(f"[extract] {archive_dir} 下没有匹配的 *.tar.gz，跳过解压")
         return
     extract_dir.mkdir(parents=True, exist_ok=True)
-    log(f"[extract] 发现 {len(archives)} 个归档，解压到 {extract_dir}")
+    log(f"[extract] 待解压 {len(archives)} 个归档 -> {extract_dir}")
     done = skipped = 0
     for i, arc in enumerate(archives, 1):
         subject = arc.name.split(".")[0]          # "00002.tar.gz" -> "00002"
@@ -478,7 +483,8 @@ def main():
     p.add_argument("--no-extract", action="store_true",
                    help="只扫描已解压目录，不碰归档（默认行为）")
     p.add_argument("--subjects", default=None,
-                   help="仅处理这些被试 ID，逗号分隔（小样本自测用）")
+                   help="仅处理这些被试 ID，逗号分隔（小样本自测 / 分批解压用）；"
+                        "同时作用于 --extract 的解压范围")
     p.add_argument("--log-file", default=None,
                    help="日志文件路径；默认写到 out/gazecapture/preprocess/logs/")
     args = p.parse_args()
@@ -506,7 +512,7 @@ def main():
     if args.extract:
         log.banner("步骤 1/4：解压归档")
         extract_archives(Path(args.archive_dir), Path(args.extract_dir), log,
-                         force=args.force_extract)
+                         force=args.force_extract, subjects=subjects)
     else:
         log.banner("步骤 1/4：跳过解压（未指定 --extract）")
 
