@@ -48,7 +48,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from datetime import datetime
 
-from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
+from configs.paths import DEVICE as DEFAULT_DEVICE, experiment_dirs
 from configs.rgbdgaze_config import (RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM,
                                      AUG_SHIFT, AUG_SCALE, AUG_ROTATE)
 from gazelab.datasets import (RGBDGazeDataset, GazeCaptureDataset,
