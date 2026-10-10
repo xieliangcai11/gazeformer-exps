@@ -29,6 +29,7 @@
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +43,9 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import time
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from datetime import datetime
 
 from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
@@ -89,7 +92,7 @@ DATASET_SPECS = {
 
 
 def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
-                     augment=False, resolution=None):
+                     augment=False, resolution=None, distributed=False):
     """构造 train/val/test 的 DataLoader。
 
     dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
@@ -114,8 +117,31 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
                      **spec["kwargs"])
     sub = Subset(ds, idx)
+    if distributed:
+        # 每个 rank 只吃 1/world 的数据；shuffle 交给 sampler（DataLoader 的
+        # shuffle 必须为 False）。每个 epoch 前要调 sampler.set_epoch(epoch)。
+        sampler = DistributedSampler(sub, shuffle=shuffle)
+        return DataLoader(sub, batch_size=batch_size, sampler=sampler,
+                          shuffle=False, num_workers=num_workers)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers)
+
+
+def init_distributed():
+    """若由 torchrun 启动则初始化 NCCL 进程组。
+
+    返回 (rank, world_size, local_rank, is_dist)。未设置 RANK/WORLD_SIZE 时
+    返回 (0, 1, 0, False)，此时行为与单卡完全一致。
+    """
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return 0, 1, 0, False
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    local = int(os.environ.get("LOCAL_RANK", 0))
+    if not torch.cuda.is_available():
+        raise RuntimeError("使用 torchrun 多卡训练需要 CUDA")
+    torch.cuda.set_device(local)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world)
+    return rank, world, local, True
 
 
 def geometric_angular_loss(pred, label, screen_cm, D):
@@ -283,8 +309,11 @@ def parse():
                    help="索引目录；默认按 --dataset 取各自 config 里的路径")
     p.add_argument("--init-ckpt", default=None,
                    help="从该权重起训（如 GazeCapture 预训练 -> RGBDGaze 微调）")
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch-size", type=int, default=64,
+                   help="**每张卡**的批大小（torchrun 多卡时有效批 = 该值 x 卡数）")
+    p.add_argument("--lr", type=float, default=1e-4,
+                   help="学习率；多卡放大有效批后建议按 sqrt(有效批/24)x1e-4 起步")
+    p.add_argument("--seed", type=int, default=0, help="随机种子")
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--device", default="auto")
     p.add_argument("--num-workers", type=int, default=4)
@@ -319,7 +348,17 @@ def parse():
 
 def main():
     args = parse()
-    device = args.device if args.device != "auto" else DEFAULT_DEVICE
+    rank, world, local_rank, is_dist = init_distributed()
+    is_main = (rank == 0)
+    if is_dist:
+        device = f"cuda:{local_rank}"
+    else:
+        device = args.device if args.device != "auto" else DEFAULT_DEVICE
+
+    # 可复现性：所有 rank 同一随机种子（数据由 DistributedSampler 切分，
+    # 各 rank 的增强随机性仍互相独立）
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     if args.index_dir is None:
         args.index_dir = str(DATASET_SPECS[args.dataset]["default_index"])
 
@@ -336,12 +375,16 @@ def main():
     log_dir = run_dirs["log"]
     log_dir.mkdir(parents=True, exist_ok=True)
     log_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"{log_time}_ablation_{args.tag}.txt"
+    # 日志名带上卡数，避免单卡/多卡产物互相覆盖；只有 rank0 写文件，
+    # 否则 8 个 rank 会同时往同一文件追加导致内容交错。
+    log_file = log_dir / (f"{log_time}_ablation_{args.tag}"
+                          + (f"_w{world}" if is_dist else "") + ".txt")
 
     def write_log(msg):
-        print(msg)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+        if is_main:
+            print(msg, flush=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
 
     model = RGBDGazeDINOv2(
         unfreeze_last=args.unfreeze,
@@ -356,11 +399,16 @@ def main():
         # 出现 unexpected 说明架构不匹配（如残留的 depth 分支）。
         write_log(f"[init] 从 {args.init_ckpt} 载入权重")
         write_log(f"[init] 缺失键 {list(missing) or '无'} | 多余键 {list(unexpected) or '无'}")
+    # DDP：先加载 init-ckpt 再包装，保证权重加载路径不依赖 DDP 的 key 前缀
+    raw_model = model
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank])
     criterion = nn.MSELoss()
     if args.diff_lr:
         # 差分学习率：被解冻的骨干层用 0.1x，其余（投影/融合/头）用全量 lr
         backbone_params, other_params = [], []
-        for n, p in model.named_parameters():
+        # 用 raw_model：DDP 包装后参数名会带 "module." 前缀，前缀判断会失效
+        for n, p in raw_model.named_parameters():
             if not p.requires_grad:
                 continue
             (backbone_params if n.startswith("rgb.backbone") else other_params).append(p)
@@ -369,12 +417,14 @@ def main():
             {"params": other_params, "lr": args.lr},
         ])
     else:
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    ema = ModelEMA(model) if args.ema else None
+        optimizer = optim.Adam(raw_model.parameters(), lr=args.lr)
+    # EMA 只在 rank0 维护：验证/保存都只在 rank0 做，其余 rank 白占显存。
+    ema = ModelEMA(raw_model) if (args.ema and is_main) else None
 
     train_dl = build_dataloader(args.dataset, "train", Path(args.index_dir),
                                 args.batch_size, True, args.num_workers,
-                                augment=args.augment, resolution=args.resolution)
+                                augment=args.augment, resolution=args.resolution,
+                                distributed=is_dist)
     val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
                               args.batch_size, False, args.num_workers,
                               augment=False, resolution=args.resolution)
@@ -382,14 +432,21 @@ def main():
                                args.batch_size, False, args.num_workers,
                                augment=False, resolution=args.resolution)
 
-    tr_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    tr_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    eff_bs = args.batch_size * world
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"
-              f" loss={args.loss} geom={args.use_geom} "
-              f"unfreeze={args.unfreeze}\n"
-              f" 训练集 {len(train_dl.dataset)} / 验证集 {len(val_dl.dataset)} / 测试集 {len(test_dl.dataset)}\n"
-              f" batch={args.batch_size} lr={args.lr} epochs={args.epochs}\n"
-              f" 可训练参数: {tr_params:,}\n"
-              f" 输出: {save_dir}\n{'='*70}")
+              f" 数据集={args.dataset}  索引={args.index_dir}\n"
+              f" loss={args.loss} geom={args.use_geom} imu={args.use_imu} "
+              f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze}\n"
+              f" 训练集 {len(train_dl.dataset)} / 验证集 {len(val_dl.dataset)} / "
+              f"测试集 {len(test_dl.dataset)}\n"
+              f" 分辨率={args.resolution} batch/卡={args.batch_size} "
+              f"卡数={world} 有效批={eff_bs} lr={args.lr} epochs={args.epochs}\n"
+              f" 可训练参数: {tr_params:,}   seed={args.seed}\n"
+              f" 命令: {' '.join(sys.argv)}\n"
+              + (f" 多卡命令: torchrun --nproc_per_node={world} -m "
+                 f"scripts.rgbdgaze.ablation {...}\n" if is_dist else "")
+              + f" 权重输出: {save_dir}\n 日志: {log_file}\n{'='*70}")
     write_log(header)
 
     # 部分数据集（或小样本子集）可能没有 val 划分：此时不做验证、每轮覆盖保存
@@ -399,6 +456,10 @@ def main():
         write_log("[warn] 验证集为空，将不做验证、每轮覆盖 best.pt（末轮权重生效）")
     best_val = float("inf")
     for epoch in range(args.epochs):
+        if is_dist:
+            # DistributedSampler 需要每 epoch 变一次种子，否则各 rank 的
+            # 分片顺序固定不变，等价于每轮喂同一批数据顺序。
+            train_dl.sampler.set_epoch(epoch)
         model.train()
         run_loss = 0.0
         n_step = 0
@@ -420,7 +481,7 @@ def main():
             loss.backward()
             optimizer.step()
             if ema is not None:
-                ema.update(model)
+                ema.update(raw_model)
             run_loss += loss.item()
             n_step += 1
             if i % 100 == 0 or i == len(train_dl) - 1:
@@ -428,13 +489,15 @@ def main():
                           f"loss {loss.item():.4f}  {time.time()-t0:.1f}s")
                 t0 = time.time()
 
+        # 验证只在 rank0 做：其他 rank 在 barrier 等待（DDP 只在 backward
+        # 时同步，rank0 单独跑前向不会与它们死锁）。
         saved_ema = ""
-        vres = evaluate_split(model, val_dl, device) if has_val else None
-        if has_val and ema is not None:
+        vres = evaluate_split(raw_model, val_dl, device) if (has_val and is_main) else None
+        if has_val and is_main and ema is not None:
             # 用 EMA 权重评估（训练权重继续训练，EMA 更平滑）
-            ema.apply_to(model)
-            vres_ema = evaluate_split(model, val_dl, device)
-            ema.restore(model)
+            ema.apply_to(raw_model)
+            vres_ema = evaluate_split(raw_model, val_dl, device)
+            ema.restore(raw_model)
             if vres_ema["ang_mean"] < vres["ang_mean"]:
                 vres = vres_ema
                 saved_ema = " [EMA]"
@@ -443,16 +506,18 @@ def main():
         mean_train = run_loss / max(n_step, 1)
         mean_ang = vres["ang_mean"] if vres else float("inf")
         saved = ""
-        if not has_val or mean_ang < best_val:
+        if is_main and (not has_val or mean_ang < best_val):
             best_val = mean_ang
             ckpt = save_dir / "best.pt"
             if ema is not None:
-                ema.apply_to(model)
-                torch.save(model.state_dict(), ckpt)
-                ema.restore(model)
+                ema.apply_to(raw_model)
+                torch.save(raw_model.state_dict(), ckpt)
+                ema.restore(raw_model)
             else:
-                torch.save(model.state_dict(), ckpt)
+                torch.save(raw_model.state_dict(), ckpt)
             saved = f"  [保存 → {ckpt} ({mean_ang:.2f}°)]"
+        if is_dist:
+            dist.barrier()      # 等 rank0 评估+保存完再进下一轮
         if vres is None:
             write_log(f"[epoch {epoch}]  train_loss {mean_train:.4f}  "
                       f"(无验证集){saved}")
@@ -465,11 +530,12 @@ def main():
                       + (saved_ema if ema is not None else "") + f"{saved}")
 
     # ---- 训练结束：用 best 权重在 test 集做独立终评（test 不参与选模） ----
+    # 同样只在 rank0 做；其他 rank 直接在 barrier 等结束。
     best_ckpt = save_dir / "best.pt"
-    if best_ckpt.exists() and len(test_dl.dataset) > 0:
-        model.load_state_dict(torch.load(best_ckpt, map_location=device,
-                                         weights_only=False))
-        fres = evaluate_split(model, test_dl, device)
+    if is_main and best_ckpt.exists() and len(test_dl.dataset) > 0:
+        raw_model.load_state_dict(torch.load(best_ckpt, map_location=device,
+                                             weights_only=False))
+        fres = evaluate_split(raw_model, test_dl, device)
         write_log("=" * 70)
         sel = "无验证集，取末轮" if not has_val else f"val {best_val:.2f}°"
         write_log(f"[final] 用 best 权重（{sel}）在 test 集独立终评:")
@@ -488,8 +554,11 @@ def main():
             write_log(f"[final] 对比基线: 论文 RGBD 1.89cm | "
                       f"{'已超越基线' if fres['em_dist'] < 1.89 else '未达基线'}")
         write_log("=" * 70)
-    else:
-        write_log("[final] 未找到 best.pt，跳过 test 终评")
+    elif is_main:
+        write_log("[final] 未找到 best.pt 或测试集为空，跳过 test 终评")
+    if is_dist:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
