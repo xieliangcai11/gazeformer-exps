@@ -793,6 +793,12 @@ def main():
     print(f"校验: {sum(1 for _,_,ok,_ in all_checks if ok)}/{len(all_checks)} PASS")
     if fails:
         print(f"失败 {len(fails)} 条，详见 summary.txt")
+    # 覆盖统计同时打到 stdout：只跑这一条命令就能看出验证到底盖住了什么，
+    # 不必再去 cat summary.txt（也避免把两条命令拼成一行导致 argparse 报错）
+    print("\n抽样覆盖统计")
+    print("-" * 60)
+    for ln in coverage_report(ds.rows, picks):
+        print("  " + ln)
 
 
 if __name__ == "__main__":
