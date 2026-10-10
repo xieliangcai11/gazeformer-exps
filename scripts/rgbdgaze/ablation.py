@@ -444,8 +444,13 @@ def main():
               f"卡数={world} 有效批={eff_bs} lr={args.lr} epochs={args.epochs}\n"
               f" 可训练参数: {tr_params:,}   seed={args.seed}\n"
               f" 命令: {' '.join(sys.argv)}\n"
-              + (f" 多卡命令: torchrun --nproc_per_node={world} -m "
-                 f"scripts.rgbdgaze.ablation {...}\n" if is_dist else "")
+              # 复现多卡跑法：把 sys.argv 的脚本路径换成 "-m <模块>"，
+              # 前面加 torchrun。CUDA_VISIBLE_DEVICES 原样带上（若设置了）。
+              + (f" 复现: CUDA_VISIBLE_DEVICES="
+                 f"{os.environ.get('CUDA_VISIBLE_DEVICES', '(全部可见)')} "
+                 f"torchrun --standalone --nproc_per_node={world} -m "
+                 f"scripts.rgbdgaze.ablation {' '.join(sys.argv[1:])}\n"
+                 if is_dist else "")
               + f" 权重输出: {save_dir}\n 日志: {log_file}\n{'='*70}")
     write_log(header)
 
