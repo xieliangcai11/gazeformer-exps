@@ -681,6 +681,8 @@ def main():
     for n, idx in enumerate(picks, 1):
         panel, num, checks, lines = trace_sample(
             ds, idx, cache, device_spec, log_lines, ds_aug=ds_aug)
+        # 目录可能在运行期间被清理，保存前确保存在（否则 FileNotFoundError）
+        img_dir.mkdir(parents=True, exist_ok=True)
         panel.save(img_dir / f"{n:03d}_idx{idx}.png")
         sheets.append(panel)
         for name, ok, detail in checks:
