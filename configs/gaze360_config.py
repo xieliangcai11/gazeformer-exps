@@ -1,4 +1,3 @@
-from pathlib import Path
 import torch
 import clip
 from torchvision.transforms import transforms
@@ -6,14 +5,14 @@ from torchvision.transforms import transforms
 # 路径与输出目录定义已抽到 configs/paths.py（那里不加载 CLIP，训练脚本用它可以
 # 避免"仅为拿 DEVICE/experiment_dirs 就把 CLIP 加载到 cuda:0"）。此处 re-export
 # 这些名字，保证既有 `from configs.gaze360_config import *` 的调用不受影响。
-from configs.paths import (          # noqa: F401  (re-export)
-    PROJECT_ROOT as _PROJECT_ROOT,
-    DATASETS_PATH,
-    OUT_PATH,
-    CHECKPOINTS_PATH,
-    LOGS_PATH,
-    RUNS_PATH,
-    experiment_dirs,
+from configs.paths import (
+    PROJECT_ROOT as _PROJECT_ROOT,  # noqa: F401  (re-export，供 import * 使用)
+    DATASETS_PATH,                  # noqa: F401
+    OUT_PATH,                       # noqa: F401
+    CHECKPOINTS_PATH,               # noqa: F401
+    LOGS_PATH,                      # noqa: F401
+    RUNS_PATH,                      # noqa: F401
+    experiment_dirs,                # noqa: F401
 )
 
 # MPIIFaceGaze
