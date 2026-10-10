@@ -1,4 +1,13 @@
-"""RGBDGaze 新模型消融实验脚本（独立，不改动 train.py / train_baseline.py）。
+"""DINOv2 注视回归训练/消融脚本（RGBDGaze 与 GazeCapture 共用同一条训练循环）。
+
+数据集由 --dataset 选择：
+    rgbdgaze    : 域内训练/消融（索引 data/RGBDGaze/index）
+    gazecapture : 大规模预训练（索引 data/GazeCapture/index，约 149 万帧）
+两者只有数据集构造与索引路径不同，训练循环、损失、评估口径完全一致
+（评估统一走 predict_frames/summarize，物理量取自每个样本自己的 screen_cm）。
+
+--init-ckpt 用于从既有权重起训（如 GazeCapture 预训练 -> RGBDGaze 微调）；
+加载时打印缺失/多余的键，避免"其实没加载上"的静默错误。
 
 消融维度（可组合）：
     --loss mse|mse_angle   损失函数
@@ -39,7 +48,9 @@ from datetime import datetime
 from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
 from configs.rgbdgaze_config import (RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM,
                                      AUG_SHIFT, AUG_SCALE, AUG_ROTATE)
-from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
+from gazelab.datasets import (RGBDGazeDataset, GazeCaptureDataset,
+                              rgb_preprocess)
+from configs.gazecapture_config import GAZECAPTURE_INDEX_DIR
 from gazelab.models.rgbdgaze import RGBDGazeDINOv2
 
 PI = 3.141592653589793
@@ -67,22 +78,41 @@ class Subset(torch.utils.data.Dataset):
         return self.base.screen_size[self.idces]
 
 
-def build_dataloader(split, index_dir, batch_size, shuffle, num_workers,
+#: 各数据集的差异点：数据集类、索引里的路径列名、默认索引目录
+DATASET_SPECS = {
+    "rgbdgaze": dict(cls=RGBDGazeDataset, path_col="rgb_path",
+                     default_index=RGBDGaze_INDEX_DIR,
+                     kwargs=dict(color_transform=rgb_preprocess)),
+    "gazecapture": dict(cls=GazeCaptureDataset, path_col="frame_path",
+                        default_index=GAZECAPTURE_INDEX_DIR, kwargs={}),
+}
+
+
+def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
                      augment=False, resolution=None):
+    """构造 train/val/test 的 DataLoader。
+
+    dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
+    （rgb / screen_cm / imu / geom；GazeCapture 另带 face_grid 但训练不使用），
+    因此训练循环与评估口径无需分叉。
+    """
+    spec = DATASET_SPECS[dataset]
     index_csv = Path(index_dir) / "index.csv"
     list_txt = Path(index_dir) / f"{split}.txt"
-    paths = [l.strip() for l in list_txt.read_text(encoding="utf-8").splitlines()
-             if l.strip()]
+    paths = [ln.strip() for ln in
+             list_txt.read_text(encoding="utf-8").splitlines() if ln.strip()]
     import csv
     with open(index_csv, encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    rgb_to_idx = {r["rgb_path"]: i for i, r in enumerate(rows)}
-    idx = [rgb_to_idx[p] for p in paths]
+    path_to_idx = {r[spec["path_col"]]: i for i, r in enumerate(rows)}
+    missing = [p for p in paths if p not in path_to_idx]
+    if missing:
+        raise KeyError(f"{len(missing)} 条清单路径不在 {index_csv} 中，"
+                       f"例：{missing[:2]}（索引与清单是否来自同一次预处理？）")
+    idx = [path_to_idx[p] for p in paths]
 
-    ds = RGBDGazeDataset(index_csv,
-                         color_transform=rgb_preprocess,
-                         augment=augment,
-                         image_size=resolution)
+    ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
+                     **spec["kwargs"])
     sub = Subset(ds, idx)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers)
@@ -245,8 +275,14 @@ class ModelEMA:
 
 
 def parse():
-    p = argparse.ArgumentParser(description="RGBDGaze DINOv2 消融实验")
-    p.add_argument("--index-dir", default=str(RGBDGaze_INDEX_DIR))
+    p = argparse.ArgumentParser(
+        description="DINOv2 注视回归训练/消融（RGBDGaze 与 GazeCapture 共用）")
+    p.add_argument("--dataset", choices=sorted(DATASET_SPECS), default="rgbdgaze",
+                   help="rgbdgaze=域内训练/消融；gazecapture=大规模预训练")
+    p.add_argument("--index-dir", default=None,
+                   help="索引目录；默认按 --dataset 取各自 config 里的路径")
+    p.add_argument("--init-ckpt", default=None,
+                   help="从该权重起训（如 GazeCapture 预训练 -> RGBDGaze 微调）")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=8)
@@ -284,6 +320,8 @@ def parse():
 def main():
     args = parse()
     device = args.device if args.device != "auto" else DEFAULT_DEVICE
+    if args.index_dir is None:
+        args.index_dir = str(DATASET_SPECS[args.dataset]["default_index"])
 
     if args.tag is None:
         args.tag = (f"loss{args.loss}_unfreeze{args.unfreeze}"
@@ -292,7 +330,7 @@ def main():
                     + ("_ema" if args.ema else "")
                     + ("_aug" if args.augment else "")
                     + (f"_res{args.resolution}" if args.resolution != 224 else ""))
-    run_dirs = experiment_dirs("rgbdgaze", "ablation")
+    run_dirs = experiment_dirs(args.dataset, "ablation")
     save_dir = run_dirs["checkpoint"] / args.tag
     save_dir.mkdir(parents=True, exist_ok=True)
     log_dir = run_dirs["log"]
@@ -311,6 +349,13 @@ def main():
         use_geom=args.use_geom,
         img_size=args.resolution,
     ).to(device)
+    if args.init_ckpt:
+        state = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        # 必须打印：缺 proj_geom 说明几何 token 是随机初始化的；
+        # 出现 unexpected 说明架构不匹配（如残留的 depth 分支）。
+        write_log(f"[init] 从 {args.init_ckpt} 载入权重")
+        write_log(f"[init] 缺失键 {list(missing) or '无'} | 多余键 {list(unexpected) or '无'}")
     criterion = nn.MSELoss()
     if args.diff_lr:
         # 差分学习率：被解冻的骨干层用 0.1x，其余（投影/融合/头）用全量 lr
@@ -327,18 +372,15 @@ def main():
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
     ema = ModelEMA(model) if args.ema else None
 
-    train_dl = build_dataloader("train", Path(args.index_dir), args.batch_size,
-                                True, args.num_workers,
-                                augment=args.augment,
-                                resolution=args.resolution)
-    val_dl = build_dataloader("val", Path(args.index_dir), args.batch_size,
-                              False, args.num_workers,
-                              augment=False,
-                              resolution=args.resolution)
-    test_dl = build_dataloader("test", Path(args.index_dir), args.batch_size,
-                               False, args.num_workers,
-                               augment=False,
-                               resolution=args.resolution)
+    train_dl = build_dataloader(args.dataset, "train", Path(args.index_dir),
+                                args.batch_size, True, args.num_workers,
+                                augment=args.augment, resolution=args.resolution)
+    val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
+                              args.batch_size, False, args.num_workers,
+                              augment=False, resolution=args.resolution)
+    test_dl = build_dataloader(args.dataset, "test", Path(args.index_dir),
+                               args.batch_size, False, args.num_workers,
+                               augment=False, resolution=args.resolution)
 
     tr_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"
@@ -350,6 +392,11 @@ def main():
               f" 输出: {save_dir}\n{'='*70}")
     write_log(header)
 
+    # 部分数据集（或小样本子集）可能没有 val 划分：此时不做验证、每轮覆盖保存
+    # best.pt（最终停在末轮权重），并在日志里明确警告，避免静默行为。
+    has_val = len(val_dl.dataset) > 0
+    if not has_val:
+        write_log("[warn] 验证集为空，将不做验证、每轮覆盖 best.pt（末轮权重生效）")
     best_val = float("inf")
     for epoch in range(args.epochs):
         model.train()
@@ -381,8 +428,9 @@ def main():
                           f"loss {loss.item():.4f}  {time.time()-t0:.1f}s")
                 t0 = time.time()
 
-        vres = evaluate_split(model, val_dl, device)
-        if ema is not None:
+        saved_ema = ""
+        vres = evaluate_split(model, val_dl, device) if has_val else None
+        if has_val and ema is not None:
             # 用 EMA 权重评估（训练权重继续训练，EMA 更平滑）
             ema.apply_to(model)
             vres_ema = evaluate_split(model, val_dl, device)
@@ -393,9 +441,9 @@ def main():
             else:
                 saved_ema = " [raw更优]"
         mean_train = run_loss / max(n_step, 1)
-        mean_ang = vres["ang_mean"]
+        mean_ang = vres["ang_mean"] if vres else float("inf")
         saved = ""
-        if mean_ang < best_val:
+        if not has_val or mean_ang < best_val:
             best_val = mean_ang
             ckpt = save_dir / "best.pt"
             if ema is not None:
@@ -405,21 +453,26 @@ def main():
             else:
                 torch.save(model.state_dict(), ckpt)
             saved = f"  [保存 → {ckpt} ({mean_ang:.2f}°)]"
-        write_log(f"[epoch {epoch}]  train_loss {mean_train:.4f}  "
-                  f"val_L2 {vres['l2_norm']:.4f}  val_em {vres['em_dist']:.2f}cm  "
-                  f"val_ang 平均 {vres['ang_mean']:.2f}° | 中位 {vres['ang_median']:.2f}° | "
-                  f"95%分位 {vres['ang_p95']:.2f}° | 前95%平均 {vres['ang_top95_mean']:.2f}° | "
-                  f"≤1.91° {vres['ang_ratio_le_191']:.1f}%"
-                  + (saved_ema if ema is not None else "") + f"{saved}")
+        if vres is None:
+            write_log(f"[epoch {epoch}]  train_loss {mean_train:.4f}  "
+                      f"(无验证集){saved}")
+        else:
+            write_log(f"[epoch {epoch}]  train_loss {mean_train:.4f}  "
+                      f"val_L2 {vres['l2_norm']:.4f}  val_em {vres['em_dist']:.2f}cm  "
+                      f"val_ang 平均 {vres['ang_mean']:.2f}° | 中位 {vres['ang_median']:.2f}° | "
+                      f"95%分位 {vres['ang_p95']:.2f}° | 前95%平均 {vres['ang_top95_mean']:.2f}° | "
+                      f"≤1.91° {vres['ang_ratio_le_191']:.1f}%"
+                      + (saved_ema if ema is not None else "") + f"{saved}")
 
     # ---- 训练结束：用 best 权重在 test 集做独立终评（test 不参与选模） ----
     best_ckpt = save_dir / "best.pt"
-    if best_ckpt.exists():
+    if best_ckpt.exists() and len(test_dl.dataset) > 0:
         model.load_state_dict(torch.load(best_ckpt, map_location=device,
                                          weights_only=False))
         fres = evaluate_split(model, test_dl, device)
         write_log("=" * 70)
-        write_log(f"[final] 用 best 权重（val {best_val:.2f}°）在 test 集独立终评:")
+        sel = "无验证集，取末轮" if not has_val else f"val {best_val:.2f}°"
+        write_log(f"[final] 用 best 权重（{sel}）在 test 集独立终评:")
         write_log(f"[final] test_L2 {fres['l2_norm']:.4f}  "
                   f"test_em {fres['em_dist']:.2f}cm "
                   f"(x:{fres['em_x']:.2f} y:{fres['em_y']:.2f})")
@@ -429,8 +482,11 @@ def main():
                   f"前95%平均 {fres['ang_top95_mean']:.2f}° | "
                   f"≤1.91° {fres['ang_ratio_le_191']:.1f}% "
                   f"(n={fres['count']})")
-        write_log(f"[final] 对比基线: 论文 RGBD 1.89cm | "
-                  f"{'已超越基线' if fres['em_dist'] < 1.89 else '未达基线'}")
+        if args.dataset == "rgbdgaze":
+            # 论文基线只对 RGBDGaze 口径成立（GazeCapture 含 iPad，屏幕物理
+            # 尺寸达 20cm，cm 误差不可与 1.89 直接比较）
+            write_log(f"[final] 对比基线: 论文 RGBD 1.89cm | "
+                      f"{'已超越基线' if fres['em_dist'] < 1.89 else '未达基线'}")
         write_log("=" * 70)
     else:
         write_log("[final] 未找到 best.pt，跳过 test 终评")
