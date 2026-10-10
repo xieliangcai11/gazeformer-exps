@@ -594,16 +594,26 @@ def dump_dropped(raw_root: Path, out_dir: Path, log_lines, max_per_reason=4):
 # 抽样：按 (设备, orientation) 分层，保证覆盖全部情况
 # ==========================================================================
 def stratified_pick(rows, k):
-    """分层抽样：先保证每个设备、再每个 (设备, 朝向) 至少 1 个，然后轮转补齐。
+    """分层抽样：保证覆盖，再按数据量优先补齐。
 
-    为什么不能只按 (设备, 朝向, split) 分组后轮转：键数会达到几十个，而
-    sorted() 把 'iPad*' 排在 'iPhone*' 前面，导致样本量不大时**全部落在 iPad**
-    （实测 60 样本 60 个都是 iPad），验证覆盖不到占比最大的 iPhone。
+    三轮：
+      1) 每个**设备** 1 个                      -> 保证机型覆盖
+      2) 每个 **(设备, 朝向, screen_w)** 1 个   -> 保证朝向 + 显示缩放变体覆盖
+         （iPhone 6 有 320x568/375x667/568x320/667x375 四种组合，
+           只按 (设备,朝向) 分层会让"显示缩放"那条分支完全验不到）
+      3) 余量按**组大小降序**轮转补齐           -> 让占比大的机型拿到更多样本
+
+    为什么第 1 轮不能直接按 (设备,朝向,split) 轮转：键数达几十个，而 sorted()
+    把 'iPad*' 排在 'iPhone*' 前，样本量不大时 60 个样本会**全部落在 iPad**。
     """
-    by_dev, by_dev_ori = defaultdict(list), defaultdict(list)
+    def key_of(r):
+        return (r["device"], int(float(r["screen_w"])), int(r["orientation"]))
+
+    by_dev, by_key = defaultdict(list), defaultdict(list)
     for i, r in enumerate(rows):
         by_dev[r["device"]].append(i)
-        by_dev_ori[(r["device"], r["orientation"])].append(i)
+        by_key[key_of(r)].append(i)
+
     picked, seen = [], set()
 
     def take(i):
@@ -611,24 +621,48 @@ def stratified_pick(rows, k):
             seen.add(i)
             picked.append(i)
 
-    for dev in sorted(by_dev):                       # 轮 1：每个设备 1 个
+    for dev in sorted(by_dev, key=lambda d: -len(by_dev[d])):   # 轮 1
         take(by_dev[dev][0])
-    for key in sorted(by_dev_ori):                   # 轮 2：每个 (设备, 朝向) 1 个
+    keys = sorted(by_key, key=lambda kk: -len(by_key[kk]))
+    for kk in keys:                                            # 轮 2
         if len(picked) >= k:
             break
-        take(by_dev_ori[key][0])
-    keys = sorted(by_dev_ori)
+        take(by_key[kk][0])
     r = 1
-    while len(picked) < k:                           # 轮 3：轮转补齐
+    while len(picked) < k:                                     # 轮 3
         added = False
-        for key in keys:
-            if len(by_dev_ori[key]) > r and len(picked) < k:
-                take(by_dev_ori[key][r])
+        for kk in keys:
+            if len(by_key[kk]) > r and len(picked) < k:
+                take(by_key[kk][r])
                 added = True
         if not added:
             break
         r += 1
     return picked
+
+
+def coverage_report(rows, picked):
+    """抽样覆盖统计（写进 summary，便于确认设备/朝向/缩放变体都验到了）。"""
+    devs = sorted({r["device"] for r in rows})
+    oris = sorted({int(r["orientation"]) for r in rows})
+    keys = sorted({(r["device"], int(float(r["screen_w"])), int(r["orientation"]))
+                   for r in rows})
+    got_dev = {rows[i]["device"] for i in picked}
+    got_ori = {int(rows[i]["orientation"]) for i in picked}
+    got_key = {(rows[i]["device"], int(float(rows[i]["screen_w"])),
+                int(rows[i]["orientation"])) for i in picked}
+    return [
+        f"总体: {len(rows)} 帧 / {len(devs)} 机型 / {len(keys)} 个"
+        f"(机型,屏宽,朝向)组合",
+        f"抽样: {len(picked)} 个 -> 机型 {len(got_dev)}/{len(devs)}"
+        f" | 朝向 {sorted(got_ori)} (全集 {oris})"
+        f" | (机型,屏宽,朝向) {len(got_key)}/{len(keys)}",
+        "未覆盖的(机型,屏宽,朝向)组合"
+        + (f": {sorted(set(keys) - got_key)}" if set(keys) - got_key else ": 无 ✓"),
+        "各机型抽样数: " + str(dict(sorted(
+            ((d, sum(1 for i in picked if rows[i]['device'] == d)) for d in got_dev),
+            key=lambda kv: -kv[1]))),
+    ]
 
 
 def main():
@@ -725,6 +759,13 @@ def main():
         by_name[name][1] += int(ok)
         if not ok:
             fails.append((idx, name, detail))
+    log_lines.append("")
+    log_lines.append("=" * 78)
+    log_lines.append("抽样覆盖统计")
+    log_lines.append("=" * 78)
+    for ln in coverage_report(ds.rows, picks):
+        log_lines.append("  " + ln)
+
     log_lines.append("")
     log_lines.append("=" * 78)
     log_lines.append("自动一致性校验汇总")
