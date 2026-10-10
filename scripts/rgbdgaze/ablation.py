@@ -111,22 +111,23 @@ def geometric_angular_loss(pred, label, screen_cm, D):
     return ang
 
 
-def evaluate_split(model, dl, device):
-    """与 train.py 完全一致的多口径评估。"""
+def predict_frames(model, dl, device):
+    """在给定 DataLoader 上跑一遍，返回逐帧物理量（供任意分组聚合）。
+
+    返回 dict，每个字段是 numpy 数组，长度 = 样本数：
+        pred, label : [N, 2] 归一化屏幕坐标（预测 / 真值）
+        cm_x, cm_y  : [N] 预测误差换算到屏幕物理厘米（带符号）
+        cm_dist     : [N] 误差的物理距离（厘米）
+        ang_deg     : [N] 几何视线角度误差（度）
+    评估口径集中在这里，summarize 与 evaluate_split 共用，避免多处各写一套。
+    """
     from configs.rgbdgaze_config import VIEWING_DISTANCE_CM as D
 
     model.eval()
-    dset = dl.dataset
-    cm_arr = np.asarray(dset.cm_px, dtype=np.float32)
-    scr = np.asarray(dset.screen_size, dtype=np.float32)
-    # 可选 token 由模型自身标志决定（与构造时的 use_imu/use_geom 一致）
     use_imu = getattr(model, "use_imu", False)
     use_geom = getattr(model, "use_geom", False)
 
-    L2n = 0.0; xA = 0.0; yA = 0.0; cnt = 0
-    cma = [0.0, 0.0, 0.0]
-    ang_acc = []
-    start = 0
+    preds, labels, cmxs, cmys, angs = [], [], [], [], []
     with torch.no_grad():
         for inp, label in dl:
             face = inp.rgb.to(device).float()
@@ -134,43 +135,63 @@ def evaluate_split(model, dl, device):
             imu = inp.imu.to(device).float() if use_imu else None
             geom = inp.geom.to(device).float() if use_geom else None
             pred = model(face, imu=imu, geom=geom)
-            diff = pred - label
-            B = label.size(0)
-            cm_b = torch.from_numpy(cm_arr[start:start+B]).to(device)
-            scr_b = torch.from_numpy(scr[start:start+B]).to(device)
-            cm_x = diff[:, 0] * scr_b[:, 0] * cm_b[:, 0]
-            cm_y = diff[:, 1] * scr_b[:, 1] * cm_b[:, 1]
-            cm_dist = torch.sqrt(cm_x**2 + cm_y**2)
-            L2n += diff.norm(dim=-1).sum().item()
-            xA += diff[:, 0].abs().sum().item()
-            yA += diff[:, 1].abs().sum().item()
-            cma[0] += cm_dist.sum().item()
-            cma[1] += cm_x.abs().sum().item()
-            cma[2] += cm_y.abs().sum().item()
 
-            scr_w_cm = scr_b[:, 0] * cm_b[:, 0]
-            scr_h_cm = scr_b[:, 1] * cm_b[:, 1]
+            # 物理换算所需量来自数据项本身，避免依赖 DataLoader 的样本顺序
+            cm_b = inp.screen_cm.to(device).float()
+            scr_w_cm = cm_b[:, 0]
+            scr_h_cm = cm_b[:, 1]
+            cm_x = (pred[:, 0] - label[:, 0]) * scr_w_cm
+            cm_y = (pred[:, 1] - label[:, 1]) * scr_h_cm
+
+            # 几何视线角度：把屏幕点按「到屏幕中心的偏移 + 基准视距 D」构成 3D 向量，
+            # 预测与真值各自归一化后取夹角。
             px = pred[:, 0] * scr_w_cm - scr_w_cm / 2
             py = pred[:, 1] * scr_h_cm - scr_h_cm / 2
             tx = label[:, 0] * scr_w_cm - scr_w_cm / 2
             ty = label[:, 1] * scr_h_cm - scr_h_cm / 2
-            p_vec = torch.stack([px, py, torch.full_like(px, D)], dim=-1)
-            t_vec = torch.stack([tx, ty, torch.full_like(tx, D)], dim=-1)
-            p_n = p_vec / p_vec.norm(dim=-1, keepdim=True)
-            t_n = t_vec / t_vec.norm(dim=-1, keepdim=True)
+            p_n = torch.stack([px, py, torch.full_like(px, D)], -1)
+            t_n = torch.stack([tx, ty, torch.full_like(tx, D)], -1)
+            p_n = p_n / p_n.norm(dim=-1, keepdim=True)
+            t_n = t_n / t_n.norm(dim=-1, keepdim=True)
             cosim = (p_n * t_n).sum(-1).clamp(-1.0, 1.0)
-            ang_acc.append((torch.acos(cosim) * 180.0 / PI).cpu().numpy())
-            cnt += B
-            start += B
 
-    ang_all = np.concatenate(ang_acc) if ang_acc else np.array([0.0])
-    n = len(ang_all)
-    sorted_a = np.sort(ang_all)
-    top95_mean = float(sorted_a[:int(n * 0.95)].mean()) if n > 0 else 0.0
+            preds.append(pred.cpu().numpy())
+            labels.append(label.cpu().numpy())
+            cmxs.append(cm_x.cpu().numpy())
+            cmys.append(cm_y.cpu().numpy())
+            angs.append((torch.acos(cosim) * 180.0 / PI).cpu().numpy())
+
+    if not preds:
+        raise ValueError("DataLoader 为空，无法评估")
     return dict(
-        l2_norm=L2n/max(cnt, 1), l2_x=xA/max(cnt, 1), l2_y=yA/max(cnt, 1),
-        em_dist=cma[0]/max(cnt, 1),
-        em_x=cma[1]/max(cnt, 1), em_y=cma[2]/max(cnt, 1),
+        pred=np.concatenate(preds), label=np.concatenate(labels),
+        cm_x=np.concatenate(cmxs), cm_y=np.concatenate(cmys),
+        ang_deg=np.concatenate(angs),
+    )
+
+
+def summarize(fr, sel=None):
+    """由 predict_frames 的逐帧结果算多口径指标；sel = 布尔/整数索引子集。"""
+    if sel is not None:
+        fr = {k: v[sel] for k, v in fr.items()}
+    pred, label = fr["pred"], fr["label"]
+    cm_x, cm_y = fr["cm_x"], fr["cm_y"]
+    ang_all = fr["ang_deg"]
+    cnt = len(ang_all)
+    if cnt == 0:
+        return dict(l2_norm=0.0, l2_x=0.0, l2_y=0.0, em_dist=0.0, em_x=0.0,
+                    em_y=0.0, ang_mean=0.0, ang_median=0.0, ang_top95_mean=0.0,
+                    ang_p95=0.0, ang_ratio_le_191=0.0, count=0)
+    diff = pred - label
+    cm_dist = np.hypot(cm_x, cm_y)
+    n95 = max(1, int(cnt * 0.95))
+    top95_mean = float(np.sort(ang_all)[:n95].mean())
+    return dict(
+        l2_norm=float(np.linalg.norm(diff, axis=1).mean()),
+        l2_x=float(np.abs(diff[:, 0]).mean()),
+        l2_y=float(np.abs(diff[:, 1]).mean()),
+        em_dist=float(cm_dist.mean()),
+        em_x=float(np.abs(cm_x).mean()), em_y=float(np.abs(cm_y).mean()),
         ang_mean=float(ang_all.mean()),
         ang_median=float(np.median(ang_all)),
         ang_top95_mean=top95_mean,
@@ -178,6 +199,11 @@ def evaluate_split(model, dl, device):
         ang_ratio_le_191=float((ang_all <= 1.91).mean() * 100),
         count=cnt,
     )
+
+
+def evaluate_split(model, dl, device):
+    """与 train.py 完全一致的多口径评估（predict_frames + summarize）。"""
+    return summarize(predict_frames(model, dl, device))
 
 
 class ModelEMA:
