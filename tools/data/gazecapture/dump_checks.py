@@ -45,7 +45,7 @@ for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
 
 from configs.gazecapture_config import (  # noqa: E402
     PROJECT_ROOT, GAZECAPTURE_EXTRACT_DIR, GAZECAPTURE_INDEX_DIR, IMAGE_SIZE,
-    CROP_MARGIN,
+    CROP_MARGIN, GEOM_RAND_ASPECT, GEOM_RAND_WIDTH_CM, GEOM_RAND_HEIGHT_CM,
 )
 from gazelab.datasets.gazecapture import GazeCaptureDataset, _resolve_data_path  # noqa: E402
 
@@ -309,18 +309,49 @@ def trace_sample(ds, idx, subject_cache, device_spec, log_lines, ds_aug=None):
         aug_inp, aug_lab = ds_aug[idx]
         aug_arr = denorm_tensor(aug_inp.rgb)          # HWC uint8 (RGB)
         aug_label = (float(aug_lab[0]), float(aug_lab[1]))
-        flipped = abs(float(aug_lab[0]) - gxn) > 1e-6
-        log_lines.append("[9] 增强（水平翻转 + 光度扰动 + 裁剪抖动）")
-        log_lines.append(f"      本样本是否发生水平翻转: {'是' if flipped else '否'}"
-                         f"（翻转时 label_x 必须变成 1-x）")
-        log_lines.append(f"      增强后 label = [{aug_lab[0]:.6f}, {aug_lab[1]:.6f}]")
+        # 增强后标签必须与"水平翻转 + 几何域随机化"的复合变换精确一致。
+        # 几何随机化会把标签重投影到合成屏 (W', H')（由 aug_inp.geom 给出）：
+        #     u' = 0.5 + s·(u-0.5)·w_cm/W'    s=+1 未翻转 / s=-1 已翻转
+        #     v' = 0.5 + (v-0.5)·h_cm/H'
+        # 若随机化未触发，则 (W',H') 就是真实屏幕，退化为"只可能水平翻转"。
+        Wp = float(math.exp(float(aug_inp.geom[1])))
+        Hp = float(math.exp(float(aug_inp.geom[2])))
+        # 是否真的被重投影：geom 以 float32 存 log(尺寸)，exp 反解往返误差约 1e-5，
+        # 故用**相对**容差判断，否则横屏帧会被误判成"已随机化"。
+        w_real, h_real = sw * cpx, sh * cpy
+        rel = max(abs(Wp - w_real) / max(w_real, 1e-9),
+                  abs(Hp - h_real) / max(h_real, 1e-9))
+        randomized = rel > 1e-3
+        au, av = float(aug_lab[0]), float(aug_lab[1])
+        exp_v = 0.5 + (gyn - 0.5) * (sh * cpy) / Hp
+        cand = [0.5 + s * (gxn - 0.5) * (sw * cpx) / Wp for s in (+1.0, -1.0)]
+        hit = min(range(2), key=lambda i: abs(cand[i] - au))
+        log_lines.append("[9] 增强（水平翻转 + 光度扰动 + 裁剪抖动 + 几何域随机化）")
+        log_lines.append(f"      增强后合成屏 W'={Wp:.4f}cm H'={Hp:.4f}cm "
+                         f"(宽高比 {Wp / Hp:.4f})"
+                         + ("  ← 与真实屏相同，本次未随机化" if rel <= 1e-3
+                            else "  ← 已重投影到合成几何"))
+        log_lines.append(f"      判定为{'已' if hit == 1 else '未'}水平翻转；"
+                         f"增强后 label = [{au:.6f}, {av:.6f}]")
+        log_lines.append(f"      期望 = [{cand[hit]:.6f}, {exp_v:.6f}]")
         log_lines.append("      注意：增强含随机裁剪抖动，故 E 面板的裁剪框与 B/C 面板不同")
-        check("增强后 label_y 不变", abs(float(aug_lab[1]) - gyn) < 1e-6)
-        check("增强后 label_x ∈ {原值, 1-原值}",
-              abs(float(aug_lab[0]) - gxn) < 1e-6
-              or abs(float(aug_lab[0]) - (1 - gxn)) < 1e-6)
-        num["aug_flipped"] = int(flipped)
-        num["aug_label_x"] = float(aug_lab[0])
+        check("增强后 label_x == 翻转×几何重投影的期望值", abs(cand[hit] - au) < 1e-5,
+              f"期望 {cand[hit]:.6f} 实得 {au:.6f}")
+        check("增强后 label_y == 几何重投影的期望值", abs(exp_v - av) < 1e-5,
+              f"期望 {exp_v:.6f} 实得 {av:.6f}")
+        if randomized:
+            check("几何随机化：合成屏尺寸在配置范围内",
+                  GEOM_RAND_WIDTH_CM[0] - 1e-6 <= Wp <= GEOM_RAND_WIDTH_CM[1] + 1e-6
+                  and GEOM_RAND_HEIGHT_CM[0] - 1e-6 <= Hp <= GEOM_RAND_HEIGHT_CM[1] + 1e-6
+                  and GEOM_RAND_ASPECT[0] - 1e-6 <= Wp / Hp <= GEOM_RAND_ASPECT[1] + 1e-6,
+                  f"W'={Wp:.3f} H'={Hp:.3f} a={Wp / Hp:.3f}")
+        else:
+            check("未随机化：geom == 真实屏幕尺寸", rel <= 1e-3,
+                  f"W'={Wp:.3f} H'={Hp:.3f} vs 真实 {w_real:.3f}x{h_real:.3f}")
+        num["aug_flipped"] = int(hit == 1)
+        num["aug_label_x"] = au
+        num["aug_Wp"] = Wp
+        num["aug_Hp"] = Hp
 
     # ---------- 组装面板图 ----------
     panel = _make_panel(img_bgr, (x0, y0, x1, y1), (cx_, cy_), (bx, by, bw, bh),
@@ -563,16 +594,40 @@ def dump_dropped(raw_root: Path, out_dir: Path, log_lines, max_per_reason=4):
 # 抽样：按 (设备, orientation) 分层，保证覆盖全部情况
 # ==========================================================================
 def stratified_pick(rows, k):
-    groups = defaultdict(list)
+    """分层抽样：先保证每个设备、再每个 (设备, 朝向) 至少 1 个，然后轮转补齐。
+
+    为什么不能只按 (设备, 朝向, split) 分组后轮转：键数会达到几十个，而
+    sorted() 把 'iPad*' 排在 'iPhone*' 前面，导致样本量不大时**全部落在 iPad**
+    （实测 60 样本 60 个都是 iPad），验证覆盖不到占比最大的 iPhone。
+    """
+    by_dev, by_dev_ori = defaultdict(list), defaultdict(list)
     for i, r in enumerate(rows):
-        groups[(r["device"], r["orientation"], r["split"])].append(i)
-    keys = sorted(groups)
-    picked, round_i = [], 0
-    while len(picked) < k and any(len(groups[key]) > round_i for key in keys):
+        by_dev[r["device"]].append(i)
+        by_dev_ori[(r["device"], r["orientation"])].append(i)
+    picked, seen = [], set()
+
+    def take(i):
+        if i not in seen:
+            seen.add(i)
+            picked.append(i)
+
+    for dev in sorted(by_dev):                       # 轮 1：每个设备 1 个
+        take(by_dev[dev][0])
+    for key in sorted(by_dev_ori):                   # 轮 2：每个 (设备, 朝向) 1 个
+        if len(picked) >= k:
+            break
+        take(by_dev_ori[key][0])
+    keys = sorted(by_dev_ori)
+    r = 1
+    while len(picked) < k:                           # 轮 3：轮转补齐
+        added = False
         for key in keys:
-            if len(groups[key]) > round_i and len(picked) < k:
-                picked.append(groups[key][round_i])
-        round_i += 1
+            if len(by_dev_ori[key]) > r and len(picked) < k:
+                take(by_dev_ori[key][r])
+                added = True
+        if not added:
+            break
+        r += 1
     return picked
 
 
