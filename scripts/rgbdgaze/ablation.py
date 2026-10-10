@@ -31,6 +31,7 @@
 import argparse
 import os
 import sys
+from math import ceil
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -438,10 +439,16 @@ def main():
               f" 数据集={args.dataset}  索引={args.index_dir}\n"
               f" loss={args.loss} geom={args.use_geom} imu={args.use_imu} "
               f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze}\n"
-              f" 训练集 {len(train_dl.dataset)} / 验证集 {len(val_dl.dataset)} / "
-              f"测试集 {len(test_dl.dataset)}\n"
+              f" 训练集 {len(train_dl.dataset)}"
+              # DDP 下 len(train_dl.dataset) 是**全集**（DistributedSampler 在
+              # 迭代时才切分），不写清每卡份数会让人误判每轮步数
+              + (f"（每卡约 {ceil(len(train_dl.dataset) / world)}）" if is_dist else "")
+              + f" / 验证集 {len(val_dl.dataset)} / 测试集 {len(test_dl.dataset)}\n"
               f" 分辨率={args.resolution} batch/卡={args.batch_size} "
               f"卡数={world} 有效批={eff_bs} lr={args.lr} epochs={args.epochs}\n"
+              # 参考 g6 的 batch=24 / lr=1e-4，按 sqrt(有效批/24) 缩放；只提示不改值
+              f" lr 参考: 按 sqrt 缩放的有效批基准为 "
+              f"{1e-4 * (eff_bs / 24) ** 0.5:.2e}（g6: batch24/lr1e-4）\n"
               f" 可训练参数: {tr_params:,}   seed={args.seed}\n"
               f" 命令: {' '.join(sys.argv)}\n"
               # 复现多卡跑法：把 sys.argv 的脚本路径换成 "-m <模块>"，
