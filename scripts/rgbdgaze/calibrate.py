@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from configs.gaze360_config import DEVICE as DEFAULT_DEVICE
+from configs.paths import DEVICE as DEFAULT_DEVICE
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
 from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import RGBDGazeDINOv2

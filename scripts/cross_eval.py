@@ -44,7 +44,7 @@ for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs  # noqa: E402
+from configs.paths import DEVICE as DEFAULT_DEVICE, experiment_dirs  # noqa: E402
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR  # noqa: E402
 from configs.gazecapture_config import GAZECAPTURE_INDEX_DIR  # noqa: E402
 from gazelab.datasets import (  # noqa: E402

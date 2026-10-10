@@ -32,7 +32,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from datetime import datetime
 
-from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
+from configs.paths import DEVICE as DEFAULT_DEVICE, experiment_dirs
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM
 from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze import RGBDGazeDINOv2, DINOV2_CKPT

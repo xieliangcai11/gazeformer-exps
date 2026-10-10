@@ -3,8 +3,18 @@ import torch
 import clip
 from torchvision.transforms import transforms
 
-# 项目根目录 = 本文件(configs/config.py)的上两级；使路径不依赖运行 CWD
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 路径与输出目录定义已抽到 configs/paths.py（那里不加载 CLIP，训练脚本用它可以
+# 避免"仅为拿 DEVICE/experiment_dirs 就把 CLIP 加载到 cuda:0"）。此处 re-export
+# 这些名字，保证既有 `from configs.gaze360_config import *` 的调用不受影响。
+from configs.paths import (          # noqa: F401  (re-export)
+    PROJECT_ROOT as _PROJECT_ROOT,
+    DATASETS_PATH,
+    OUT_PATH,
+    CHECKPOINTS_PATH,
+    LOGS_PATH,
+    RUNS_PATH,
+    experiment_dirs,
+)
 
 # MPIIFaceGaze
 # EyeDiap
@@ -25,41 +35,8 @@ TEST_DATASET_NAME = "Gaze360"
 IS_TRAIN = False
 TEST_EPOCH = 50
 TEST_CHECKPOINT = f"epoch_{TEST_EPOCH}.pth"
-# 数据根目录（GazeHub 结构：<data>/<数据集名>/GazeHub/{Image,Label}）。
-# 数据集子目录名必须与 TRAIN_DATASET_NAME / TEST_DATASET_NAME 完全一致（即 Gaze360），
-# 故 Gaze360 数据需位于 data/Gaze360/GazeHub/ 下。
-DATASETS_PATH = _PROJECT_ROOT / "data"
-# TRAIN_IMAGES_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image"/"train"
-# TEST_IMAGES_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Image"/"test"
-TRAIN_IMAGES_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Image"
-TEST_IMAGES_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Image"
-# ClusterLabel is for EyeDiap
-TRAIN_LABELS_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Label"
-TEST_LABELS_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Label"
-# TRAIN_LABELS_PATH = DATASETS_PATH / TRAIN_DATASET_NAME / "GazeHub" / "Label"
-# TEST_LABELS_PATH = DATASETS_PATH / TEST_DATASET_NAME / "GazeHub" / "Label"
-OUT_PATH = _PROJECT_ROOT / "out"
-CHECKPOINTS_PATH = OUT_PATH / "checkpoints"
-LOGS_PATH = OUT_PATH / "logs"
-RUNS_PATH = OUT_PATH / "runs"
-
-
-def experiment_dirs(dataset: str, task: str) -> dict:
-    """返回按数据集+任务分层的输出目录。
-
-    规范：out/<dataset>/<task>/{logs, checkpoints, runs}
-      - out/gaze360/train/{logs, checkpoints, runs}
-      - out/rgbdgaze/train/{logs, checkpoints, runs}
-
-    各脚本请用此函数生成统一的输出路径，勿再硬编码相对 CWD 的 'log/' 等。
-    """
-    base = OUT_PATH / dataset / task
-    return {
-        "root": base,
-        "log": base / "logs",
-        "checkpoint": base / "checkpoints",
-        "run": base / "runs",
-    }
+# （OUT_PATH / CHECKPOINTS_PATH / LOGS_PATH / RUNS_PATH / experiment_dirs
+#   的定义已移到 configs/paths.py，见文件开头的 re-export）
 SEED = 0
 is_ablation = True
 ABLA_CONFIG = {
