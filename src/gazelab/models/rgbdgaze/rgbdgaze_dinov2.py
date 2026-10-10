@@ -1,30 +1,40 @@
-"""RGBDGaze 新模型：DINOv2 冻结 RGB + 逆深度几何 + Transformer(BlockMoba) 融合。
+"""RGBDGaze 模型：DINOv2 冻结 RGB + 屏幕几何 token + Transformer(BlockMoba) 融合。
 
-设计（替代旧的 CLIP+ResNet 双流，输入一致：RGB 人脸 + 深度人脸）：
-    RGB 流   → DINOv2（ViT-S/14，冻结）提取 cls + patch tokens。
-    Depth 流 → 逆深度单通道，grid 池化 + 线性嵌入为少量 depth tokens（几何补充，不喧宾夺主）。
-    融合     → 复用 gazelab.models.transformers 的 BlockMoba（标准自注意力 + MoE/FFN），
-               把 [汇总CLS, rgb_cls, depth_tokens, rgb_patch_tokens] 一起自注意力。
-    回归     → 取汇总 CLS 经线性头输出 2D 屏幕坐标。
+设计：
+    RGB 流     → DINOv2（ViT-S/14，冻结）提取 cls + patch tokens。
+    几何 token → 屏幕物理几何（宽高比 + 物理宽高），1 个 token。
+    姿态 token → IMU 重力向量（可选），1 个 token。
+    融合       → 复用 gazelab.models.transformers 的 BlockMoba（标准自注意力 + MoE/FFN），
+                 把 [汇总CLS, geom, imu, rgb_cls, rgb_patch_tokens] 一起自注意力。
+    回归       → 取汇总 CLS 经线性头输出 2D 屏幕坐标。
 
-训练目标（在训练脚本中实现）：2D 坐标 MSE + 几何角度损失（配合 VIEWING_DISTANCE_CM）。
+为什么需要"屏幕几何 token"（跨设备泛化的关键）：
+    归一化屏幕坐标 (x,y) 的物理含义随设备变化。实测（GazeCapture vs RGBDGaze）：
+      - 宽高比 0.562~0.750（GazeCapture 手机/iPad）vs 0.462（RGBDGaze 现代手机）；
+      - 屏幕物理对角线 11.94~25.47 cm，相差 2.1 倍。
+    同一个归一化坐标 (0.1, 0.1) 在不同设备上对应的物理方向完全不同
+    （与水平夹角 52.9° / 60.7° / 64.1°）。而屏幕在正面摄像头画面里是**不可见**的，
+    模型无法从人脸图推断屏幕尺寸 —— 必须显式喂入，否则只能学到"平均设备"的映射。
+
+注意：深度模态已移除 —— 实验证明其在 RGBDGaze 上无正收益
+（见 out/rgbdgaze/ablation 消融结果），故不再保留相关分支。
 
 输入：
-    face  : [B, 3, 224, 224] RGB 人脸（ImageNet 归一化，适配 DINOv2 预处理）。
-    depth : [B, 1, 224, 224] 逆深度单通道（由 inverse_depth_preprocess 产生）。
+    face : [B, 3, S, S] RGB 人脸（ImageNet 归一化，适配 DINOv2 预处理）。
+    imu  : [B, 3] 重力向量（use_imu=True 时必需）。
+    geom : [B, 3] 屏幕几何 [宽高比, log(物理宽cm), log(物理高cm)]（use_geom=True 时必需）。
 
 设计取舍（重要，避免逻辑/资源纰漏）：
     - 不直接复用 TransformerDeepSeek_gaze：其 proj_f1/f2/f3 把输入维度写死为
       512/512/2048（面向 CLIP+ResNet）。RGBD 无 CLIP 时若强行喂入，会因
       2048->768 投影作用在 256 个 token 上而产生约 4 亿参数，浪费且错误。
-      此处复用其底层 BlockMoba 块，构造 RGBD 专用、维度正确的投影。
+      此处复用其底层 BlockMoba 块，构造维度正确的投影。
     - DINOv2 冻结当现成"眼睛"，只训融合与回归头。
 """
 
 import torch
 import torch.nn as nn
 import timm
-from pathlib import Path
 
 from gazelab.models.transformers import RMSNorm, BlockMoba
 
@@ -121,79 +131,17 @@ class DINOv2Backbone(nn.Module):
             pass
 
 
-class DepthAttentionFusion(nn.Module):
-    """深度特征图 -> 空间注意力权重图 -> 与 RGB 特征图逐像素相乘（论文同款机制）。
-
-    结构（对应 RGBDGaze 论文 Figure 3 的 CNN Spatial Attention Unit）：
-        depth [B,1,H,W]
-          -> 轻量 CNN（几层 3x3）得 depth 特征 [B, C_d, H', W']
-          -> 1x1 conv 出单通道空间权重图 [B, 1, H', W']（sigmoid）
-          -> RGB 特征图与权重图逐元素相乘后重新投影到 d_model
-    保留深度空间结构（相比旧版压成 64 个 token，信息不再被池化丢弃）。
-
-    为什么加 RGB 特征图：RGB tokens 是 DINOv2 输出（[B,N,C]，N=256, 网格16x16），
-    深度注意力图下采样到 16x16 与之对齐，乘法融合后得到"被深度引导"的 RGB 表征，
-    再与原 RGB 表征并联，保证不丢原信息。
-    """
-
-    def __init__(self, dino_dim: int, d_model: int, hidden: int = 32, grid: int = 16):
-        super().__init__()
-        self.grid = grid
-        # 轻量 CNN：1通道逆深度 -> hidden 特征
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, hidden, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
-        )
-        # 1x1 conv 出空间注意力图（单通道）
-        self.attn = nn.Conv2d(hidden, 1, 1)
-        # 融合后投影回 d_model（输入 = RGB特征(被门控) + 原RGB特征 拼接? 简化为乘法后直接投影）
-        self.proj = nn.Linear(dino_dim, d_model)
-        self.gate = nn.Parameter(torch.zeros(1))  # 融合强度门控（可学习，初始0=不干扰）
-
-    def forward(self, depth: torch.Tensor, rgb_tokens: torch.Tensor):
-        """depth: [B,1,H,W] 逆深度; rgb_tokens: [B, N, dino_dim] (无cls)。
-        返回 [B, N, d_model] 的深度门控 RGB 表征。
-        """
-        B = depth.size(0)
-        # 1) 深度特征 -> 注意力图，池化到 patch 网格
-        feat = self.cnn(depth)                                # [B, hidden, H, W]
-        attn = torch.sigmoid(self.attn(feat))                 # [B, 1, H, W]
-        attn = nn.functional.adaptive_avg_pool2d(attn, (self.grid, self.grid))
-        attn = attn.reshape(B, 1, self.grid * self.grid)      # [B, 1, N]
-        # 2) 门控乘法：深度引导的 RGB 表征 = 原 tokens * (1 + gate * attn)
-        gated = rgb_tokens * (1.0 + self.gate * attn.permute(0, 2, 1))  # [B,N,C]
-        return self.proj(gated)                               # [B, N, d_model]
-
-
-class DepthPatchEmbed(nn.Module):
-    """把逆深度单通道图嵌入为 depth tokens（少量，几何补充）。
-
-    流程：逆深度 [B,1,H,W] -> AdaptiveAvgPool 到 (grid, grid) -> 展平 [B,N,1]
-          -> Linear(1, d_model) -> [B, N, d_model]。
-    N = grid*grid（默认 8*8=64），远小于 RGB 的 256 个 patch，保持 RGB 主导。
-    """
-
-    def __init__(self, in_channels=1, grid=8, d_model=384):
-        super().__init__()
-        self.grid = grid
-        self.pool = nn.AdaptiveAvgPool2d((grid, grid))
-        self.proj = nn.Linear(in_channels, d_model)
-
-    def forward(self, depth):
-        """depth: [B, in_channels, H, W]。返回 [B, grid*grid, d_model]."""
-        B = depth.size(0)
-        x = self.pool(depth)                      # [B, C, grid, grid]
-        x = x.reshape(B, self.grid * self.grid, -1)  # [B, N, C]
-        return self.proj(x)                       # [B, N, d_model]
-
-
 class RGBDGazeDINOv2(nn.Module):
-    """DINOv2(RGB,冻结) + 逆深度 depth tokens + BlockMoba 融合 -> 2D 屏幕坐标。
+    """DINOv2(RGB,冻结) + 屏幕几何 token + BlockMoba 融合 -> 2D 屏幕坐标。
 
-    forward(face, depth) -> [B, 2]
-      face  : [B, 3, 224, 224] RGB（ImageNet 归一化，DINOv2 预处理）
-      depth : [B, 1, 224, 224] 逆深度单通道
+    forward(face, imu=None, geom=None) -> [B, 2]
+      face : [B, 3, S, S] RGB（ImageNet 归一化，DINOv2 预处理）
+      imu  : [B, 3] 重力向量（use_imu=True 时必需）
+      geom : [B, 3] 屏幕几何 [宽高比, log(物理宽cm), log(物理高cm)]（use_geom=True 时必需）
     """
+
+    #: 几何 token 的输入维度：[宽高比, log(w_cm), log(h_cm)]
+    GEOM_DIM = 3
 
     def __init__(
         self,
@@ -202,12 +150,10 @@ class RGBDGazeDINOv2(nn.Module):
         num_heads=8,
         num_layers=6,
         inter_dim=1536,
-        depth_grid=8,
         freeze_dino=True,
-        use_depth=True,
         unfreeze_last=0,
-        depth_mode="token",
         use_imu=False,
+        use_geom=True,
         img_size=DINOV2_IMG_SIZE,
         dino_model=DINOV2_MODEL,
         dino_ckpt=DINOV2_CKPT,
@@ -224,34 +170,15 @@ class RGBDGazeDINOv2(nn.Module):
         self.proj_rgb_cls = nn.Linear(dino_dim, d_model)
         self.proj_rgb_patch = nn.Linear(dino_dim, d_model)
 
-        # ---- Depth 流（可关；两种用法可选，做消融） ----
-        # depth_mode:
-        #   "none"      : 关闭深度
-        #   "attn"      : 轻量 CNN 特征图 + 与 RGB 特征图空间注意力相乘（论文同款机制）
-        #   "token"     : 旧版逆深度 grid token（消融已证弱，保留作对照）
-        self.use_depth = use_depth
-        self.depth_mode = depth_mode
-        if use_depth:
-            if depth_mode == "attn":
-                # patch 网格 = img_size / 14（DINOv2 patch 大小），如 224/14=16, 448/14=32
-                patch_grid = img_size // 14
-                self.depth_attn = DepthAttentionFusion(dino_dim, d_model,
-                                                       grid=patch_grid)
-                self.depth_patch = None
-            elif depth_mode == "token":
-                self.depth_patch = DepthPatchEmbed(in_channels=1, grid=depth_grid,
-                                                   d_model=d_model)
-                self.depth_attn = None
-            else:
-                raise ValueError(f"未知 depth_mode: {depth_mode}")
-        else:
-            self.depth_patch = None
-            self.depth_attn = None
-
         # ---- IMU 姿态 token（可选） ----
         self.use_imu = use_imu
         if use_imu:
             self.proj_imu = nn.Linear(3, d_model)
+
+        # ---- 屏幕几何 token（可选；跨设备泛化的关键，见模块 docstring） ----
+        self.use_geom = use_geom
+        if use_geom:
+            self.proj_geom = nn.Linear(self.GEOM_DIM, d_model)
 
         # ---- 融合：BlockMoba 栈 + 汇总 token ----
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -267,7 +194,7 @@ class RGBDGazeDINOv2(nn.Module):
         self.norm = RMSNorm(d_model, eps=1e-5)
         self.head = nn.Linear(d_model, gaze_dim)
 
-    def forward(self, face, depth, imu=None):
+    def forward(self, face, imu=None, geom=None):
         # 1) RGB：DINOv2（冻结/部分解冻）-> cls + patches
         tokens = self.rgb(face)                      # [B, 1+N, C]
         cls = tokens[:, 0]                           # [B, C]
@@ -275,27 +202,27 @@ class RGBDGazeDINOv2(nn.Module):
         rgb_cls = self.proj_rgb_cls(cls).unsqueeze(1)    # [B, 1, d_model]
         rgb_patch = self.proj_rgb_patch(patches)         # [B, N, d_model]
 
-        # 2) 拼接：汇总CLS + rgb_cls [+ depth] + rgb_patches
-        if self.use_depth and self.depth_mode == "attn":
-            # 深度空间注意力融合：门控增强后的 RGB patch 表征
-            d_patch = self.depth_attn(depth, patches)    # [B, N, d_model]
-            seq = torch.cat([rgb_cls, d_patch, rgb_patch], dim=1)
-        elif self.use_depth and self.depth_mode == "token":
-            depth_tokens = self.depth_patch(depth)       # [B, N_d, d_model]
-            seq = torch.cat([rgb_cls, depth_tokens, rgb_patch], dim=1)
-        else:
-            seq = torch.cat([rgb_cls, rgb_patch], dim=1)
+        # 2) 拼接：汇总CLS + [imu] + [geom] + rgb_cls + rgb_patches
+        seq = torch.cat([rgb_cls, rgb_patch], dim=1)
 
-        # 2b) IMU 姿态 token（可选，1 个 token）
+        # 2a) IMU 姿态 token（可选，1 个 token）
         if self.use_imu:
             if imu is None:
                 raise ValueError("use_imu=True 但 forward 未提供 imu")
             imu_tok = self.proj_imu(imu).unsqueeze(1)    # [B, 1, d_model]
             seq = torch.cat([imu_tok, seq], dim=1)
 
-        B = depth.size(0)
+        # 2b) 屏幕几何 token（可选，1 个 token）——跨设备泛化的关键信息，
+        #     屏幕在正面摄像头画面里不可见，必须显式提供。
+        if self.use_geom:
+            if geom is None:
+                raise ValueError("use_geom=True 但 forward 未提供 geom")
+            geom_tok = self.proj_geom(geom).unsqueeze(1)  # [B, 1, d_model]
+            seq = torch.cat([geom_tok, seq], dim=1)
+
+        B = face.size(0)
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+1+[imu]+[N_d]+N, d_model]
+        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+[imu]+[geom]+1+N, d_model]
 
         # 3) BlockMoba 栈（自注意力融合）
         for layer in self.layers:

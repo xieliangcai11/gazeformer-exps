@@ -5,8 +5,8 @@
         mse        : 纯 MSE（与旧基线同口径）
         mse_angle  : MSE + 几何角度损失（训练时就按"物理cm + 30cm眼距"算，
                      与 evaluate_split 验收口径一致；注意不是早期那个有缺陷的代理角度）
-    --use-depth / --no-depth
-        是否使用逆深度分支（RGB-only 消融）
+    --geom / --no-geom
+        是否注入屏幕几何 token（跨设备泛化的关键信息）
     --unfreeze N
         解冻 DINOv2 最后 N 个 block 参与微调（N=0 表示全部冻结）
 
@@ -14,8 +14,8 @@
 指标：与 train.py 完全一致的多口径（L2 / cm / 角度 mean·median·p95·前95%·≤1.91%）。
 
 用法示例：
-    python -m scripts.rgbdgaze.ablation --loss mse --use-depth --unfreeze 0 --epochs 8
-    python -m scripts.rgbdgaze.ablation --loss mse --no-depth --unfreeze 0 --epochs 8
+    python -m scripts.rgbdgaze.ablation --loss mse --unfreeze 0 --epochs 8
+    python -m scripts.rgbdgaze.ablation --loss mse --no-geom --unfreeze 0 --epochs 8
     python -m scripts.rgbdgaze.ablation --loss mse_angle --unfreeze 2 --epochs 8
 """
 
@@ -37,9 +37,9 @@ from torch.utils.data import DataLoader
 from datetime import datetime
 
 from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
-from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM
-from gazelab.datasets.rgbdgaze import (RGBDGazeDataset, rgb_preprocess,
-                                       inverse_depth_preprocess)
+from configs.rgbdgaze_config import (RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM,
+                                     AUG_SHIFT, AUG_SCALE, AUG_ROTATE)
+from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze import RGBDGazeDINOv2
 
 PI = 3.141592653589793
@@ -68,7 +68,7 @@ class Subset(torch.utils.data.Dataset):
 
 
 def build_dataloader(split, index_dir, batch_size, shuffle, num_workers,
-                     augment=False, crop_jitter=0.0, resolution=None):
+                     augment=False, resolution=None):
     index_csv = Path(index_dir) / "index.csv"
     list_txt = Path(index_dir) / f"{split}.txt"
     paths = [l.strip() for l in list_txt.read_text(encoding="utf-8").splitlines()
@@ -81,8 +81,7 @@ def build_dataloader(split, index_dir, batch_size, shuffle, num_workers,
 
     ds = RGBDGazeDataset(index_csv,
                          color_transform=rgb_preprocess,
-                         depth_transform=inverse_depth_preprocess,
-                         augment=augment, crop_jitter=crop_jitter,
+                         augment=augment,
                          image_size=resolution)
     sub = Subset(ds, idx)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
@@ -120,6 +119,9 @@ def evaluate_split(model, dl, device):
     dset = dl.dataset
     cm_arr = np.asarray(dset.cm_px, dtype=np.float32)
     scr = np.asarray(dset.screen_size, dtype=np.float32)
+    # 可选 token 由模型自身标志决定（与构造时的 use_imu/use_geom 一致）
+    use_imu = getattr(model, "use_imu", False)
+    use_geom = getattr(model, "use_geom", False)
 
     L2n = 0.0; xA = 0.0; yA = 0.0; cnt = 0
     cma = [0.0, 0.0, 0.0]
@@ -128,10 +130,10 @@ def evaluate_split(model, dl, device):
     with torch.no_grad():
         for inp, label in dl:
             face = inp.rgb.to(device).float()
-            depth = inp.depth.to(device).float()
             label = label.to(device)
-            imu = inp.imu.to(device).float() if getattr(model, "use_imu", False) else None
-            pred = model(face, depth, imu=imu)
+            imu = inp.imu.to(device).float() if use_imu else None
+            geom = inp.geom.to(device).float() if use_geom else None
+            pred = model(face, imu=imu, geom=geom)
             diff = pred - label
             B = label.size(0)
             cm_b = torch.from_numpy(cm_arr[start:start+B]).to(device)
@@ -226,12 +228,10 @@ def parse():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--loss", choices=["mse", "mse_angle"], default="mse",
                    help="mse=纯MSE；mse_angle=MSE+几何角度")
-    p.add_argument("--use-depth", dest="use_depth", action="store_true",
-                   default=True, help="使用逆深度分支（默认开）")
-    p.add_argument("--no-depth", dest="use_depth", action="store_false",
-                   help="只用 RGB，关闭逆深度分支")
-    p.add_argument("--depth-mode", choices=["token", "attn"], default="token",
-                   help="深度用法：token=旧版grid token；attn=特征图空间注意力相乘(论文同款)")
+    p.add_argument("--geom", dest="use_geom", action="store_true", default=True,
+                   help="注入屏幕几何 token（宽高比 + 物理尺寸，默认开）")
+    p.add_argument("--no-geom", dest="use_geom", action="store_false",
+                   help="关闭屏幕几何 token（消融用）")
     p.add_argument("--unfreeze", type=int, default=0,
                    help="解冻 DINOv2 最后 N 个 block（0=全冻结）")
     p.add_argument("--diff-lr", action="store_true",
@@ -241,9 +241,13 @@ def parse():
     p.add_argument("--ema", action="store_true",
                    help="使用 EMA 权重做验证与保存（decay=0.999）")
     p.add_argument("--augment", action="store_true",
-                   help="训练集数据增强（水平翻转+注视镜像、裁剪抖动、光度扰动）")
-    p.add_argument("--crop-jitter", type=float, default=0.05,
-                   help="裁剪框抖动比例（默认0.05，配合 --augment）")
+                   help="训练集数据增强（水平翻转+注视镜像、几何抖动、光度扰动）")
+    p.add_argument("--aug-shift", type=float, default=AUG_SHIFT,
+                   help="裁剪中心随机偏移幅度（相对裁剪边长，配合 --augment）")
+    p.add_argument("--aug-scale", type=float, default=AUG_SCALE,
+                   help="裁剪边长随机缩放幅度（配合 --augment）")
+    p.add_argument("--aug-rotate", type=float, default=AUG_ROTATE,
+                   help="随机旋转角度（度，配合 --augment）")
     p.add_argument("--resolution", type=int, default=224,
                    help="模型输入分辨率（224 或 448）")
     p.add_argument("--tag", default=None,
@@ -256,8 +260,7 @@ def main():
     device = args.device if args.device != "auto" else DEFAULT_DEVICE
 
     if args.tag is None:
-        args.tag = (f"loss{args.loss}_depth{args.use_depth}"
-                    f"{args.depth_mode}_unfreeze{args.unfreeze}"
+        args.tag = (f"loss{args.loss}_unfreeze{args.unfreeze}"
                     + ("_difflr" if args.diff_lr else "")
                     + ("_imu" if args.use_imu else "")
                     + ("_ema" if args.ema else "")
@@ -277,10 +280,9 @@ def main():
             f.write(msg + "\n")
 
     model = RGBDGazeDINOv2(
-        use_depth=args.use_depth,
         unfreeze_last=args.unfreeze,
-        depth_mode=args.depth_mode,
         use_imu=args.use_imu,
+        use_geom=args.use_geom,
         img_size=args.resolution,
     ).to(device)
     criterion = nn.MSELoss()
@@ -301,20 +303,20 @@ def main():
 
     train_dl = build_dataloader("train", Path(args.index_dir), args.batch_size,
                                 True, args.num_workers,
-                                augment=args.augment, crop_jitter=args.crop_jitter,
+                                augment=args.augment,
                                 resolution=args.resolution)
     val_dl = build_dataloader("val", Path(args.index_dir), args.batch_size,
                               False, args.num_workers,
-                              augment=False, crop_jitter=0.0,
+                              augment=False,
                               resolution=args.resolution)
     test_dl = build_dataloader("test", Path(args.index_dir), args.batch_size,
                                False, args.num_workers,
-                               augment=False, crop_jitter=0.0,
+                               augment=False,
                                resolution=args.resolution)
 
     tr_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"
-              f" loss={args.loss} depth={args.use_depth} "
+              f" loss={args.loss} geom={args.use_geom} "
               f"unfreeze={args.unfreeze}\n"
               f" 训练集 {len(train_dl.dataset)} / 验证集 {len(val_dl.dataset)} / 测试集 {len(test_dl.dataset)}\n"
               f" batch={args.batch_size} lr={args.lr} epochs={args.epochs}\n"
@@ -330,11 +332,11 @@ def main():
         t0 = time.time()
         for i, (inp, label) in enumerate(train_dl):
             face = inp.rgb.to(device).float()
-            depth = inp.depth.to(device).float()
             label = label.to(device)
             imu = inp.imu.to(device).float() if args.use_imu else None
+            geom = inp.geom.to(device).float() if args.use_geom else None
             optimizer.zero_grad()
-            pred = model(face, depth, imu=imu)
+            pred = model(face, imu=imu, geom=geom)
             loss_coord = criterion(pred, label)
             loss = loss_coord
             if args.loss == "mse_angle":

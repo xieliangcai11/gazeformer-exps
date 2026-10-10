@@ -2,15 +2,16 @@
 
 任务：把 RGBDGaze 官方的分级目录（p*/decoded/{activity}/{rgb,depth,label.csv}）
 转成一个扁平索引，每一行对应一个样本：
-    rgb_path, depth_path, bbox_x, bbox_y, bbox_w, bbox_h,
-    device, screen_w, screen_h, gaze_x, gaze_y
+    rgb_path, bbox_x, bbox_y, bbox_w, bbox_h,
+    device, screen_w, screen_h, gaze_x, gaze_y, cm_px_x, cm_px_y,
+    imu_x, imu_y, imu_z, subject, activity
 
 关键处理：
 1. 扫描所有 p*/decoded/*/label.csv，逐行读取 bbox 与注视点、设备。
 2. label.csv 的 device 名带空格（如 "iPhone 12 Pro Max"），而 iphone_spec.csv
    的 key 无空格（如 "iPhone12 Pro Max"），做去空格匹配。
-3. RGB 与 depth 都是 3 通道彩色图；RGB 1440x1080，depth 640x480，二者用
-   同一 bbox（按比例缩放后）对齐，供双流模型使用。
+3. depth 目录仍存在于原始数据中，但深度模态已被实验证明无正收益，故**不写索引**
+   （模型/数据集只消费 RGB）。
 4. 输出统一索引到 configs/rgbdgaze_config.py 的 RGBDGaze_INDEX_DIR。
 5. 同时生成按人/按样本划分的 train/val/test 清单。
 """
@@ -61,7 +62,7 @@ def load_screen_spec() -> dict:
 def discover_samples():
     """扫描原始目录，返回有序样本列表。
 
-    每个样本 dict: rgb, depth, bbox_xywh, device, screen_w, screen_h,
+    每个样本 dict: rgb, bbox_xywh, device, screen_w, screen_h,
                    gaze_x, gaze_y, subject, activity
     """
     spec = load_screen_spec()
@@ -106,16 +107,13 @@ def discover_samples():
                 cm_px_x = w_cm / w_pt   # 每像素对应的物理宽度(厘米)
                 cm_px_y = h_cm / h_pt   # 每像素对应的物理高度(厘米)
                 rgb = act_dir / "rgb" / f"{uid}.jpg"
-                depth = act_dir / "depth" / f"{uid}.jpg"
-                if not rgb.exists() or not depth.exists():
-                    # RGB 与 depth 数量一致（论文所述），跳过缺任一
+                if not rgb.exists():
                     continue
                 # 存"相对项目根" + 前向斜杠的路径，跨 Windows/Linux 通用
                 # （读取端再用 configs.rgbdgaze_config.PROJECT_ROOT 拼回绝对路径）
                 rgb_rel = rgb.relative_to(_PROJECT_ROOT).as_posix()
-                depth_rel = depth.relative_to(_PROJECT_ROOT).as_posix()
                 samples.append(dict(
-                    rgb=rgb_rel, depth=depth_rel,
+                    rgb=rgb_rel,
                     bbox_xywh=(bx, by, bw, bh),
                     device=device, screen_w=w_pt, screen_h=h_pt,
                     gaze_x=gx, gaze_y=gy,
@@ -132,13 +130,13 @@ def write_index(samples, index_dir: Path):
     out = index_dir / "index.csv"
     with open(out, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["rgb_path", "depth_path", "bbox_x", "bbox_y", "bbox_w",
+        w.writerow(["rgb_path", "bbox_x", "bbox_y", "bbox_w",
                     "bbox_h", "device", "screen_w", "screen_h", "gaze_x",
                     "gaze_y", "cm_px_x", "cm_px_y", "imu_x", "imu_y", "imu_z",
                     "subject", "activity"])
         for s in samples:
             bx, by, bw, bh = s["bbox_xywh"]
-            w.writerow([s["rgb"], s["depth"], bx, by, bw, bh,
+            w.writerow([s["rgb"], bx, by, bw, bh,
                         s["device"], s["screen_w"], s["screen_h"],
                         s["gaze_x"], s["gaze_y"],
                         s["cm_px_x"], s["cm_px_y"],

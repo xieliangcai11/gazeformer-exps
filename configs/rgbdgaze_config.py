@@ -15,7 +15,7 @@ PROJECT_ROOT = _PROJECT_ROOT
 # data/RGBDGaze_dataset/
 # ├── p{1..45}/
 # │   └── decoded/
-# │       ├── sitting/  {rgb/, depth/, label.csv}
+# │       ├── sitting/  {rgb/, depth/, label.csv}   ← depth 不再使用（消融已证无效）
 # │       ├── standing/ {rgb/, depth/, label.csv}
 # │       ├── walking/  {rgb/, depth/, label.csv}
 # │       └── lying/    {rgb/, depth/, label.csv}
@@ -38,7 +38,7 @@ IPHONE_SPEC_CSV = RGBDGaze_RAW_ROOT / "iphone_spec.csv"
 # 相机内参（每被试 intrinsic.json）
 # 若无则用默认近似（data 中大多是同一矩阵）
 
-# 图像目标尺寸（双流：RGB 与 depth 都 resize 到该尺寸）
+# 图像目标尺寸（RGB 人脸图 resize 到该尺寸）
 IMAGE_SIZE = 224
 
 # 人脸裁剪边距倍数（相对人脸 bbox 最大边）
@@ -52,3 +52,10 @@ VIEWING_DISTANCE_CM = 30.0
 
 # 归一化后 gaze 目标范围（用于回归，配合 sigmoid/tanh 或直接回归）
 # 若 NORMALIZE_GAZE: 目标在 [0,1] 左右
+# ---- 训练期几何增强（只作用于训练集；用于抹平两数据集的人脸框分布差异）----
+# 实测 GazeCapture 与 RGBDGaze 的"bbox 边长/帧短边"分布：中位 0.467 vs 0.427，
+# 5~95% 区间 0.352~0.789 vs 0.312~0.591（GazeCapture 方差 2.2 倍）。
+# 不做几何抖动，模型会依赖"人脸在裁剪图里的构图"这种域特有线索。
+AUG_SHIFT = 0.10     # 裁剪中心随机偏移 ±10% 边长
+AUG_SCALE = 0.25     # 裁剪边长随机缩放 ±25%
+AUG_ROTATE = 10.0    # 随机旋转 ±10 度
