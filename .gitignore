@@ -34,3 +34,5 @@ experiments/*.pt
 
 # ---- 文档（不入版本库）----
 docs/
+
+temp/
