@@ -33,9 +33,14 @@ from configs.rgbdgaze_config import (
     AUG_SHIFT,
     AUG_SCALE,
     AUG_ROTATE,
+    GEOM_RAND_PROB,
+    GEOM_RAND_ASPECT,
+    GEOM_RAND_WIDTH_CM,
+    GEOM_RAND_HEIGHT_CM,
 )
 from gazelab.datasets.common import (
     crop_face_square,
+    randomize_screen_geometry,
     rgb_preprocess,  # noqa: F401  (re-export，供既有调用方使用)
     screen_geometry,
 )
@@ -82,6 +87,7 @@ class RGBDGazeDataset(Dataset):
         aug_shift: float = AUG_SHIFT,
         aug_scale: float = AUG_SCALE,
         aug_rotate: float = AUG_ROTATE,
+        geom_randomize: float = None,
         image_size: int = None,
     ):
         super().__init__()
@@ -105,6 +111,12 @@ class RGBDGazeDataset(Dataset):
         self.aug_shift = float(aug_shift) if augment else 0.0
         self.aug_scale = float(aug_scale) if augment else 0.0
         self.aug_rotate = float(aug_rotate) if augment else 0.0
+        # geom_randomize: 几何域随机化触发概率（None=用 config 默认；仅在
+        # augment 开启时生效，显式传 0 可关闭）
+        self.geom_randomize = (float(GEOM_RAND_PROB) if geom_randomize is None
+                               else float(geom_randomize))
+        if not augment:
+            self.geom_randomize = 0.0
         self._rng = np.random.RandomState()
         # 输入分辨率（None = 使用配置的 IMAGE_SIZE）
         self.image_size = int(image_size) if image_size else IMAGE_SIZE
@@ -183,16 +195,25 @@ class RGBDGazeDataset(Dataset):
         if self.augment:
             rgb_face, gx = self._augment(rgb_face, gx)
 
-        label = np.array([gx, gy], dtype=np.float32)
-
         # 屏幕物理尺寸(cm) 与几何 token 输入
-        screen_cm = torch.tensor(
-            [float(row["screen_w"]) * float(row["cm_px_x"]),
-             float(row["screen_h"]) * float(row["cm_px_y"])],
-            dtype=torch.float32,
-        )
+        cm_px_x = float(row["cm_px_x"])
+        cm_px_y = float(row["cm_px_y"])
+        w_cm = float(row["screen_w"]) * cm_px_x
+        h_cm = float(row["screen_h"]) * cm_px_y
+        screen_cm = torch.tensor([w_cm, h_cm], dtype=torch.float32)
         geom = screen_geometry(float(row["screen_w"]), float(row["screen_h"]),
-                               float(row["cm_px_x"]), float(row["cm_px_y"]))
+                               cm_px_x, cm_px_y)
+        # 几何域随机化（与 GazeCapture 同源，见 common.randomize_screen_geometry）
+        if self.geom_randomize > 0.0 and self._rng.random() < self.geom_randomize:
+            out = randomize_screen_geometry(
+                gx, gy, w_cm, h_cm, self._rng,
+                aspect_range=GEOM_RAND_ASPECT,
+                width_range=GEOM_RAND_WIDTH_CM,
+                height_range=GEOM_RAND_HEIGHT_CM)
+            if out is not None:
+                gx, gy, geom = out
+
+        label = np.array([gx, gy], dtype=np.float32)
 
         # IMU 重力向量（若 index 含该列则返回，供 use_imu 模型使用；否则零向量占位）
         try:

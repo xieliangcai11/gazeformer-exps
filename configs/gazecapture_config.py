@@ -80,3 +80,13 @@ MIN_VALID_FRAMES_PER_SUBJECT = 10
 AUG_SHIFT = 0.10
 AUG_SCALE = 0.25
 AUG_ROTATE = 10.0
+
+# ---- 几何域随机化（P2）：把标签重投影到"合成设备" ----
+# 目的：GazeCapture 只有 0.562/0.563/0.750 三种宽高比，而 RGBDGaze(19.5:9) 是
+# 0.462 —— 比预训练见过的最窄还窄 22%，属于外推。用真实物理标签重投影到合成
+# 几何，把这一维变成内插（推导与验证见 gazelab.datasets.common.randomize_screen_geometry）。
+# 期间相机相对屏幕中心的物理位置保持不变。
+GEOM_RAND_PROB = 0.5            # 每个样本被随机化的概率
+GEOM_RAND_ASPECT = (0.40, 0.80)  # 合成屏幕宽高比(短/长)，覆盖 19.5:9(0.462)~4:3(0.75)
+GEOM_RAND_WIDTH_CM = (5.5, 8.5)  # 合成屏幕物理宽(cm)
+GEOM_RAND_HEIGHT_CM = (10.0, 17.5)  # 合成屏幕物理高(cm)，用于过滤不合理组合

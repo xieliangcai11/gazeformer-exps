@@ -59,3 +59,9 @@ VIEWING_DISTANCE_CM = 30.0
 AUG_SHIFT = 0.10     # 裁剪中心随机偏移 ±10% 边长
 AUG_SCALE = 0.25     # 裁剪边长随机缩放 ±25%
 AUG_ROTATE = 10.0    # 随机旋转 ±10 度
+
+# ---- 几何域随机化（与 GazeCapture 同源同参，保证两域增强分布一致）----
+GEOM_RAND_PROB = 0.35           # 微调时调低，避免稀释真实目标几何(0.462)的信号
+GEOM_RAND_ASPECT = (0.40, 0.80)
+GEOM_RAND_WIDTH_CM = (5.5, 8.5)
+GEOM_RAND_HEIGHT_CM = (10.0, 17.5)

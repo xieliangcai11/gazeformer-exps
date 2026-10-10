@@ -39,9 +39,14 @@ from configs.gazecapture_config import (
     AUG_SHIFT,
     AUG_SCALE,
     AUG_ROTATE,
+    GEOM_RAND_PROB,
+    GEOM_RAND_ASPECT,
+    GEOM_RAND_WIDTH_CM,
+    GEOM_RAND_HEIGHT_CM,
 )
 from gazelab.datasets.common import (
     crop_face_square,
+    randomize_screen_geometry,
     rgb_preprocess,  # noqa: F401  (re-export，供既有调用方使用)
     screen_geometry,
 )
@@ -81,6 +86,7 @@ class GazeCaptureDataset(Dataset):
         aug_shift: float = AUG_SHIFT,
         aug_scale: float = AUG_SCALE,
         aug_rotate: float = AUG_ROTATE,
+        geom_randomize: float = None,
         image_size: int = None,
     ):
         super().__init__()
@@ -104,8 +110,25 @@ class GazeCaptureDataset(Dataset):
         self.aug_shift = float(aug_shift) if augment else 0.0
         self.aug_scale = float(aug_scale) if augment else 0.0
         self.aug_rotate = float(aug_rotate) if augment else 0.0
+        # geom_randomize: 几何域随机化触发概率（None=用 config 默认；仅在
+        # augment 开启时生效，显式传 0 可关闭）
+        self.geom_randomize = (float(GEOM_RAND_PROB) if geom_randomize is None
+                               else float(geom_randomize))
+        if not augment:
+            self.geom_randomize = 0.0
         self._rng = np.random.RandomState()
         self.image_size = int(image_size) if image_size else IMAGE_SIZE
+
+        # 与 RGBDGazeDataset 保持 API 一致：评估脚本需要按样本取
+        # 「每点厘米」与「屏幕点数」把归一化误差换算成物理厘米/角度。
+        self.cm_px = np.array(
+            [[float(r["cm_px_x"]), float(r["cm_px_y"])] for r in self.rows],
+            dtype=np.float32,
+        )
+        self.screen_size = np.array(
+            [[float(r["screen_w"]), float(r["screen_h"])] for r in self.rows],
+            dtype=np.float32,
+        )
 
     def __len__(self):
         return len(self.rows)
@@ -147,8 +170,6 @@ class GazeCaptureDataset(Dataset):
         if self.augment:
             face, gx = self._augment(face, gx)
 
-        label = np.array([gx, gy], dtype=np.float32)
-
         # ---- 辅助信息 ----
         # 屏幕物理尺寸(cm)：由"每点厘米"乘屏幕点数得到（设备不在规格表时为 NaN）
         cm_px_x = float(row["cm_px_x"])
@@ -166,6 +187,21 @@ class GazeCaptureDataset(Dataset):
         # 屏幕几何 token 输入（跨设备泛化的关键，见模型 docstring）
         geom = screen_geometry(float(row["screen_w"]), float(row["screen_h"]),
                                cm_px_x, cm_px_y)
+        # 几何域随机化：把 (标签, 几何) 一起重投影到合成设备，把"宽高比外推"
+        # 变成"内插"（推导与实测验证见 common.randomize_screen_geometry）。
+        if self.geom_randomize > 0.0 and self._rng.random() < self.geom_randomize:
+            out = randomize_screen_geometry(
+                gx, gy,
+                float(row["screen_w"]) * cm_px_x,
+                float(row["screen_h"]) * cm_px_y,
+                self._rng,
+                aspect_range=GEOM_RAND_ASPECT,
+                width_range=GEOM_RAND_WIDTH_CM,
+                height_range=GEOM_RAND_HEIGHT_CM)
+            if out is not None:
+                gx, gy, geom = out
+
+        label = np.array([gx, gy], dtype=np.float32)
         # 人脸在 25x25 网格中的位置（iTracker 风格输入特征）
         face_grid = torch.tensor(
             [float(row["face_grid_x"]), float(row["face_grid_y"]),
