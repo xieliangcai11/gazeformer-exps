@@ -34,8 +34,7 @@ from datetime import datetime
 
 from configs.gaze360_config import DEVICE as DEFAULT_DEVICE, experiment_dirs
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM
-from gazelab.datasets.rgbdgaze import (RGBDGazeDataset, rgb_preprocess,
-                                       inverse_depth_preprocess)
+from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze import RGBDGazeDINOv2, DINOV2_CKPT
 
 
@@ -73,8 +72,7 @@ def build_dataloader(split, index_dir, batch_size, shuffle, num_workers=0):
     idx = [rgb_to_idx[p] for p in paths]
 
     ds = RGBDGazeDataset(index_csv,
-                         color_transform=rgb_preprocess,
-                         depth_transform=inverse_depth_preprocess)
+                         color_transform=rgb_preprocess)
     sub = Subset(ds, idx)
     return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers)
@@ -124,9 +122,8 @@ def evaluate_split(model, dl, device):
     with torch.no_grad():
         for inp, label in dl:
             face = inp.rgb.to(device).float()
-            depth = inp.depth.to(device).float()
             label = label.to(device)
-            pred = model(face, depth)
+            pred = model(face, geom=inp.geom.to(device).float())
             diff = (pred - label)
             B = label.size(0)
             cm_b = torch.from_numpy(cm_arr[start:start+B]).to(device)
@@ -240,10 +237,9 @@ def main():
         n_step = 0
         for i, (inp, label) in enumerate(train_dl):
             face = inp.rgb.to(device).float()
-            depth = inp.depth.to(device).float()  # [B,1,H,W] 逆深度
             label = label.to(device)
             optimizer.zero_grad()
-            pred = model(face, depth)  # [B,2]
+            pred = model(face, geom=inp.geom.to(device).float())  # [B,2]
             loss_coord = criterion(pred, label)
             loss_ang = angular_loss(pred, label, VIEWING_DISTANCE_CM).mean()
             loss = loss_coord + args.ang_weight * loss_ang

@@ -14,9 +14,7 @@ from collections import defaultdict
 from sklearn.linear_model import RidgeCV
 
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
-from gazelab.datasets.rgbdgaze import (
-    RGBDGazeDataset, rgb_preprocess, inverse_depth_preprocess,
-)
+from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import RGBDGazeDINOv2
 from gazelab.models.rgbdgaze.calibrator import extract_features
 
@@ -27,7 +25,7 @@ ALPHAS = [0.01, 0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = RGBDGazeDINOv2(use_depth=False, unfreeze_last=12, img_size=RESOLUTION)
+model = RGBDGazeDINOv2(unfreeze_last=12, img_size=RESOLUTION)
 model.load_state_dict(torch.load(CKPT, map_location="cpu", weights_only=False))
 model.to(device).eval()
 print(f"[load] {CKPT}")
@@ -38,7 +36,6 @@ test_indices = [path_to_idx[p.strip()] for p in
                 open(RGBDGaze_INDEX_DIR/'test.txt', encoding='utf-8') if p.strip()]
 dataset = RGBDGazeDataset(RGBDGaze_INDEX_DIR/'index.csv',
                           color_transform=rgb_preprocess,
-                          depth_transform=inverse_depth_preprocess,
                           image_size=RESOLUTION)
 
 # 按被试分组，按帧序排列
@@ -55,19 +52,19 @@ all_feats, all_preds, all_gts = {}, {}, {}
 with torch.no_grad():
     for start in range(0, len(test_indices), 32):
         batch = test_indices[start:start+32]
-        faces, depths = [], []
+        faces, geoms = [], []
         for idx in batch:
             r = rows[idx]
             inp, _ = dataset[idx]
             gx = float(r["gaze_x"]) / float(r["screen_w"])
             gy = float(r["gaze_y"]) / float(r["screen_h"])
             faces.append(inp.rgb)
-            depths.append(inp.depth)
+            geoms.append(inp.geom)
             all_gts[idx] = (gx, gy)
         f = torch.stack(faces).to(device).float()
-        d = torch.stack(depths).to(device).float()
-        feat = extract_features(model, f, d)
-        pred = model(f, d)
+        g = torch.stack(geoms).to(device).float()
+        feat = extract_features(model, f)
+        pred = model(f, geom=g)
         for i, idx in enumerate(batch):
             all_feats[idx] = feat[i].cpu().numpy()
             all_preds[idx] = pred[i].cpu().numpy()

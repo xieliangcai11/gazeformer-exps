@@ -35,7 +35,7 @@ class Calibrator(nn.Module):
         return self.net(features)
 
 
-def extract_features(model, face, depth, imu=None):
+def extract_features(model, face):
     """提取骨干模型的 CLS 特征（校准器的输入）。
 
     复用 RGBDGazeDINOv2 的 forward 逻辑，但返回 CLS 特征而非注视点。

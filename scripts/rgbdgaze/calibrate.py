@@ -35,9 +35,7 @@ import torch.optim as optim
 
 from configs.gaze360_config import DEVICE as DEFAULT_DEVICE
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
-from gazelab.datasets.rgbdgaze import (
-    RGBDGazeDataset, rgb_preprocess, inverse_depth_preprocess,
-)
+from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import RGBDGazeDINOv2
 from gazelab.models.rgbdgaze.calibrator import extract_features
 
@@ -67,15 +65,15 @@ def predict_batch(model, indices, dataset, device, batch_size=32):
     preds, labels = {}, {}
     for start in range(0, len(indices), batch_size):
         batch = indices[start:start+batch_size]
-        faces, depths = [], []
+        faces, geoms = [], []
         for idx in batch:
             inp, label = dataset[idx]
             faces.append(inp.rgb)
-            depths.append(inp.depth)
+            geoms.append(inp.geom)
             labels[idx] = label.numpy()
         f = torch.stack(faces).to(device).float()
-        d = torch.stack(depths).to(device).float()
-        out = model(f, d)
+        g = torch.stack(geoms).to(device).float()
+        out = model(f, geom=g)
         for i, idx in enumerate(batch):
             preds[idx] = out[i].cpu().numpy()
     return preds, labels
@@ -87,14 +85,12 @@ def feature_batch(model, indices, dataset, device, batch_size=32):
     feats = {}
     for start in range(0, len(indices), batch_size):
         batch = indices[start:start+batch_size]
-        faces, depths = [], []
+        faces = []
         for idx in batch:
             inp, _ = dataset[idx]
             faces.append(inp.rgb)
-            depths.append(inp.depth)
         f = torch.stack(faces).to(device).float()
-        d = torch.stack(depths).to(device).float()
-        feat = extract_features(model, f, d)
+        feat = extract_features(model, f)
         for i, idx in enumerate(batch):
             feats[idx] = feat[i].cpu()
     return feats
@@ -128,7 +124,7 @@ def main():
     emit("=" * 60)
 
     # 加载模型
-    model = RGBDGazeDINOv2(use_depth=False, unfreeze_last=12, img_size=args.resolution)
+    model = RGBDGazeDINOv2(unfreeze_last=12, img_size=args.resolution)
     model.load_state_dict(torch.load(args.backbone_ckpt, map_location="cpu", weights_only=False))
     model.to(device).eval()
     for param in model.parameters():
@@ -143,7 +139,6 @@ def main():
                     if l.strip()]
     dataset = RGBDGazeDataset(RGBDGaze_INDEX_DIR / "index.csv",
                               color_transform=rgb_preprocess,
-                              depth_transform=inverse_depth_preprocess,
                               image_size=args.resolution)
     emit(f"[calib] 测试集: {len(test_indices)} 样本")
 
