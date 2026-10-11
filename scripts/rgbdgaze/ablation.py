@@ -301,6 +301,44 @@ class ModelEMA:
         return {k: v for k, v in self.shadow.items()}
 
 
+def preflight_gpu_check(rank, local_rank, is_dist):
+    """启动前 GPU 自检：打印每张卡的型号，并用一次 matmul(+all_reduce) 验证可用。
+
+    为什么需要：机器上某张卡故障（驱动 Xid 错误、掉卡）时，症状是"长跑到一半
+    rank 某个进程 exitcode 1、其他 rank 被 SIGTERM"，且往往拿不到 traceback，
+    排查成本极高。把这段放到训练开始前，坏卡会在几秒内暴露，并明确打印出
+    "哪个 rank 落在哪张卡上"，而不是烧掉几小时。
+
+    注意 CUDA_VISIBLE_DEVICES 的重映射：CUDA_VISIBLE_DEVICES=1,4 时
+    LOCAL_RANK 0 对应的是**物理 1 号卡**，所以"rank0 挂了"很可能是 1 号卡坏了。
+    """
+    if not torch.cuda.is_available():
+        return
+    # 注意 set_device / get_device_name 也在 try 内：掉卡时它们同样会抛
+    # "invalid device ordinal"，若放在 try 外，我们自己的排查提示就被绕过了。
+    name = "?"
+    try:
+        torch.cuda.set_device(local_rank)
+        name = torch.cuda.get_device_name(local_rank)
+        # 每个 rank 都直接 print（不走 write_log）：需要每张卡一行，不只 rank0
+        print(f"[preflight] rank {rank} local_rank {local_rank} -> {name}", flush=True)
+        a = torch.randn(512, 512, device=f"cuda:{local_rank}")
+        b = a @ a
+        if is_dist:
+            dist.all_reduce(b)      # 顺带验证 NCCL 通
+            dist.barrier()
+        torch.cuda.synchronize()
+    except Exception as e:                       # noqa: BLE001  启动自检要给出明确信息
+        raise RuntimeError(
+            f"[preflight] rank {rank} 在 local_rank {local_rank}（{name}）上自检失败："
+            f"{type(e).__name__}: {e}\n"
+            f"          该卡很可能已故障，请用 nvidia-smi / dmesg -T | grep -i xid 确认，"
+            f"并通过 CUDA_VISIBLE_DEVICES 排除它再重试。") from e
+    if not bool(torch.isfinite(b).all()):
+        raise RuntimeError(f"[preflight] rank {rank} 在 {name} 上算出了非有限值，卡可能已损坏")
+    print(f"[preflight] rank {rank} 自检通过", flush=True)
+
+
 def parse():
     p = argparse.ArgumentParser(
         description="DINOv2 注视回归训练/消融（RGBDGaze 与 GazeCapture 共用）")
@@ -358,6 +396,7 @@ def main():
 
     # 可复现性：所有 rank 同一随机种子（数据由 DistributedSampler 切分，
     # 各 rank 的增强随机性仍互相独立）
+    preflight_gpu_check(rank, local_rank, is_dist)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if args.index_dir is None:
