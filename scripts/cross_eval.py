@@ -9,7 +9,7 @@
 为什么必须做：P0（几何 token）、P2（几何域随机化）都只是"让模型有能力泛化"，
 是否真的泛化只能靠 ②③ 的数字判断。①变好但②③不变 = 只是记住了 RGBDGaze。
 
-指标口径复用 scripts.rgbdgaze.ablation.evaluate_split（cm 误差、几何角度、
+指标口径复用 scripts.train.evaluate_split（cm 误差、几何角度、
 ≤1.91° 占比等），保证与训练期验收完全一致，不另起一套。
 
 用法：
@@ -52,9 +52,7 @@ from gazelab.datasets import (  # noqa: E402
 )
 from gazelab.datasets.common import randomize_screen_geometry  # noqa: E402
 from gazelab.models.rgbdgaze import RGBDGazeDINOv2  # noqa: E402
-from scripts.rgbdgaze.ablation import (  # noqa: E402
-    Subset, predict_frames, summarize,
-)
+from scripts.train import Subset, predict_frames, summarize  # noqa: E402
 
 # 各数据集用来分组的列（都存在于对应 index.csv 中）
 GROUP_COLUMNS = {
