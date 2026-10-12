@@ -23,11 +23,24 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 
-# ---- 路径引导：确保从任意工作目录都能导入 configs / gazelab / tools ----
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-for _p in (str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# ---- 路径引导：把项目根与 src/ 加入 sys.path ----
+# 已改为「向上搜索项目根」而不是数 __file__ 的目录层级：后者在文件被移动到
+# 不同深度后会静默失效（曾因 scripts/rgbdgaze/ablation.py -> scripts/train.py
+# 的移动导致 `No module named 'gazelab'`）。
+def _bootstrap() -> Path:
+    """从本文件向上找到含 src/gazelab/__init__.py 的目录，并加入 sys.path。"""
+    here = Path(__file__).resolve()
+    for d in (here.parent, *here.parents):
+        if (d / "src" / "gazelab" / "__init__.py").is_file():
+            for p in (str(d), str(d / "src")):
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            return d
+    raise RuntimeError(
+        f"找不到项目根：从 {here} 向上未发现 src/gazelab/__init__.py")
+
+
+_PROJECT_ROOT = _bootstrap()
 
 from configs.rgbdgaze_config import (
     RGBDGaze_RAW_ROOT,
