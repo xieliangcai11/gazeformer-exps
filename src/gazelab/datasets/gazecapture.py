@@ -20,7 +20,6 @@ edict 内全部为 Tensor，可直接走 torch 的 default_collate，无需自�
 索引由 tools/data/gazecapture/preprocess.py 生成。
 """
 
-import csv
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -44,6 +43,7 @@ from configs.gazecapture_config import (
     GEOM_RAND_WIDTH_CM,
     GEOM_RAND_HEIGHT_CM,
 )
+from gazelab.datasets.table_index import TableIndex
 from gazelab.datasets.common import (
     crop_face_square,
     randomize_screen_geometry,
@@ -91,8 +91,10 @@ class GazeCaptureDataset(Dataset):
     ):
         super().__init__()
         self.index_csv = Path(index_csv) if index_csv else GAZECAPTURE_INDEX_DIR / "index.csv"
-        with open(self.index_csv, encoding="utf-8") as f:
-            self.rows = list(csv.DictReader(f))
+        # 列式索引：list(csv.DictReader) 会按 1.9KB/行 生成 dict，
+        # 149 万行时约 2.4GB/进程，fork 给 DataLoader worker 后触发写时复制，
+        # 是多卡训练卡顿的主因。TableIndex 取值语义与 DictReader 完全一致。
+        self.rows = TableIndex(self.index_csv)
 
         # 默认用通用的 ImageNet 归一化（与 RGBDGaze 一致，保证预训练/微调同分布）
         self.color_transform = color_transform if color_transform is not None else rgb_preprocess

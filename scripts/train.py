@@ -1,4 +1,4 @@
-"""DINOv2 注视回归训练/消融脚本（RGBDGaze 与 GazeCapture 共用同一条训练循环）。
+"""DINOv2 注视回归统一训练入口（RGBDGaze 与 GazeCapture 共用同一条训练循环）。
 
 数据集由 --dataset 选择：
     rgbdgaze    : 域内训练/消融（索引 data/RGBDGaze/index）
@@ -19,13 +19,14 @@
     --unfreeze N
         解冻 DINOv2 最后 N 个 block 参与微调（N=0 表示全部冻结）
 
-输出：独立目录 out/rgbdgaze/ablation/<tag>/（不污染 train.py 的 best_dinov2.pt）。
+输出：out/<dataset>/ablation/<tag>/（按数据集分层，不互相污染）。
 指标：与 train.py 完全一致的多口径（L2 / cm / 角度 mean·median·p95·前95%·≤1.91%）。
 
 用法示例：
-    python -m scripts.rgbdgaze.ablation --loss mse --unfreeze 0 --epochs 8
-    python -m scripts.rgbdgaze.ablation --loss mse --no-geom --unfreeze 0 --epochs 8
-    python -m scripts.rgbdgaze.ablation --loss mse_angle --unfreeze 2 --epochs 8
+    python -m scripts.train --dataset rgbdgaze --loss mse --unfreeze 0 --epochs 8
+    python -m scripts.train --dataset rgbdgaze --loss mse --no-geom --unfreeze 0 --epochs 8
+    python -m scripts.train --dataset gazecapture --resolution 224 --geom --augment \
+        --unfreeze 12 --epochs 3 --batch-size 32 --lr 2.3e-4 --tag gc_pretrain
 """
 
 import argparse
@@ -54,6 +55,7 @@ from configs.rgbdgaze_config import (RGBDGaze_INDEX_DIR, VIEWING_DISTANCE_CM,
                                      AUG_SHIFT, AUG_SCALE, AUG_ROTATE)
 from gazelab.datasets import (RGBDGazeDataset, GazeCaptureDataset,
                               rgb_preprocess)
+from gazelab.datasets.table_index import TableIndex
 from configs.gazecapture_config import GAZECAPTURE_INDEX_DIR
 from gazelab.models.rgbdgaze import RGBDGazeDINOv2
 
@@ -105,10 +107,9 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
     list_txt = Path(index_dir) / f"{split}.txt"
     paths = [ln.strip() for ln in
              list_txt.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    import csv
-    with open(index_csv, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    path_to_idx = {r[spec["path_col"]]: i for i, r in enumerate(rows)}
+    # 列式索引 + lookup：避免为每行构造临时 dict（125 万行 -> 瞬时 2.4GB 峰值）
+    idx_table = TableIndex(index_csv)
+    path_to_idx = idx_table.lookup(spec["path_col"])
     missing = [p for p in paths if p not in path_to_idx]
     if missing:
         raise KeyError(f"{len(missing)} 条清单路径不在 {index_csv} 中，"
@@ -118,14 +119,17 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
                      **spec["kwargs"])
     sub = Subset(ds, idx)
+    # persistent_workers：worker 进程跨 epoch 复用，避免每个 epoch 重新
+    # fork（125 万行索引的 fork 成本很高，且是 epoch 边界卡顿的来源）。
+    common = dict(batch_size=batch_size, num_workers=num_workers,
+                  pin_memory=False, prefetch_factor=2 if num_workers > 0 else None,
+                  persistent_workers=num_workers > 0)
     if distributed:
         # 每个 rank 只吃 1/world 的数据；shuffle 交给 sampler（DataLoader 的
         # shuffle 必须为 False）。每个 epoch 前要调 sampler.set_epoch(epoch)。
         sampler = DistributedSampler(sub, shuffle=shuffle)
-        return DataLoader(sub, batch_size=batch_size, sampler=sampler,
-                          shuffle=False, num_workers=num_workers)
-    return DataLoader(sub, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=num_workers)
+        return DataLoader(sub, sampler=sampler, shuffle=False, **common)
+    return DataLoader(sub, shuffle=shuffle, **common)
 
 
 def init_distributed():
@@ -495,7 +499,7 @@ def main():
               + (f" 复现: CUDA_VISIBLE_DEVICES="
                  f"{os.environ.get('CUDA_VISIBLE_DEVICES', '(全部可见)')} "
                  f"torchrun --standalone --nproc_per_node={world} -m "
-                 f"scripts.rgbdgaze.ablation {' '.join(sys.argv[1:])}\n"
+                 f"scripts.train {' '.join(sys.argv[1:])}\n"
                  if is_dist else "")
               + f" 权重输出: {save_dir}\n 日志: {log_file}\n{'='*70}")
     write_log(header)

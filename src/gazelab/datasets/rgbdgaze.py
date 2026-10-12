@@ -16,7 +16,6 @@
 """
 
 from pathlib import Path
-import csv
 from typing import Callable, Optional
 
 import cv2
@@ -38,6 +37,7 @@ from configs.rgbdgaze_config import (
     GEOM_RAND_WIDTH_CM,
     GEOM_RAND_HEIGHT_CM,
 )
+from gazelab.datasets.table_index import TableIndex
 from gazelab.datasets.common import (
     crop_face_square,
     randomize_screen_geometry,
@@ -92,8 +92,10 @@ class RGBDGazeDataset(Dataset):
     ):
         super().__init__()
         self.index_csv = Path(index_csv)
-        with open(self.index_csv, encoding="utf-8") as f:
-            self.rows = list(csv.DictReader(f))
+        # 列式索引：list(csv.DictReader) 会按 1.9KB/行 生成 dict，
+        # 149 万行时约 2.4GB/进程，fork 给 DataLoader worker 后触发写时复制，
+        # 是多卡训练卡顿的主因。TableIndex 取值语义与 DictReader 完全一致。
+        self.rows = TableIndex(self.index_csv)
 
         self.color_transform = color_transform
 

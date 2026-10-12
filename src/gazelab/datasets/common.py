@@ -108,7 +108,15 @@ def crop_face_square(img: np.ndarray, bbox_xywh, margin: float, size: int,
 
 
 def geom_vector(w_cm: float, h_cm: float) -> torch.Tensor:
-    """由物理屏幕尺寸(cm)构造几何 token 向量 [宽高比, log(宽), log(h)]。"""
+    """由物理屏幕尺寸(cm)构造几何 token 向量 [宽高比, log(宽), log(h)]。
+
+    注意：这里的"宽高比"是 **w_cm/h_cm（物理宽高比）**，不是 w_pt/h_pt（逻辑分辨率比）。
+    两者通常相差 1~5%（例如 RGBDGaze 的 iPhone12 Pro Max：物理比 0.4857 vs 点比 0.4622），
+    原因是该数据集自带的 iphone_spec.csv 用的是**机身尺寸**而非屏幕尺寸
+    （7.81x16.08cm 恰为机身 78.1x160.8mm；而它自己的 inch 列 6.68" 对应的是屏幕对角）。
+    这里统一取物理宽高比，是为了与"几何域随机化"生成的合成几何保持一致
+    （合成屏只有 cm、没有点数）。
+    """
     return torch.tensor(
         [w_cm / h_cm, math.log(w_cm), math.log(h_cm)], dtype=torch.float32)
 
