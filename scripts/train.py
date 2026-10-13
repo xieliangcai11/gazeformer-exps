@@ -71,7 +71,7 @@ from gazelab.datasets import (RGBDGazeDataset, GazeCaptureDataset,
                               rgb_preprocess)
 from gazelab.datasets.table_index import TableIndex
 from configs.gazecapture_config import GAZECAPTURE_INDEX_DIR
-from gazelab.models.rgbdgaze import RGBDGazeDINOv2
+from gazelab.models.rgbdgaze import RGBDGazeDINOv2, load_state_dict_any_res
 
 PI = 3.141592653589793
 
@@ -461,10 +461,15 @@ def main():
     ).to(device)
     if args.init_ckpt:
         state = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        # 用 any_res 版加载：init-ckpt 是"跨运行复用"的权重（如 224 预训练 ->
+        # 448 微调），pos_embed 形状常不一致，普通 load_state_dict 会直接崩。
+        missing, unexpected, resampled = load_state_dict_any_res(model, state)
         # 必须打印：缺 proj_geom 说明几何 token 是随机初始化的；
         # 出现 unexpected 说明架构不匹配（如残留的 depth 分支）。
         write_log(f"[init] 从 {args.init_ckpt} 载入权重")
+        if resampled is not None:
+            cur = tuple(model.state_dict()["rgb.backbone.pos_embed"].shape)
+            write_log(f"[init] pos_embed 分辨率不一致 {resampled} -> {cur}，已插值")
         write_log(f"[init] 缺失键 {list(missing) or '无'} | 多余键 {list(unexpected) or '无'}")
     # DDP：先加载 init-ckpt 再包装，保证权重加载路径不依赖 DDP 的 key 前缀
     raw_model = model

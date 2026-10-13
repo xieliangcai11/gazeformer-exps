@@ -54,12 +54,18 @@ _PROJECT_ROOT = _bootstrap()
 
 from configs.paths import DEVICE as DEFAULT_DEVICE, experiment_dirs  # noqa: E402
 from scripts.train import DATASET_SPECS, Subset, predict_frames  # noqa: E402
+from gazelab.models.rgbdgaze import load_state_dict_any_res  # noqa: E402
 
 
 def load_ckpt(model, ckpt, log):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    # any_res：--ckpt 与 --resolution 是独立指定的，权重可能来自另一种分辨率
+    # （如 224 预训练 -> 448 分析），此时 pos_embed 形状不一致需先插值。
+    missing, unexpected, resampled = load_state_dict_any_res(model, state)
     log(f"[load] {ckpt}")
+    if resampled is not None:
+        cur = tuple(model.state_dict()["rgb.backbone.pos_embed"].shape)
+        log(f"[load] pos_embed {resampled} -> {cur}（已插值）")
     log(f"[load] 缺失键 {list(missing) or '无'} | 多余键 {list(unexpected) or '无'}")
 
 

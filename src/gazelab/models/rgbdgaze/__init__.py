@@ -12,6 +12,8 @@ from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import (
     RGBDGazeDINOv2,
     DINOV2_CKPT,
     DINOV2_MODEL,
+    load_state_dict_any_res,
 )
 
-__all__ = ["RGBDGazeDINOv2", "DINOV2_CKPT", "DINOV2_MODEL"]
+__all__ = ["RGBDGazeDINOv2", "DINOV2_CKPT", "DINOV2_MODEL",
+           "load_state_dict_any_res"]

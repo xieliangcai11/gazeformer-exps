@@ -231,3 +231,39 @@ class RGBDGazeDINOv2(nn.Module):
         # 4) 汇总 CLS -> 2D
         out = self.head(self.norm(x[:, 0, :]))
         return out
+
+
+def load_state_dict_any_res(model: nn.Module, state: dict):
+    """加载权重，并把 pos_embed 自动插值到当前模型的分辨率。
+
+    为什么需要：预训练为省时常用 224（16x16 网格），微调为对齐基线常用 448
+    （32x32 网格）。两者 pos_embed 形状不同（[1,257,C] vs [1,1025,C]），而
+    `load_state_dict(strict=False)` 只豁免"键缺失/多余"，对形状不匹配仍会抛
+    RuntimeError —— 直接把 224 权重喂给 448 模型会崩，且崩在训练启动阶段。
+
+    这里复用 DINOv2Backbone 加载官方 DINOv2 权重时的同一套做法
+    （resample_abs_pos_embed + 同样的 num_prefix_tokens），因此两条路径的
+    插值口径一致。
+
+    返回 (missing, unexpected, resampled_from)：
+      - missing / unexpected 语义同 nn.Module.load_state_dict；
+      - resampled_from 为 None 表示未发生插值，否则是原 pos_embed 的形状元组，
+        供调用方写进日志（避免"悄悄插值了"这种不可追溯的情况）。
+    """
+    key = "rgb.backbone.pos_embed"
+    state = dict(state)                       # 不改调用方持有的对象
+    resampled_from = None
+    src = state.get(key)
+    dst = model.state_dict().get(key)
+    if src is not None and dst is not None and tuple(src.shape) != tuple(dst.shape):
+        n = int(dst.shape[1]) - NUM_PREFIX_TOKENS
+        grid = int(round(n ** 0.5))
+        if grid * grid != n:
+            raise ValueError(
+                f"[DINOv2] 目标 pos_embed 第二维 {dst.shape[1]} 不等于 "
+                f"网格点数+{NUM_PREFIX_TOKENS}，无法确定插值网格")
+        state[key] = resample_abs_pos_embed(src, (grid, grid),
+                                            num_prefix_tokens=NUM_PREFIX_TOKENS)
+        resampled_from = tuple(src.shape)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    return missing, unexpected, resampled_from

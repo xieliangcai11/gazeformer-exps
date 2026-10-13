@@ -99,10 +99,14 @@ def main():
     log("=" * 78)
 
     # ---------- 前向一遍，拿逐帧预测 ----------
-    from gazelab.models.rgbdgaze import RGBDGazeDINOv2
+    from gazelab.models.rgbdgaze import RGBDGazeDINOv2, load_state_dict_any_res
     model = RGBDGazeDINOv2(img_size=args.resolution, use_geom=args.use_geom).to(device)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    miss, unexp = model.load_state_dict(state, strict=False)
+    # any_res：--ckpt 与 --resolution 独立指定，权重可能来自另一种分辨率
+    miss, unexp, resampled = load_state_dict_any_res(model, state)
+    if resampled is not None:
+        cur = tuple(model.state_dict()["rgb.backbone.pos_embed"].shape)
+        log(f"[load] pos_embed {resampled} -> {cur}（已插值）")
     log(f"[load] 缺失键 {list(miss) or '无'} | 多余键 {list(unexp) or '无'}")
     model.eval()
 

@@ -65,7 +65,7 @@ from gazelab.datasets import (  # noqa: E402
     GazeCaptureDataset, RGBDGazeDataset, rgb_preprocess,
 )
 from gazelab.datasets.common import randomize_screen_geometry  # noqa: E402
-from gazelab.models.rgbdgaze import RGBDGazeDINOv2  # noqa: E402
+from gazelab.models.rgbdgaze import RGBDGazeDINOv2, load_state_dict_any_res  # noqa: E402
 from scripts.train import Subset, predict_frames, summarize  # noqa: E402
 
 # 各数据集用来分组的列（都存在于对应 index.csv 中）
@@ -198,10 +198,16 @@ def load_model(ckpt: Path, device, image_size: int, use_geom: bool = True):
 
     strict=False：允许被评估权重缺少新增参数，但会把缺失/多余的键打印出来，
     避免"其实没加载上"这种静默错误。
+
+    pos_embed 会自动插值到 image_size 对应的网格：被评估权重可能来自另一种
+    分辨率的运行（如 224 预训练权重直接在 448 上做零样本评估）。
     """
     model = RGBDGazeDINOv2(img_size=image_size, use_geom=use_geom).to(device)
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing, unexpected, resampled = load_state_dict_any_res(model, state)
+    if resampled is not None:
+        cur = tuple(model.state_dict()["rgb.backbone.pos_embed"].shape)
+        print(f"  [load] {ckpt.name}: pos_embed {resampled} -> {cur}（已插值到 {image_size}）")
     if missing:
         print(f"  [load] {ckpt.name}: 缺失键 {list(missing)}")
     if unexpected:
