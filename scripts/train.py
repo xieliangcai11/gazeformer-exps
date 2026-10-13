@@ -514,7 +514,9 @@ def main():
               f" loss={args.loss} geom={args.use_geom} "
               f"geom_rand={train_dl.dataset.base.geom_randomize} "
               f"imu={args.use_imu} "
-              f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze}\n"
+              f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze} "
+              f"diff_lr={args.diff_lr} "
+              f"aug(shift/scale/rot)={args.aug_shift}/{args.aug_scale}/{args.aug_rotate}\n"
               f" 训练集 {len(train_dl.dataset)}"
               # DDP 下 len(train_dl.dataset) 是**全集**（DistributedSampler 在
               # 迭代时才切分），不写清每卡份数会让人误判每轮步数
