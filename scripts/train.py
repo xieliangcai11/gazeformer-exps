@@ -109,12 +109,17 @@ DATASET_SPECS = {
 
 
 def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
-                     augment=False, resolution=None, distributed=False):
+                     augment=False, resolution=None, distributed=False,
+                     geom_randomize=None):
     """构造 train/val/test 的 DataLoader。
 
     dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
     （rgb / screen_cm / imu / geom；GazeCapture 另带 face_grid 但训练不使用），
     因此训练循环与评估口径无需分叉。
+
+    geom_randomize：几何域随机化触发概率，None=交给数据集用各自 config 默认。
+    调用方只需在训练集上传非 None 值；val/test 传什么都没关系，因为两个数据集
+    在 augment=False 时都会把它强制为 0（评估口径固定为真实几何）。
     """
     spec = DATASET_SPECS[dataset]
     index_csv = Path(index_dir) / "index.csv"
@@ -131,7 +136,7 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
     idx = [path_to_idx[p] for p in paths]
 
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
-                     **spec["kwargs"])
+                     geom_randomize=geom_randomize, **spec["kwargs"])
     sub = Subset(ds, idx)
     # persistent_workers：worker 进程跨 epoch 复用，避免每个 epoch 重新
     # fork（125 万行索引的 fork 成本很高，且是 epoch 边界卡顿的来源）。
@@ -380,6 +385,10 @@ def parse():
                    help="注入屏幕几何 token（宽高比 + 物理尺寸，默认开）")
     p.add_argument("--no-geom", dest="use_geom", action="store_false",
                    help="关闭屏幕几何 token（消融用）")
+    p.add_argument("--geom-randomize", type=float, default=None,
+                   help="几何域随机化的触发概率（P2，把宽高比外推变内插）；"
+                        "None=用各自 config 默认（rgbdgaze=0.35 / gazecapture=0.5）。"
+                        "仅在 --augment 下生效，显式传 0 可关闭（消融用）")
     p.add_argument("--unfreeze", type=int, default=0,
                    help="解冻 DINOv2 最后 N 个 block（0=全冻结）")
     p.add_argument("--diff-lr", action="store_true",
@@ -479,10 +488,13 @@ def main():
     # EMA 只在 rank0 维护：验证/保存都只在 rank0 做，其余 rank 白占显存。
     ema = ModelEMA(raw_model) if (args.ema and is_main) else None
 
+    # geom_randomize 只在训练集上传：val/test 的 augment=False 会让数据集
+    # 把它强制为 0，评估口径始终是真实几何。
     train_dl = build_dataloader(args.dataset, "train", Path(args.index_dir),
                                 args.batch_size, True, args.num_workers,
                                 augment=args.augment, resolution=args.resolution,
-                                distributed=is_dist)
+                                distributed=is_dist,
+                                geom_randomize=args.geom_randomize)
     val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
                               args.batch_size, False, args.num_workers,
                               augment=False, resolution=args.resolution)
@@ -494,7 +506,9 @@ def main():
     eff_bs = args.batch_size * world
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"
               f" 数据集={args.dataset}  索引={args.index_dir}\n"
-              f" loss={args.loss} geom={args.use_geom} imu={args.use_imu} "
+              f" loss={args.loss} geom={args.use_geom} "
+              f"geom_rand={train_dl.dataset.base.geom_randomize} "
+              f"imu={args.use_imu} "
               f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze}\n"
               f" 训练集 {len(train_dl.dataset)}"
               # DDP 下 len(train_dl.dataset) 是**全集**（DistributedSampler 在
