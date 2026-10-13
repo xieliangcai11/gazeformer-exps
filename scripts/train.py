@@ -630,5 +630,27 @@ def main():
         dist.destroy_process_group()
 
 
+def run_with_rank_traceback():
+    """包住 main()，让**每个 rank** 的异常带 rank 信息打到 stdout。
+
+    为什么需要：torchrun 在 stdout 非 TTY（例如 `2>&1 | tee log`）时，
+    失败 rank 的堆栈常常抓不到（表现为 `error_file: <N/A>`、Root Cause 只有
+    exitcode 1），只剩"某个 rank 崩了、其余被 SIGTERM"，无法定位。
+    这里显式打印，保证堆栈一定出现在日志流里。
+    """
+    import traceback
+    rank = os.environ.get("RANK", "0")
+    try:
+        main()
+    except BaseException:
+        # 用 BaseException：KeyboardInterrupt / CUDA 侧异常也要留下记录
+        print(f"\n{'=' * 70}\n[rank {rank}] 训练异常终止，完整堆栈如下：\n"
+              f"{'=' * 70}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
+
+
 if __name__ == "__main__":
-    main()
+    run_with_rank_traceback()
