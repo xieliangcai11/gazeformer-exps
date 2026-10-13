@@ -1,0 +1,11 @@
+# 统一行尾策略：仓库内一律按 LF 存储，检出时使用平台原生行尾
+# （Linux 检出 LF，Windows 检出 CRLF）。
+#
+# 背景：此前有 14 个文件的 blob 里直接存了 CRLF，导致服务端工作区出现
+# 23 个文件"整个文件都是修改"的假 diff（`git diff --ignore-cr-at-eol` 为空），
+# 掩盖真实改动、干扰 review 与合并。加本文件并做一次 renormalize 后，
+# 两端 `git status` 都干净。
+* text=auto
+
+# 本文件自身固定 LF，避免被 core.autocrlf 改写
+.gitattributes text eol=lf
