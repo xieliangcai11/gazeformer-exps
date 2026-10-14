@@ -29,7 +29,7 @@ blink = {r["path"]: float(r["blink"]) for r in
 sess = defaultdict(list)
 for r in csv.DictReader(open(CSV, encoding="utf-8")):
     sess[r["path"].rsplit("/", 1)[0]].append(
-        dict(path=r["path"], fi=int(r["frame_index"]),
+        dict(path=r["path"], sub=r["subject"], fi=int(r["frame_index"]),
              P=np.array([float(r["pred_x"]), float(r["pred_y"])]),
              L=np.array([float(r["label_x"]), float(r["label_y"])]),
              S=sc[r["path"]], b=blink.get(r["path"], 0.0)))
@@ -85,7 +85,7 @@ for s, v in sess.items():
                                    (last_clean_corr[1] - L[1]) * h))
         if r["b"] <= THR:
             last_clean_corr = corr
-        recs.append(dict(raw=e_raw, corr=e_corr, hyb=e_hyb, b=r["b"],
+        recs.append(dict(raw=e_raw, corr=e_corr, hyb=e_hyb, b=r["b"], sub=r["sub"],
                          dc=float(np.hypot(L[0] - 0.5, L[1] - 0.5))))
         add(a, x, y, float(P[0] - L[0]), float(P[1] - L[1]))
         c = grid[(min(G - 1, max(0, int(float(p1[0]) * G))),
@@ -121,3 +121,19 @@ for a_, b_ in zip(qs[:-1], qs[1:]):
 print(f"\n  【对照】闭眼帧上的三方案（A→B→C）:")
 m = bv > THR
 print(f"    n={m.sum()}  {raw[m].mean():.3f} → {corr[m].mean():.3f} → {hyb[m].mean():.3f}")
+
+subs = sorted({r["sub"] for r in recs})
+print(f"\n  【分被试】A 原始 → B 场修正（检验'最差被试获益是否最大'）")
+print(f"  {'被试':<7}{'n':>6}{'A 原始':>9}{'B 场':>9}{'相对增益':>10}{'A>3cm':>9}{'B>3cm':>9}")
+rows2 = []
+for s in subs:
+    m2 = np.array([r["sub"] == s for r in recs])
+    if m2.sum() < 50:
+        continue
+    a0, a1 = raw[m2].mean(), corr[m2].mean()
+    rows2.append((s, m2.sum(), a0, a1, 100 * (a1 / a0 - 1),
+                  100 * (raw[m2] > 3).mean(), 100 * (corr[m2] > 3).mean()))
+for s, n, a0, a1, g, t0, t1 in sorted(rows2, key=lambda x: -x[2]):
+    print(f"  {s:<7}{n:>6}{a0:>9.3f}{a1:>9.3f}{g:>9.1f}%{t0:>8.2f}%{t1:>8.2f}%")
+c0 = np.corrcoef([x[2] for x in rows2], [x[4] for x in rows2])[0, 1] if len(rows2) > 2 else float("nan")
+print(f"  ⇒ corr(原始误差, 相对增益) = {c0:+.2f}（越接近 -1 表示'越差的被试获益越大'）")
