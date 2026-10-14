@@ -152,15 +152,15 @@ class RGBDGazeDataset(Dataset):
                     f"不一致，请重跑 tools/data/rgbdgaze/build_eye_boxes.py")
 
         # 每样本的"像素 -> 厘米"换算系数（来自 index，用于把预测误差转成物理 cm）
+        # 整列取出（float_column）而不是逐行建 dict：14 万行下后者是启动期主要开销，
+        # 且多卡时每个 rank 都要付一次。取值语义与逐行 float(r[col]) 完全一致。
         try:
-            self.cm_px = np.array(
-                [[float(r["cm_px_x"]), float(r["cm_px_y"])] for r in self.rows],
-                dtype=np.float32,
-            )
-            self.screen_size = np.array(
-                [[float(r["screen_w"]), float(r["screen_h"])] for r in self.rows],
-                dtype=np.int32,
-            )
+            self.cm_px = np.stack(
+                [self.rows.float_column("cm_px_x", np.float32),
+                 self.rows.float_column("cm_px_y", np.float32)], axis=1)
+            self.screen_size = np.stack(
+                [self.rows.float_column("screen_w", np.int32),
+                 self.rows.float_column("screen_h", np.int32)], axis=1)
         except KeyError:
             # 旧版 index 无 cm 列时退化为近似（角标）
             self.cm_px = np.full((len(self.rows), 2), 0.0182, dtype=np.float32)
