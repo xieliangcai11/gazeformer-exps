@@ -123,14 +123,14 @@ class GazeCaptureDataset(Dataset):
 
         # 与 RGBDGazeDataset 保持 API 一致：评估脚本需要按样本取
         # 「每点厘米」与「屏幕点数」把归一化误差换算成物理厘米/角度。
-        self.cm_px = np.array(
-            [[float(r["cm_px_x"]), float(r["cm_px_y"])] for r in self.rows],
-            dtype=np.float32,
-        )
-        self.screen_size = np.array(
-            [[float(r["screen_w"]), float(r["screen_h"])] for r in self.rows],
-            dtype=np.float32,
-        )
+        # 整列取出而非逐行建 dict：GazeCapture train 划分 125 万行时，逐行 build
+        # 是本数据集启动期的主要开销（多卡时每个 rank 各付一次）。
+        self.cm_px = np.stack(
+            [self.rows.float_column("cm_px_x", np.float32),
+             self.rows.float_column("cm_px_y", np.float32)], axis=1)
+        self.screen_size = np.stack(
+            [self.rows.float_column("screen_w", np.float32),
+             self.rows.float_column("screen_h", np.float32)], axis=1)
 
     def __len__(self):
         return len(self.rows)

@@ -143,6 +143,24 @@ class TableIndex:
             return {uniq[c]: i for i, c in enumerate(d[1])}
         return {v.decode(): i for i, v in enumerate(d[1])}
 
+    def float_column(self, name, dtype=np.float32):
+        """把一列按浮点语义整列取出为 numpy 数组。
+
+        等价于 `np.array([float(r[name]) for r in rows], dtype=dtype)`，但**不逐行构造
+        dict** —— 后者在 14 万 / 149 万行时是启动期的主要开销（每个 dict 解析一次 CSV 行）。
+
+        列一律以字符串语义保存，故解析仍必需；差别只是省掉了建 dict 与逐行 Python 调用：
+        编码列走"唯一值表转 float + 索引数组"完全向量化，bytes 列只做一次列表解析。
+        实测量级：RGBDGaze 142,669 行由秒级降到几十毫秒；GazeCapture 149 万行收益更大。
+        """
+        kind = self._data[name]
+        if kind[0] == "code":
+            _, codes, uniques = kind
+            lut = np.array([float(u) for u in uniques], dtype=dtype)
+            return lut[codes]
+        _, buf = kind
+        return np.array([float(v) for v in buf], dtype=dtype)
+
     def memory_bytes(self):
         """当前实际占用（用于验证内存修复效果）。"""
         tot = 0
