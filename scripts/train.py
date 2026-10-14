@@ -417,8 +417,9 @@ def parse():
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--device", default="auto")
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--loss", choices=["mse", "mse_angle"], default="mse",
-                   help="mse=纯MSE；mse_angle=MSE+几何角度")
+    p.add_argument("--loss", choices=["mse", "mse_angle", "l1"], default="mse",
+                   help="mse=纯MSE；mse_angle=MSE+几何角度；"
+                        "l1=平均绝对误差（贴近验收口径的平均距离，预期减轻预测收缩）")
     p.add_argument("--geom", dest="use_geom", action="store_true", default=True,
                    help="注入屏幕几何 token（宽高比 + 物理尺寸，默认开）")
     p.add_argument("--no-geom", dest="use_geom", action="store_false",
@@ -529,7 +530,7 @@ def main():
     raw_model = model
     if is_dist:
         model = DDP(model, device_ids=[local_rank])
-    criterion = nn.MSELoss()
+    criterion = nn.L1Loss() if args.loss == "l1" else nn.MSELoss()
     if args.diff_lr:
         # 差分学习率：被解冻的骨干层用 0.1x，其余（投影/融合/头）用全量 lr
         backbone_params, other_params = [], []
