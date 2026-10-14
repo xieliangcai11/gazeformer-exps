@@ -102,6 +102,7 @@ class Subset(torch.utils.data.Dataset):
 DATASET_SPECS = {
     "rgbdgaze": dict(cls=RGBDGazeDataset, path_col="rgb_path",
                      default_index=RGBDGaze_INDEX_DIR, supports_eye=True,
+                     supports_orient=True,
                      kwargs=dict(color_transform=rgb_preprocess)),
     "gazecapture": dict(cls=GazeCaptureDataset, path_col="frame_path",
                         default_index=GAZECAPTURE_INDEX_DIR, kwargs={}),
@@ -110,7 +111,8 @@ DATASET_SPECS = {
 
 def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
                      augment=False, resolution=None, distributed=False,
-                     geom_randomize=None, eye_crops=False):
+                     geom_randomize=None, eye_crops=False, orient="raw",
+                     eye_scale=0.0):
     """构造 train/val/test 的 DataLoader。
 
     dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
@@ -135,12 +137,19 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
                        f"例：{missing[:2]}（索引与清单是否来自同一次预处理？）")
     idx = [path_to_idx[p] for p in paths]
 
-    # 眼部支流：只有声明 supports_eye 的数据集才接受该参数（GazeCapture 目前没有坐标表）
+    # 仅声明支持的数据集才接受这两个参数（GazeCapture 目前没有眼框表 / 朝向参数）
     kwargs = dict(spec["kwargs"])
     if eye_crops:
         if not spec.get("supports_eye"):
             raise ValueError(f"数据集 {dataset} 不支持眼部支流（eye_crops=True）")
         kwargs["eye_crops"] = True
+        if eye_scale > 0:
+            kwargs["eye_scale"] = eye_scale
+    if orient != "raw":
+        # 评估历史 ckpt 用（其输入约定是躺倒朝向）；训练一律默认 raw
+        if not spec.get("supports_orient"):
+            raise ValueError(f"数据集 {dataset} 不支持 orient={orient!r}")
+        kwargs["orient"] = orient
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
                      geom_randomize=geom_randomize, **kwargs)
     sub = Subset(ds, idx)
@@ -197,14 +206,30 @@ def geometric_angular_loss(pred, label, screen_cm, D):
     return ang
 
 
+#: 眼图对齐对照（--eye-shuffle）：置 True 时把眼部裁剪沿 batch 维 roll 一拍。
+#: 目的：输入分布、参数量、算力全部不变，仅破坏"眼图 ↔ 当前帧"的对应关系 ⇒
+#: 若模型仍能超过无眼基线，说明收益来自正则化/额外算力；若退化到无眼水平，
+#: 说明收益确实来自虹膜细节。
+EYE_SHUFFLE = False
+
+
+def _shuffle_eyes(eye_l, eye_r):
+    """对照实验用：破坏眼图与当前帧的对应（batch 内循环错位）。"""
+    if not EYE_SHUFFLE or eye_l.shape[0] < 2:
+        return eye_l, eye_r
+    return eye_l.roll(1, dims=0), eye_r.roll(1, dims=0)
+
+
 def predict_frames(model, dl, device):
     """在给定 DataLoader 上跑一遍，返回逐帧物理量（供任意分组聚合）。
 
     返回 dict，每个字段是 numpy 数组，长度 = 样本数：
         pred, label : [N, 2] 归一化屏幕坐标（预测 / 真值）
         cm_x, cm_y  : [N] 预测误差换算到屏幕物理厘米（带符号）
-        cm_dist     : [N] 误差的物理距离（厘米）
         ang_deg     : [N] 几何视线角度误差（度）
+
+    注意：物理距离 cm_dist = hypot(cm_x, cm_y) 由 summarize 现算，**不在本返回值里**
+    （此前 docstring 误列了它；2026-10-14 修正）。
     评估口径集中在这里，summarize 与 evaluate_split 共用，避免多处各写一套。
     """
     from configs.rgbdgaze_config import VIEWING_DISTANCE_CM as D
@@ -223,9 +248,9 @@ def predict_frames(model, dl, device):
             geom = inp.geom.to(device).float() if use_geom else None
             if use_eye:
                 # 眼部支流：数据集需以 eye_crops=True 构造，否则此处会 AttributeError
-                pred = model(face, imu=imu, geom=geom,
-                             eye_l=inp.eye_l.to(device).float(),
-                             eye_r=inp.eye_r.to(device).float())
+                eye_l, eye_r = _shuffle_eyes(inp.eye_l.to(device).float(),
+                                             inp.eye_r.to(device).float())
+                pred = model(face, imu=imu, geom=geom, eye_l=eye_l, eye_r=eye_r)
             else:
                 pred = model(face, imu=imu, geom=geom)
 
@@ -405,6 +430,14 @@ def parse():
     p.add_argument("--use-eye", dest="use_eye", action="store_true",
                    help="加入眼部放大支流：人脸 + 左右眼各一张裁剪（共用 DINOv2 骨干）。"
                         "眼框表由 tools/data/rgbdgaze/build_eye_boxes.py 生成")
+    p.add_argument("--eye-shuffle", dest="eye_shuffle", action="store_true",
+                   help="【对照实验】把眼部裁剪沿 batch 维 roll 一拍：输入分布与算力"
+                        "完全不变，只破坏 眼图↔当前帧 的对应。用于分离眼支流收益"
+                        "来自图像内容 还是来自正则化/额外算力（须与 --use-eye 同用）")
+    p.add_argument("--eye-scale", type=float, default=0.0,
+                   help="眼部裁剪边长 = eye_scale × 眼框高度（正方形，居中）。"
+                        "0=历史行为（边长取 max(宽,高)，虹膜仅占约 28%%）。"
+                        "取 1.5 左右可让虹膜占比升到约 2/3 ⇒ 等效虹膜像素提升数倍")
     p.add_argument("--unfreeze", type=int, default=0,
                    help="解冻 DINOv2 最后 N 个 block（0=全冻结）")
     p.add_argument("--diff-lr", action="store_true",
@@ -430,6 +463,10 @@ def parse():
 
 def main():
     args = parse()
+    global EYE_SHUFFLE
+    EYE_SHUFFLE = bool(getattr(args, "eye_shuffle", False))
+    if EYE_SHUFFLE and not getattr(args, "use_eye", False):
+        raise SystemExit("--eye-shuffle 需要与 --use-eye 同用（没有眼图可打乱）")
     rank, world, local_rank, is_dist = init_distributed()
     is_main = (rank == 0)
     if is_dist:
@@ -517,15 +554,18 @@ def main():
                                 augment=args.augment, resolution=args.resolution,
                                 distributed=is_dist,
                                 geom_randomize=args.geom_randomize,
-                                eye_crops=args.use_eye)
+                                eye_crops=args.use_eye,
+                                eye_scale=args.eye_scale)
     val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
                               args.batch_size, False, args.num_workers,
                               augment=False, resolution=args.resolution,
-                              eye_crops=args.use_eye)
+                              eye_crops=args.use_eye,
+                              eye_scale=args.eye_scale)
     test_dl = build_dataloader(args.dataset, "test", Path(args.index_dir),
                                args.batch_size, False, args.num_workers,
                                augment=False, resolution=args.resolution,
-                               eye_crops=args.use_eye)
+                               eye_crops=args.use_eye,
+                               eye_scale=args.eye_scale)
 
     tr_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     eff_bs = args.batch_size * world
@@ -582,9 +622,9 @@ def main():
             geom = inp.geom.to(device).float() if args.use_geom else None
             optimizer.zero_grad()
             if args.use_eye:
-                pred = model(face, imu=imu, geom=geom,
-                             eye_l=inp.eye_l.to(device).float(),
-                             eye_r=inp.eye_r.to(device).float())
+                eye_l, eye_r = _shuffle_eyes(inp.eye_l.to(device).float(),
+                                             inp.eye_r.to(device).float())
+                pred = model(face, imu=imu, geom=geom, eye_l=eye_l, eye_r=eye_r)
             else:
                 pred = model(face, imu=imu, geom=geom)
             loss_coord = criterion(pred, label)

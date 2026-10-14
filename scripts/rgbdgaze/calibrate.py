@@ -117,6 +117,26 @@ def main():
     p.add_argument("--calib-ratios", type=float, nargs="+", default=[0.05, 0.10, 0.15])
     p.add_argument("--calib-epochs", type=int, default=50)
     p.add_argument("--calib-lr", type=float, default=1e-4)
+    p.add_argument("--calib-split", choices=["head", "stride"], default="head",
+                   help="校准帧划分：head=被试前 N%% 帧（历史做法；动画使注视点"
+                        "时间非平稳 ⇒ 校准窗口分布≠测试分布）；stride=全 session "
+                        "交错抽样（注视分布与测试集一致）")
+    p.add_argument("--use-geom", action="store_true", default=False,
+                   help="骨干含屏幕几何 token。必须与 ckpt 一致：模型类默认 "
+                        "use_geom=True，而 nodepth/no-geom 的 ckpt 无 proj_geom，"
+                        "不显式关闭会直接 load_state_dict 失败")
+    p.add_argument("--no-geom", dest="use_geom", action="store_false",
+                   help="兼容 dump_predictions 的写法（本脚本默认已是关闭 geom）")
+    p.add_argument("--use-imu", action="store_true", help="骨干含 IMU token（须与 ckpt 一致）")
+    p.add_argument("--use-eye", action="store_true", help="骨干含眼部支流（须与 ckpt 一致）")
+    p.add_argument("--orient", choices=["raw", "rot90"], default="raw",
+                   help="裁剪朝向，必须与 ckpt 训练时一致：raw=正立（当前代码默认）；"
+                        "rot90=躺倒朝向（历史 ckpt：g5/g6/base224/g6_multi 等）。"
+                        "用错朝向会让基线 EM 涨 2.5~3 倍且不会报错，务必核对打印的基线值")
+    p.add_argument("--offset-mode", choices=["feat", "const", "affine"], default="feat",
+                   help="偏移来源：feat=特征相关逐帧偏移（可记忆校准窗口的注视"
+                        "位置）；const=校准集平均偏移（仅 2 参数，鲁棒）；"
+                        "affine=校准集最小二乘仿射（6 参数，可修正幅度/收缩误差）")
     p.add_argument("--device", default="auto")
     args = p.parse_args()
 
@@ -138,7 +158,9 @@ def main():
     emit("=" * 60)
 
     # 加载模型
-    model = RGBDGazeDINOv2(unfreeze_last=12, img_size=args.resolution)
+    model = RGBDGazeDINOv2(unfreeze_last=12, img_size=args.resolution,
+                           use_geom=args.use_geom, use_imu=args.use_imu,
+                           use_eye=args.use_eye)
     model.load_state_dict(torch.load(args.backbone_ckpt, map_location="cpu", weights_only=False))
     model.to(device).eval()
     for param in model.parameters():
@@ -153,7 +175,8 @@ def main():
                     if l.strip()]
     dataset = RGBDGazeDataset(RGBDGaze_INDEX_DIR / "index.csv",
                               color_transform=rgb_preprocess,
-                              image_size=args.resolution)
+                              image_size=args.resolution,
+                              orient=args.orient)
     emit(f"[calib] 测试集: {len(test_indices)} 样本")
 
     # 按被试分组
@@ -191,14 +214,24 @@ def main():
         for sub in sorted(subject_frames.keys()):
             frames = subject_frames[sub]
             n_calib = max(1, int(len(frames) * ratio))
-            calib_ids = [idx for _, idx in frames[:n_calib]]
-            test_ids = [idx for _, idx in frames[n_calib:]]
+            if args.calib_split == "head":
+                calib_ids = [idx for _, idx in frames[:n_calib]]
+                test_ids = [idx for _, idx in frames[n_calib:]]
+            else:
+                # 交错抽样：校准帧摊满整个 session ⇒ 注视分布与测试集一致
+                stride = max(1, int(round(1.0 / ratio)))
+                calib_ids = [idx for k, (_, idx) in enumerate(frames)
+                             if k % stride == 0]
+                test_ids = [idx for k, (_, idx) in enumerate(frames)
+                            if k % stride != 0]
+                n_calib = len(calib_ids)
 
             if len(test_ids) == 0:
                 continue
 
             # 校准帧的特征 + 模型预测 + GT
-            calib_feats = feature_batch(model, calib_ids, dataset, device)
+            calib_feats = (feature_batch(model, calib_ids, dataset, device)
+                           if args.offset_mode == "feat" else None)
             offsets_target = []
             for idx in calib_ids:
                 r = rows[idx]
@@ -207,25 +240,41 @@ def main():
                 mp = preds_all[idx]
                 offsets_target.append([gx - mp[0], gy - mp[1]])
             offsets_target = np.array(offsets_target, dtype=np.float32)
-            calib_feat_tensor = torch.stack([calib_feats[i] for i in calib_ids])
 
-            # 训练偏移校准器
-            calibrator = OffsetCalibrator(calib_feat_tensor.shape[1], hidden=32).to(device)
-            optimizer = optim.Adam(calibrator.parameters(), lr=args.calib_lr,
-                                   weight_decay=0.01)
-            criterion = nn.MSELoss()
-            target_t = torch.tensor(offsets_target, device=device)
-            feat_t = calib_feat_tensor.to(device)
-            for epoch in range(args.calib_epochs):
-                calibrator.train()
-                optimizer.zero_grad()
-                loss = criterion(calibrator(feat_t), target_t)
-                loss.backward()
-                optimizer.step()
+            # 仿射模式：只用校准帧做最小二乘 (pred -> gt)，6 参数（2x2 + 偏置）
+            affine_A = None
+            if args.offset_mode == "affine":
+                Pc = np.array([preds_all[i] for i in calib_ids], dtype=np.float64)
+                Lc = np.array([[float(rows[i]["gaze_x"]) / float(rows[i]["screen_w"]),
+                                float(rows[i]["gaze_y"]) / float(rows[i]["screen_h"])]
+                               for i in calib_ids], dtype=np.float64)
+                affine_A, *_ = np.linalg.lstsq(
+                    np.hstack([Pc, np.ones((len(Pc), 1))]), Lc, rcond=None)
+            calib_feat_tensor = (torch.stack([calib_feats[i] for i in calib_ids])
+                                 if args.offset_mode == "feat" else None)
+
+            # 训练偏移校准器（仅 feat 模式需要）
+            calibrator = None
+            if args.offset_mode == "feat":
+                calibrator = OffsetCalibrator(calib_feat_tensor.shape[1],
+                                              hidden=32).to(device)
+                optimizer = optim.Adam(calibrator.parameters(), lr=args.calib_lr,
+                                       weight_decay=0.01)
+                criterion = nn.MSELoss()
+                target_t = torch.tensor(offsets_target, device=device)
+                feat_t = calib_feat_tensor.to(device)
+                for epoch in range(args.calib_epochs):
+                    calibrator.train()
+                    optimizer.zero_grad()
+                    loss = criterion(calibrator(feat_t), target_t)
+                    loss.backward()
+                    optimizer.step()
 
             # 在测试帧上评估
-            test_feats = feature_batch(model, test_ids, dataset, device)
-            calibrator.eval()
+            test_feats = (feature_batch(model, test_ids, dataset, device)
+                          if args.offset_mode == "feat" else None)
+            if calibrator is not None:
+                calibrator.eval()
             mean_offset = np.mean(offsets_target, axis=0)
             sub_errors = []
             for idx in test_ids:
@@ -234,13 +283,18 @@ def main():
                 gy = float(r["gaze_y"]) / float(r["screen_h"])
                 sw_cm = float(r["screen_w"]) * float(r["cm_px_x"])
                 sh_cm = float(r["screen_h"]) * float(r["cm_px_y"])
-                # 校准: 模型预测 + 特征级偏移修正
-                feat = test_feats[idx].unsqueeze(0).to(device)
-                with torch.no_grad():
-                    offset = calibrator(feat).cpu().numpy()[0]
                 mp = preds_all[idx]
-                corrected_x = mp[0] + offset[0]
-                corrected_y = mp[1] + offset[1]
+                if args.offset_mode == "const":
+                    offset = mean_offset          # 2 参数：校准集平均偏移
+                    corrected_x, corrected_y = mp[0] + offset[0], mp[1] + offset[1]
+                elif args.offset_mode == "affine":
+                    cx, cy = np.append(mp, 1.0) @ affine_A
+                    corrected_x, corrected_y = float(cx), float(cy)
+                else:
+                    with torch.no_grad():
+                        feat = test_feats[idx].unsqueeze(0).to(device)
+                        offset = calibrator(feat).cpu().numpy()[0]
+                    corrected_x, corrected_y = mp[0] + offset[0], mp[1] + offset[1]
                 e = math.hypot((corrected_x-gx)*sw_cm, (corrected_y-gy)*sh_cm)
                 sub_errors.append(e)
                 all_corrected_errors.append(e)
@@ -248,13 +302,25 @@ def main():
                  f"平均={np.mean(sub_errors):.2f}cm")
 
         overall = np.mean(all_corrected_errors) if all_corrected_errors else 0
+        arr = np.array(all_corrected_errors)
+        base_arr = np.array(base_errors)
+
+        def tail(a):
+            return (f"中位 {np.median(a):.3f} | >2cm {100 * (a > 2).mean():.2f}% | "
+                    f">3cm {100 * (a > 3).mean():.2f}% | >5cm {100 * (a > 5).mean():.2f}%"
+                    f" | max {a.max():.2f}")
+
         emit(f"[calib] 校准后整体: {overall:.2f}cm (n={len(all_corrected_errors)})")
+        emit(f"[calib]   基线  : {base_arr.mean():.3f} | {tail(base_arr)}")
+        emit(f"[calib]   校准后: {arr.mean():.3f} | {tail(arr)}")
         emit(f"[calib] 无校准: {baseline_cm:.2f}cm → 校准后 {overall:.2f}cm "
              f"| 提升 {(1-overall/baseline_cm)*100:.1f}%")
 
-        result_file = run_dirs / f"calibration_offset_r{int(ratio*100)}.json"
+        result_file = run_dirs / (f"calibration_offset_{args.calib_split}_"
+                                  f"{args.offset_mode}_r{int(ratio*100)}.json")
         result_file.write_text(json.dumps({
-            "ratio": ratio, "baseline_cm": baseline_cm,
+            "ratio": ratio, "split": args.calib_split, "mode": args.offset_mode,
+            "baseline_cm": baseline_cm,
             "calibrated_cm": overall,
             "improvement_pct": (1 - overall / baseline_cm) * 100,
         }, indent=2))

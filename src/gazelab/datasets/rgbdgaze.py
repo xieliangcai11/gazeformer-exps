@@ -90,17 +90,20 @@ class RGBDGazeDataset(Dataset):
         geom_randomize: float = None,
         image_size: int = None,
         eye_crops: bool = False,
+        orient: str = "raw",
+        eye_scale: float = 0.0,
     ):
-        """裁剪朝向说明（2026-10-14 定案，勿再改回）
+        """裁剪朝向 orient（**只用于评估历史 ckpt**；所有训练与新实验用默认 raw）
 
-        历史实现先 np.rot90(img, 1) 再按索引 bbox 裁。实测该朝向让**人脸躺倒**
-        （rot90 后两眼中心连线 Δx=1.0 px / Δy=208 px，即竖直），而原图本身人脸
-        是正立的（MediaPipe 眼框 137x40 = 宽>高）⇒ 躺倒输入对 DINOv2 属分布外，
-        白费正立人脸先验，伤的是跨被试泛化。
+          - "raw"（默认）：直接用原图 + 把索引 bbox 反映射回来。原图人脸正立
+            （MediaPipe 眼框 137x40 = 宽>高），与预训练数据（GazeCapture 亦正立）一致。
+            一致性验证：反解后框中心与 MediaPipe 人脸框中心相差 4.68% 脸边长。
+          - "rot90"：历史行为（先 np.rot90(img,1) 再按索引 bbox 裁）。实测量化该朝向
+            使**人脸躺倒**（rot90 后两眼中心连线 Δx=1.0 px / Δy=208 px，即竖直）。
+            **仅**用于复现/评估在躺倒朝向下训练的旧 ckpt（例如 test 1.64cm 的
+            g6_multi）——用错朝向评估会让数字完全失真。
 
-        现改为**直接用原图**，并把索引 bbox（作者坐标系＝rot90 后）反映射回来。
-        验证：反解后框中心与 MediaPipe 人脸框中心相差 14 px（脸边长 2.7%）。
-        眼框表随之简化为 jsonl 的原图坐标，不再需要任何坐标映射。
+        注意 rot90 模式不支持 eye_crops（眼框表存的是原图坐标，没有旋转后坐标）。
         """
         super().__init__()
         self.index_csv = Path(index_csv)
@@ -134,6 +137,16 @@ class RGBDGazeDataset(Dataset):
         self._rng = np.random.RandomState()
         # 输入分辨率（None = 使用配置的 IMAGE_SIZE）
         self.image_size = int(image_size) if image_size else IMAGE_SIZE
+
+        # ---- 裁剪朝向（见 docstring）：raw=正立原图（默认）；rot90=历史躺倒朝向 ----
+        if orient not in ("raw", "rot90"):
+            raise ValueError(f"orient 只能是 'raw' 或 'rot90'，收到 {orient!r}")
+        self.orient = orient
+        self.eye_scale = eye_scale
+        if orient == "rot90" and eye_crops:
+            raise ValueError(
+                "orient='rot90' 不支持 eye_crops：眼框表只存了原图坐标。"
+                "评估带眼支流的历史 ckpt 需要另建旋转后坐标的框表。")
 
         # ---- 眼部放大支流（可选）----
         # 动机（实测）：眼区框（含 1.6 倍边距）中位 128 px，放大到 224 时虹膜约 62 px，
@@ -186,10 +199,14 @@ class RGBDGazeDataset(Dataset):
             raise FileNotFoundError(
                 f"无法读取 RGB 图像: {rgb_path}（文件缺失或损坏？）")
 
-        # 原图本身人脸正立（见 __init__ docstring）：不旋转，直接裁；
-        # 索引 bbox 在作者（rot90 后）坐标系，需反映射回原图。
-        img = rgb
-        bbox_use = self._index_bbox_to_raw(bbox_xywh, rgb.shape[1])
+        if self.orient == "rot90":
+            # 历史朝向：仅用于评估在躺倒朝向下训练的旧 ckpt（其 bbox 就在该坐标系）
+            img = np.rot90(rgb, 1)
+            bbox_use = bbox_xywh
+        else:
+            # 默认（正立）：用原图；索引 bbox 在作者（rot90 后）坐标系，需反映射回来
+            img = rgb
+            bbox_use = self._index_bbox_to_raw(bbox_xywh, rgb.shape[1])
 
         rgb_face = crop_face_square(img, bbox_use, CROP_MARGIN,
                                     self.image_size, shift=self.aug_shift,
@@ -213,14 +230,28 @@ class RGBDGazeDataset(Dataset):
         x, y, w, h = bbox
         return (W0 - 1 - (y + h), x, h, w)
 
-    def _crop_eye(self, oriented, idx, off, rng):
-        """从已旋转的原分辨率整帧上裁一只眼（框来自 eye_boxes.npz）。
+    def _crop_eye(self, raw, idx, off, rng):
+        """从**原图**（未旋转）上裁一只眼的放大正方形（框来自 eye_boxes.npz）。
 
-        复用 crop_face_square：margin=1.0 时它以 bbox 中心取 max(w,h) 的正方形，
-        正好把整只眼含边距框进去；越界由该函数内部补齐，不会产生黑边。
+        复用 crop_face_square：margin=1.0 时它以 bbox 中心取 max(w,h) 的正方形
+        （眼框中位 128 px，放大到 224 ⇒ 1.75x ⇒ 虹膜约 62 px，越过"1°/px"门槛）。
+
+        已知限制（实测 0.03% 的眼框会触发，可忽略但需知情）：
+        crop_face_square 对越界是**按边界截断**、随后 resize ⇒ 这类样本会被**拉伸**
+        （没有黑边，但放大倍数与其它样本不一致）。出界比例：左眼 0.02% / 右眼 0.01%。
+
+        另一个注意点：rotate>0 时人脸与眼部**各自绕自己裁剪中心**旋转，两支流的
+        相对几何因此不完全一致；本项目实验均用 --aug-rotate 0，故不触发。
         """
         box = tuple(float(v) for v in self.eye_boxes[idx, off:off + 4])
-        eye = crop_face_square(oriented, box, 1.0, self.image_size,
+        if self.eye_scale > 0:
+            # 收紧眼框：以**眼框高度**为基准取正方形 ⇒ 虹膜在裁剪中的占比大幅提高
+            # （默认 0 = 历史行为，以 max(w,h) 为边长，虹膜仅占约 28%）。
+            _ex, _ey, _ew, _eh = box
+            _s = max(self.eye_scale * _eh, 1.0)
+            _cx, _cy = _ex + _ew / 2.0, _ey + _eh / 2.0
+            box = (_cx - _s / 2.0, _cy - _s / 2.0, _s, _s)
+        eye = crop_face_square(raw, box, 1.0, self.image_size,
                                shift=self.aug_shift, scale=self.aug_scale,
                                rotate=self.aug_rotate, rng=rng)
         return self.color_transform(eye) if self.color_transform is not None else eye

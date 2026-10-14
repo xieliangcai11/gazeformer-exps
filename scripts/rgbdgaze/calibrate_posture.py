@@ -30,7 +30,9 @@ from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
 from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import RGBDGazeDINOv2
 from gazelab.models.rgbdgaze.calibrator import extract_features
 
-model = RGBDGazeDINOv2(unfreeze_last=12, img_size=448)
+# use_geom 必须与 ckpt 一致：模型类默认 use_geom=True，而 g5_nodepth_448_aug 是
+# --no-geom 训的、不含 proj_geom，不显式关闭会在 load_state_dict 处直接报错。
+model = RGBDGazeDINOv2(unfreeze_last=12, img_size=448, use_geom=False)
 model.load_state_dict(torch.load(
     Path("out/rgbdgaze/ablation/checkpoints/g5_nodepth_448_aug/best.pt"),
     map_location="cpu", weights_only=False))
