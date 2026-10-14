@@ -134,10 +134,18 @@ class DINOv2Backbone(nn.Module):
 class RGBDGazeDINOv2(nn.Module):
     """DINOv2(RGB,冻结) + 屏幕几何 token + BlockMoba 融合 -> 2D 屏幕坐标。
 
-    forward(face, imu=None, geom=None) -> [B, 2]
-      face : [B, 3, S, S] RGB（ImageNet 归一化，DINOv2 预处理）
-      imu  : [B, 3] 重力向量（use_imu=True 时必需）
-      geom : [B, 3] 屏幕几何 [宽高比, log(物理宽cm), log(物理高cm)]（use_geom=True 时必需）
+    forward(face, imu=None, geom=None, eye_l=None, eye_r=None) -> [B, 2]
+      face  : [B, 3, S, S] RGB（ImageNet 归一化，DINOv2 预处理）
+      imu   : [B, 3] 重力向量（use_imu=True 时必需）
+      geom  : [B, 3] 屏幕几何 [宽高比, log(物理宽cm), log(物理高cm)]（use_geom=True 时必需）
+      eye_l : [B, 3, S, S] 左眼放大裁剪（use_eye=True 时必需）
+      eye_r : [B, 3, S, S] 右眼放大裁剪（use_eye=True 时必需）
+
+    眼部支流的动机（用实测数字，不是猜测）：480×640/1080×1440 原图中虹膜直径约 22~36 px，
+    整脸裁剪后（CROP_MARGIN=1.2）resize 到 224 时虹膜只剩约 14 px ≈ DINOv2 一个 patch(14)，
+    即"一个视觉单元 ≈ 一整个虹膜"；而把眼区（含 1.6 倍边距约 134 px）放大到 224 可得
+    虹膜约 60 px，恰好跨过"1°/px"门槛（约 58 px）。两条支流共用同一个 DINOv2 骨干，
+    眼部只贡献各自的 cls token（融合序列 259 -> 261，几乎不增加融合开销）。
     """
 
     #: 几何 token 的输入维度：[宽高比, log(w_cm), log(h_cm)]
@@ -154,6 +162,7 @@ class RGBDGazeDINOv2(nn.Module):
         unfreeze_last=0,
         use_imu=False,
         use_geom=True,
+        use_eye=False,
         img_size=DINOV2_IMG_SIZE,
         dino_model=DINOV2_MODEL,
         dino_ckpt=DINOV2_CKPT,
@@ -180,6 +189,11 @@ class RGBDGazeDINOv2(nn.Module):
         if use_geom:
             self.proj_geom = nn.Linear(self.GEOM_DIM, d_model)
 
+        # ---- 眼部放大支流（可选）：与整脸共用骨干，只取各自的 cls token ----
+        self.use_eye = use_eye
+        if use_eye:
+            self.proj_eye = nn.Linear(dino_dim, d_model)
+
         # ---- 融合：BlockMoba 栈 + 汇总 token ----
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.layers = nn.ModuleList([
@@ -194,7 +208,7 @@ class RGBDGazeDINOv2(nn.Module):
         self.norm = RMSNorm(d_model, eps=1e-5)
         self.head = nn.Linear(d_model, gaze_dim)
 
-    def forward(self, face, imu=None, geom=None):
+    def forward(self, face, imu=None, geom=None, eye_l=None, eye_r=None):
         # 1) RGB：DINOv2（冻结/部分解冻）-> cls + patches
         tokens = self.rgb(face)                      # [B, 1+N, C]
         cls = tokens[:, 0]                           # [B, C]
@@ -220,9 +234,20 @@ class RGBDGazeDINOv2(nn.Module):
             geom_tok = self.proj_geom(geom).unsqueeze(1)  # [B, 1, d_model]
             seq = torch.cat([geom_tok, seq], dim=1)
 
+        # 2c) 眼部放大支流（可选，2 个 token）：与整脸共用同一个 DINOv2 骨干，
+        #     每只眼只贡献自己的 cls token，因此融合序列只增加 2 个位置。
+        if self.use_eye:
+            if eye_l is None or eye_r is None:
+                raise ValueError("use_eye=True 但 forward 未提供 eye_l/eye_r")
+            eye_tok = torch.cat([
+                self.proj_eye(self.rgb(eye_l)[:, 0]).unsqueeze(1),
+                self.proj_eye(self.rgb(eye_r)[:, 0]).unsqueeze(1),
+            ], dim=1)                                    # [B, 2, d_model]
+            seq = torch.cat([eye_tok, seq], dim=1)
+
         B = face.size(0)
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+[imu]+[geom]+1+N, d_model]
+        x = torch.cat([cls_tokens, seq], dim=1)       # [B, 1+[imu]+[geom]+[2眼]+1+N, d_model]
 
         # 3) BlockMoba 栈（自注意力融合）
         for layer in self.layers:

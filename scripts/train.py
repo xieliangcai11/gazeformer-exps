@@ -101,7 +101,7 @@ class Subset(torch.utils.data.Dataset):
 #: 各数据集的差异点：数据集类、索引里的路径列名、默认索引目录
 DATASET_SPECS = {
     "rgbdgaze": dict(cls=RGBDGazeDataset, path_col="rgb_path",
-                     default_index=RGBDGaze_INDEX_DIR,
+                     default_index=RGBDGaze_INDEX_DIR, supports_eye=True,
                      kwargs=dict(color_transform=rgb_preprocess)),
     "gazecapture": dict(cls=GazeCaptureDataset, path_col="frame_path",
                         default_index=GAZECAPTURE_INDEX_DIR, kwargs={}),
@@ -110,7 +110,7 @@ DATASET_SPECS = {
 
 def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
                      augment=False, resolution=None, distributed=False,
-                     geom_randomize=None):
+                     geom_randomize=None, eye_crops=False):
     """构造 train/val/test 的 DataLoader。
 
     dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
@@ -135,8 +135,14 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
                        f"例：{missing[:2]}（索引与清单是否来自同一次预处理？）")
     idx = [path_to_idx[p] for p in paths]
 
+    # 眼部支流：只有声明 supports_eye 的数据集才接受该参数（GazeCapture 目前没有坐标表）
+    kwargs = dict(spec["kwargs"])
+    if eye_crops:
+        if not spec.get("supports_eye"):
+            raise ValueError(f"数据集 {dataset} 不支持眼部支流（eye_crops=True）")
+        kwargs["eye_crops"] = True
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
-                     geom_randomize=geom_randomize, **spec["kwargs"])
+                     geom_randomize=geom_randomize, **kwargs)
     sub = Subset(ds, idx)
     # persistent_workers：worker 进程跨 epoch 复用，避免每个 epoch 重新
     # fork（125 万行索引的 fork 成本很高，且是 epoch 边界卡顿的来源）。
@@ -206,6 +212,7 @@ def predict_frames(model, dl, device):
     model.eval()
     use_imu = getattr(model, "use_imu", False)
     use_geom = getattr(model, "use_geom", False)
+    use_eye = getattr(model, "use_eye", False)
 
     preds, labels, cmxs, cmys, angs = [], [], [], [], []
     with torch.no_grad():
@@ -214,7 +221,13 @@ def predict_frames(model, dl, device):
             label = label.to(device)
             imu = inp.imu.to(device).float() if use_imu else None
             geom = inp.geom.to(device).float() if use_geom else None
-            pred = model(face, imu=imu, geom=geom)
+            if use_eye:
+                # 眼部支流：数据集需以 eye_crops=True 构造，否则此处会 AttributeError
+                pred = model(face, imu=imu, geom=geom,
+                             eye_l=inp.eye_l.to(device).float(),
+                             eye_r=inp.eye_r.to(device).float())
+            else:
+                pred = model(face, imu=imu, geom=geom)
 
             # 物理换算所需量来自数据项本身，避免依赖 DataLoader 的样本顺序
             cm_b = inp.screen_cm.to(device).float()
@@ -389,6 +402,9 @@ def parse():
                    help="几何域随机化的触发概率（P2，把宽高比外推变内插）；"
                         "None=用各自 config 默认（rgbdgaze=0.35 / gazecapture=0.5）。"
                         "仅在 --augment 下生效，显式传 0 可关闭（消融用）")
+    p.add_argument("--use-eye", dest="use_eye", action="store_true",
+                   help="加入眼部放大支流：人脸 + 左右眼各一张裁剪（共用 DINOv2 骨干）。"
+                        "眼框表由 tools/data/rgbdgaze/build_eye_boxes.py 生成")
     p.add_argument("--unfreeze", type=int, default=0,
                    help="解冻 DINOv2 最后 N 个 block（0=全冻结）")
     p.add_argument("--diff-lr", action="store_true",
@@ -457,6 +473,7 @@ def main():
         unfreeze_last=args.unfreeze,
         use_imu=args.use_imu,
         use_geom=args.use_geom,
+        use_eye=args.use_eye,
         img_size=args.resolution,
     ).to(device)
     if args.init_ckpt:
@@ -499,13 +516,16 @@ def main():
                                 args.batch_size, True, args.num_workers,
                                 augment=args.augment, resolution=args.resolution,
                                 distributed=is_dist,
-                                geom_randomize=args.geom_randomize)
+                                geom_randomize=args.geom_randomize,
+                                eye_crops=args.use_eye)
     val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
                               args.batch_size, False, args.num_workers,
-                              augment=False, resolution=args.resolution)
+                              augment=False, resolution=args.resolution,
+                              eye_crops=args.use_eye)
     test_dl = build_dataloader(args.dataset, "test", Path(args.index_dir),
                                args.batch_size, False, args.num_workers,
-                               augment=False, resolution=args.resolution)
+                               augment=False, resolution=args.resolution,
+                               eye_crops=args.use_eye)
 
     tr_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     eff_bs = args.batch_size * world
@@ -515,6 +535,7 @@ def main():
               f"geom_rand={train_dl.dataset.base.geom_randomize} "
               f"imu={args.use_imu} "
               f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze} "
+              f"eye={args.use_eye} "
               f"diff_lr={args.diff_lr} "
               f"aug(shift/scale/rot)={args.aug_shift}/{args.aug_scale}/{args.aug_rotate}\n"
               f" 训练集 {len(train_dl.dataset)}"
@@ -560,7 +581,12 @@ def main():
             imu = inp.imu.to(device).float() if args.use_imu else None
             geom = inp.geom.to(device).float() if args.use_geom else None
             optimizer.zero_grad()
-            pred = model(face, imu=imu, geom=geom)
+            if args.use_eye:
+                pred = model(face, imu=imu, geom=geom,
+                             eye_l=inp.eye_l.to(device).float(),
+                             eye_r=inp.eye_r.to(device).float())
+            else:
+                pred = model(face, imu=imu, geom=geom)
             loss_coord = criterion(pred, label)
             loss = loss_coord
             if args.loss == "mse_angle":
