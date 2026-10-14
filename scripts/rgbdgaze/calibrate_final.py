@@ -43,7 +43,9 @@ ALPHAS = [0.01, 0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = RGBDGazeDINOv2(unfreeze_last=12, img_size=RESOLUTION)
+# use_geom 必须与 ckpt 一致：模型类默认 use_geom=True，而 g5_nodepth_448_aug 是
+# --no-geom 训的、不含 proj_geom，不显式关闭会在 load_state_dict 处直接报错。
+model = RGBDGazeDINOv2(unfreeze_last=12, img_size=RESOLUTION, use_geom=False)
 model.load_state_dict(torch.load(CKPT, map_location="cpu", weights_only=False))
 model.to(device).eval()
 print(f"[load] {CKPT}")
