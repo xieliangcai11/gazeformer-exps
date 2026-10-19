@@ -1,195 +1,144 @@
 # Gazelab
 
-> 3D 视线估计（Gaze Estimation）研究框架：融合 CLIP 语义先验、CNN 视觉特征与 MoE Transformer。
+注视（gaze）估计研究仓库：以 **DINOv2 视觉骨干 + 屏幕几何 token** 为核心，做 **2D 屏幕注视点回归**。
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+两条使用线：
 
----
+| 数据集 | 用途 | 规模 |
+|---|---|---|
+| **GazeCapture** | 大规模"注视先验"预训练 | ~149 万帧 / 1474 名被试 |
+| **RGBDGaze** | 域内训练、校准、测试时自适应 | ~14 万帧 / 45 名被试 |
 
-## 项目简介
-
-Gazelab 是一个**模块化、可扩展**的视线估计研究框架。核心思想是用 CLIP 的图文语义能力，
-为一张人脸补充"光照 / 头姿 / 背景 / 视线方向"等属性先验，再与 CNN 提取的视觉特征融合，
-经 MoE Transformer 回归 3D 视线方向。
-
-设计目标是让"换模型、换数据集、加新功能"都尽可能低成本：
-
-- 模型放在 `src/gazelab/models/`，新增一个文件即可接入
-- 数据集适配在 `src/gazelab/datasets.py`
-- 训练 / 测试 / 推理 / 预处理各自独立入口在 `scripts/`
-- 支持多实验目录 `experiments/`
+两者共用同一条训练循环、同一套模型与评估口径（`cm` 与角度），差异只在数据集构造与索引路径。
 
 ---
 
 ## 目录结构
 
 ```
-gazelab/
-├── configs/
-│   └── config.py           # 全局配置（数据集/模型/超参）
-├── src/gazelab/            # 核心包
-│   ├── datasets.py         # 数据集适配层（Gaze360 / ETH-XGaze / MPIIFaceGaze / EyeDiap）
-│   ├── predict.py          # 单图推理 + 箭头可视化（CLI）
+gazeformer-exps/
+├── configs/                     # 只放配置（零副作用）
+│   ├── paths.py                 #   项目根 / DEVICE / out 目录约定
+│   ├── gazecapture_config.py    #   GazeCapture 路径、几何域随机化范围等
+│   └── rgbdgaze_config.py       #   RGBDGaze 路径、裁剪/增强/视距等
+├── src/gazelab/
+│   ├── datasets/
+│   │   ├── common.py            #   裁剪 / 归一化 / 屏幕几何 / 几何随机化
+│   │   ├── table_index.py       #   列式 CSV 索引（避免 2.4GB/进程的 dict 列表）
+│   │   ├── gazecapture.py       #   GazeCapture 数据集（可选眼支流）
+│   │   └── rgbdgaze.py          #   RGBDGaze 数据集（可选眼支流 / 朝向兼容）
 │   ├── models/
-│   │   ├── gazeformer.py   # 主模型：CLIP 语义融合（GEWithCLIPModel / _zhao）
-│   │   ├── transformers.py # MoE Transformer：特征 -> 3D 视线
-│   │   └── clipmodel.py    # CLIP 相关
-│   └── utils/
-│       ├── common.py       # 通用工具（leave_one_out 等）
-│       └── loggers.py      # 日志（TensorBoard / wandb）
-├── tools/
-│   └── data/               # 数据处理脚本
-│       ├── preprocess.py   # 数据预处理（Gaze360 -> GazeHub 标准格式）
-│       └── verify.py       # 数据校验
+│   │   ├── dinov2_gaze/         #   **数据集无关**的注视模型家族
+│   │   │   ├── rgbdgaze_dinov2.py  # 主模型：DINOv2 + 几何/IMU/眼 token + BlockMoba
+│   │   │   ├── calibrator.py       # 校准器（特征空间偏移 / 多项式）
+│   │   │   ├── tta.py              # 测试时自适应
+│   │   │   └── vpt_model.py        # Visual Prompt Tuning 适配
+│   │   └── transformers.py      #   BlockMoba / RMSNorm 等基础块
+│   └── utils/                   #   通用工具
 ├── scripts/
-│   ├── train.py            # 训练入口
-│   └── train_test.py       # 测试入口
-├── assets/                 # 推理用检测模型（mediapipe / Haar）
-├── experiments/            # （预留）多模型 / 多实验
-├── tests/                  # （预留）测试
-├── docs/                   # 文档
-├── pyproject.toml          # 包定义
-└── requirements.txt        # 依赖
+│   ├── train.py                 # **统一训练入口**：--dataset rgbdgaze|gazecapture
+│   ├── cross_eval.py            # 跨数据集/跨几何评估、划分导出
+│   ├── analysis/                # 一次性分析脚本（校准、误差预算、可视化等）
+│   ├── rgbdgaze/                # RGBDGaze 专用：校准 / TTA / 坏例筛查
+│   └── gazecapture/             # GazeCapture 专用：训练队列脚本
+├── tools/data/
+│   ├── common/eye_detect.py     # 人脸/眼检测（Haar + MediaPipe，共享）
+│   ├── rgbdgaze/                # preprocess / build_eye_boxes / build_blink_scores
+│   └── gazecapture/             # preprocess / 眼框生成·体检·修复 / 数据验证
+├── assets/                      # 检测模型（face_landmarker、Haar）
+├── docs/                        # 论文与实验记录
+├── tests/ experiments/          # 预留
+├── data/ out/ model/ temp/      # 数据与产物（gitignore）
+├── pyproject.toml requirements.txt
 ```
 
 ---
 
 ## 安装
 
-### 1. 环境
+```bash
+conda create -n dl python=3.11 -y && conda activate dl
+pip install -r requirements.txt
+pip install mediapipe     # 眼框生成/数据质检可选
+```
 
-- Python 3.10+
-- PyTorch（CUDA 版）
-- 建议使用 conda
+DINOv2 权重放在 `model/dinov2_vits14_pretrain.pth`（不入库）。
 
-### 2. 安装依赖
+---
+
+## 数据准备
 
 ```bash
-pip install -e .                    # 安装 gazelab 包（editable）
-pip install -r requirements.txt     # 依赖（torch/clip/scipy/timm 等）
-pip install mediapipe               # 推理可选：人脸关键点检测
+# GazeCapture：解压 → 扫描元数据 → index.csv + train/val/test.txt
+python -m tools.data.gazecapture.preprocess
+
+# RGBDGaze：构建索引与划分
+python -m tools.data.rgbdgaze.preprocess --split subject
+
+# 眼框表（训练眼支流时才需要）
+python -m tools.data.gazecapture.build_eye_boxes_mp --shard 0 --nshards 8   # 分片并行
+python -m tools.data.gazecapture.build_eye_boxes_mp --merge \
+    data/GazeCapture/index/eye_boxes_shard*.npz --out data/GazeCapture/index/eye_boxes.npz
+python -m tools.data.gazecapture.check_shards --nshards 8        # 完整性体检
+python -m tools.data.gazecapture.fix_eye_boxes --dry-run         # 退化框统计
+python -m tools.data.gazecapture.fix_eye_boxes                    # 同被试中位兜底 + filled 标记
+```
+
+### 数据验证
+
+```bash
+python -m tools.data.gazecapture.verify                 # 结构/标签/抽样图像/眼框对齐
+python -m tools.data.gazecapture.verify --recheck 50    # 额外用 MediaPipe 现场重检并比 IoU
+```
+
+本地若只有完整数据集的**子集**，缺失清单/图像默认记为 `WARN`（用 `--strict-data` 切到严格模式）。
+
+---
+
+## 训练
+
+统一入口 `scripts/train.py`，`--dataset` 选择数据集：
+
+```bash
+# 单卡
+python -m scripts.train --dataset rgbdgaze --resolution 448 --unfreeze 12 --diff-lr \
+    --lr 1e-4 --batch-size 24 --epochs 8 --tag g6_nodepth
+
+# 多卡（GazeCapture 预训练示例）
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 torchrun --standalone --nproc_per_node=6 \
+  -m scripts.train --dataset gazecapture --resolution 224 --no-geom --geom-randomize 0 \
+  --augment --aug-shift 0.05 --aug-scale 0.05 --aug-rotate 0 --unfreeze 12 --diff-lr \
+  --lr 2e-4 --batch-size 32 --num-workers 8 --epochs 5 --seed 0 --tag gc_run1
+
+# 带眼支流（需先准备 eye_boxes.npz）
+python -m scripts.train --dataset gazecapture --use-eye --eye-scale 2.0 ...
+```
+
+产物：`out/<dataset>/ablation/checkpoints/<tag>/{best.pt,train_args.json}` 与 `logs/`。
+`train_args.json` 记录完整参数，可直接复现。
+
+### 评估
+
+```bash
+python -m scripts.cross_eval --ckpt out/gazecapture/ablation/checkpoints/gc_run1/best.pt \
+    --dataset gazecapture --image-size 224 --use-geom 0
 ```
 
 ---
 
-## 快速开始
+## 关键约定
 
-> `configs/config.py` 中的数据路径已基于项目根目录自动推导，
-> 训练/推理脚本也带路径引导，因此**可以从任意目录运行**以下命令。
-> 若用 `python -m gazelab.predict`，需先 `pip install -e .` 或设 `PYTHONPATH=src`。
-
-### 单图推理（预测视线 + 画箭头）
-
-```bash
-python -m gazelab.predict --image 你的图片.jpg
-# 或
-conda run -n dl python -m gazelab.predict --image 你的图片.jpg \
-    --checkpoint checkpoints/best—separate-added_Gaze360.pt \
-    --out result.png
-```
-
-输出：原图 + 从双眼中心指向视线方向的红色箭头，另打印 3D 视线向量、yaw/pitch。
-
-### 数据预处理
-
-```bash
-python tools/data/preprocess.py --input-dir ./gaze360 --output-dir ./data/Gaze360
-```
-
-### 训练
-
-```bash
-python scripts/train.py
-```
-
-### 测试
-
-```bash
-python scripts/train_test.py
-```
+- **坐标**：标签为屏幕像素点，数据集内归一化到 `[0,1]`；眼框为 `(x,y,w,h)` 原图坐标。
+- **几何 token**：`[短边/长边, log(短边cm), log(长边cm)]`（横竖屏同一语义）；`--geom-randomize` 把标签与几何一起重投影到合成屏，并把 `screen_cm` 同步替换；尺寸按标签可行性反推，生效率≈100%。
+- **增强可复现**：逐样本种子 `(aug_seed, epoch, idx)`，与 worker 数无关；DataLoader 每 epoch 重建 worker（`persistent_workers=False`），保证 `set_epoch` 生效。
+- **眼框质量**：MediaPipe 在侧脸/遮挡下会产生退化框（<8px，实测约 1.8%）。`fix_eye_boxes` 用**同被试中位框**替换并置 `filled=True`；**不做镜像**（镜像会把瞳孔水平翻转）。
 
 ---
 
-## 模型架构
+## 已知限制
 
-Gazelab 的 gaze 估计分两个阶段：
-
-1. **特征提取（`models/gazeformer.py`）**
-   - 冻结的 CLIP 编码人脸图像与一组文本提示（光照 / 头姿 / 背景 / 视线方向）
-   - 用余弦相似度选出最匹配的属性向量，与图像特征融合
-   - 得到 `feature_1`（环境：光照+头姿+背景）与 `feature_2`（视线方向）
-   - CNN（如 ResNet-50）提取局部特征图 `feature_3`
-
-2. **回归（`models/transformers.py`）**
-   - 各特征投影成 token 序列，前置 CLS token
-   - 多层 DeepSeek 风格 Block（自注意力 + 交叉注意力 + MoE）
-   - 取 CLS token 经线性头回归 3D 视线方向
-
-训练用 `angular_loss`（角度差）为主，可选 `feature_separation_loss` 辅助。
-
----
-
-## RGBDGaze 新模型（DINOv2，屏幕注视 2D 回归）
-
-项目主注意力已转向 **RGBDGaze**（RGB 人脸 + 深度人脸 → 屏幕上的 2D 注视点）。
-
-新模型 `src/gazelab/models/rgbdgaze/`（`rgbdgaze_dinov2.py`）：
-
-- **RGB 流**：DINOv2（ViT-S/14，**冻结**，定位视觉特征提取器）→ cls + patch tokens。
-- **深度流**：`inverse_depth_preprocess` 把深度图（灰度单通道）换算成**逆深度**单通道，
-  经 grid 池化 + 线性嵌入为少量 depth tokens（几何补充，RGB 仍为主角，不喧宾夺主）。
-- **融合**：复用 `transformers.py` 的 `BlockMoba`（自注意力 + MoE/FFN）把
-  `[汇总CLS, rgb_cls, depth_tokens, rgb_patch_tokens]` 一起融合，取 CLS 经线性头输出 2D 坐标。
-- **损失**：MSE(2D) + 几何角度损失（训练与验收同用"角度"这把尺子）。
-
-说明：不直接复用 `TransformerDeepSeek_gaze`（其 `proj_f1/f2/f3` 写死 512/512/2048，面向
-CLIP 语义流；无 CLIP 时强行复用会产生巨量、错误投影），故构造 RGBD 专用但复用同一 `BlockMoba` 块。
-
-### 权重要求
-
-DINOv2 官方权重需放在 `model/dinov2_vits14_pretrain.pth`（此目录已 gitignore，不随仓库提交）。
-获取方式：`facebookresearch/dinov2` 的 `dinov2_vits14` 预训练权重。缺失时模型构造会报错。
-
-```bash
-python scripts/rgbdgaze/train.py --epochs 1 --batch-size 48
-```
-
-### 老奶奶版理解文档
-详见 `docs/新模型_从原始数据开始_老奶奶版.md`。
-
----
-
-## 扩展指南
-
-### 新增模型
-
-在 `src/gazelab/models/` 新建一个文件，实现 `nn.Module`，并在入口脚本中替换 import 即可。
-
-### 新增数据集
-
-在 `src/gazelab/datasets.py` 新增一个 `Dataset` 子类（参考已有实现），
-并在 `configs/config.py` 中设置 `TRAIN_DATASET_NAME` / `TEST_DATASET_NAME`。
-
-### 消融实验
-
-通过 `configs/config.py` 的 `ABLA_CONFIG` 开关各特征流（`use_feature_1` ~ `use_feature_4`）。
-
----
-
-## 目录约定
-
-| 目录 | 用途 |
-|---|---|
-| `data/` | 数据集（GazeHub 格式，gitignore 忽略） |
-| `checkpoints/` | 模型权重（gitignore 忽略） |
-| `log/` | 训练日志 |
-| `assets/` | 推理检测模型（需提交） |
-| `experiments/` | 多实验 / 多模型结果 |
-| `docs/` | 项目文档 |
-
----
+- `--loss mse_angle` 的角度项以"度"为单位，与归一化 MSE（~1e-4）不同量级；如需两者同量级请设 `--angle-weight 0.01~0.05`。
+- 部分分析脚本（`scripts/analysis/`）是一次性实验代码，接口未做稳定化承诺。
 
 ## License
 

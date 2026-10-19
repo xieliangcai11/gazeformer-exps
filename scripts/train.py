@@ -30,7 +30,9 @@
 """
 
 import argparse
+import json
 import os
+import random
 import sys
 from math import ceil
 from pathlib import Path
@@ -71,9 +73,12 @@ from gazelab.datasets import (RGBDGazeDataset, GazeCaptureDataset,
                               rgb_preprocess)
 from gazelab.datasets.table_index import TableIndex
 from configs.gazecapture_config import GAZECAPTURE_INDEX_DIR
-from gazelab.models.rgbdgaze import RGBDGazeDINOv2, load_state_dict_any_res
+from gazelab.models.dinov2_gaze import RGBDGazeDINOv2, load_state_dict_any_res
 
 PI = 3.141592653589793
+#: 「1 厘米 @ 视距」对应的视角（度）——此前到处硬编码 1.91°，改动
+#: VIEWING_DISTANCE_CM 时不会跟随（2026-10-15 审计）。指标键名保持不变以免破坏下游解析。
+ANG_1CM_DEG = float(np.degrees(np.arctan(1.0 / VIEWING_DISTANCE_CM)))
 
 
 class Subset(torch.utils.data.Dataset):
@@ -88,6 +93,19 @@ class Subset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         return self.base[self.idces[i]]
+
+    def set_epoch(self, epoch):
+        """把 epoch 透传给基础数据集（增强的逐样本种子含 epoch，见数据集 set_epoch）。"""
+        if hasattr(self.base, "set_epoch"):
+            self.base.set_epoch(epoch)
+
+    def set_aug_seed(self, seed):
+        if hasattr(self.base, "set_aug_seed"):
+            self.base.set_aug_seed(seed)
+
+    def aug_summary(self):
+        """基础数据集**实际生效**的增强参数（供日志如实记录）。"""
+        return self.base.aug_summary() if hasattr(self.base, "aug_summary") else {}
 
     @property
     def cm_px(self):
@@ -105,14 +123,17 @@ DATASET_SPECS = {
                      supports_orient=True,
                      kwargs=dict(color_transform=rgb_preprocess)),
     "gazecapture": dict(cls=GazeCaptureDataset, path_col="frame_path",
-                        default_index=GAZECAPTURE_INDEX_DIR, kwargs={}),
+                        default_index=GAZECAPTURE_INDEX_DIR, supports_eye=True,
+                        kwargs={}),
 }
 
 
 def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
                      augment=False, resolution=None, distributed=False,
                      geom_randomize=None, eye_crops=False, orient="raw",
-                     eye_scale=0.0):
+                     eye_scale=0.0, aug_shift=None, aug_scale=None,
+                     aug_rotate=None, seed=None, drop_blink=False,
+                     blink_scores=None, blink_threshold=0.5):
     """构造 train/val/test 的 DataLoader。
 
     dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
@@ -128,6 +149,29 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
     list_txt = Path(index_dir) / f"{split}.txt"
     paths = [ln.strip() for ln in
              list_txt.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if drop_blink:
+        # 闭眼帧的"真值"语义无效（闭眼时不可能在看屏幕目标点），且官方发布数据集已按
+        # 论文口径剔除（"pruned the collected dataset by removing data points where
+        # the participants blinked"）⇒ 训练与评估都应剔除。分数文件由
+        # tools/data/rgbdgaze/build_blink_scores.py 生成（列：path,subject,blink）。
+        import csv as _csv
+        _bp = Path(blink_scores) if blink_scores else (Path(index_dir) / "blink_scores.csv")
+        if not _bp.is_file():
+            # 明确报错而不是静默放行：静默会让"我剔除了闭眼帧"变成假话
+            raise FileNotFoundError(
+                f"--drop-blink 需要闭眼分数文件：{_bp}\n"
+                f"  请先运行 tools/data/rgbdgaze/build_blink_scores.py 生成")
+        _sc = {}
+        with open(_bp, encoding="utf-8") as fh:
+            for r in _csv.DictReader(fh):
+                _sc[r["path"]] = float(r["blink"])
+        _before = len(paths)
+        _miss = sum(1 for p in paths if p not in _sc)
+        paths = [p for p in paths if _sc.get(p, 0.0) < float(blink_threshold)]
+        print(f"[blink] 剔除闭眼帧（{split}）：{_before} -> {len(paths)}"
+              f"（阈值 {blink_threshold}，缺分数 {_miss} 条按 0 计，来源 {_bp.name}）")
+        if not paths:
+            raise RuntimeError(f"剔除闭眼帧后 {split} 为空：阈值是否过大？（{blink_threshold}）")
     # 列式索引 + lookup：避免为每行构造临时 dict（125 万行 -> 瞬时 2.4GB 峰值）
     idx_table = TableIndex(index_csv)
     path_to_idx = idx_table.lookup(spec["path_col"])
@@ -150,14 +194,45 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
         if not spec.get("supports_orient"):
             raise ValueError(f"数据集 {dataset} 不支持 orient={orient!r}")
         kwargs["orient"] = orient
+    # 增强参数**必须**从这里传进数据集：此前 CLI 的 --aug-shift/--aug-scale/
+    # --aug-rotate 只被解析与打印（build_dataloader 没有对应参数），实际生效的是
+    # config 默认值 ⇒ 日志记录的是假配置（2026-10-15 审计 A1）。
+    for _k, _v in (("aug_shift", aug_shift), ("aug_scale", aug_scale),
+                   ("aug_rotate", aug_rotate)):
+        if _v is not None:
+            kwargs[_k] = float(_v)
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
                      geom_randomize=geom_randomize, **kwargs)
+    if seed is not None and hasattr(ds, "set_aug_seed"):
+        # 逐样本确定性增强种子：修掉 RandomState() 无播种导致的"同 seed 不可复现"
+        # （2026-10-15 审计 A2）
+        ds.set_aug_seed(seed)
     sub = Subset(ds, idx)
     # persistent_workers：worker 进程跨 epoch 复用，避免每个 epoch 重新
     # fork（125 万行索引的 fork 成本很高，且是 epoch 边界卡顿的来源）。
+    # 多进程下每个 worker 独立播种（torch/np/random 全局）。数据集内部对增强还用了
+    # 「逐样本确定性种子」，因此即使 worker 数/分片变化，同一 (seed, epoch, idx) 的
+    # 增强也完全相同（2026-10-15 审计 A2）。
+    def _worker_init(worker_id):
+        base = 0 if seed is None else int(seed)
+        s = (base + worker_id) % (2 ** 31 - 1)
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+
     common = dict(batch_size=batch_size, num_workers=num_workers,
                   pin_memory=False, prefetch_factor=2 if num_workers > 0 else None,
-                  persistent_workers=num_workers > 0)
+                  # persistent_workers=False：worker 每 epoch 重新 fork，主进程里的
+                  # dataset.set_epoch(epoch) 才会被 worker 看到。若复用 worker，
+                  # epoch 恒为 0 ⇒ 每轮增强完全相同（翻转/光度/几何抖动固定），
+                  # 多轮增强多样性实际不存在（2026-10 审查确认）。
+                  persistent_workers=False,
+                  worker_init_fn=_worker_init if num_workers > 0 else None)
+    if seed is not None:
+        # 让单卡的 shuffle 顺序也可复现（多卡走 sampler，见下）
+        gen = torch.Generator()
+        gen.manual_seed(int(seed))
+        common["generator"] = gen
     if distributed:
         # 每个 rank 只吃 1/world 的数据；shuffle 交给 sampler（DataLoader 的
         # shuffle 必须为 False）。每个 epoch 前要调 sampler.set_epoch(epoch)。
@@ -314,7 +389,7 @@ def summarize(fr, sel=None):
         ang_median=float(np.median(ang_all)),
         ang_top95_mean=top95_mean,
         ang_p95=float(np.percentile(ang_all, 95)),
-        ang_ratio_le_191=float((ang_all <= 1.91).mean() * 100),
+        ang_ratio_le_191=float((ang_all <= ANG_1CM_DEG).mean() * 100),
         count=cnt,
     )
 
@@ -413,13 +488,35 @@ def parse():
                    help="**每张卡**的批大小（torchrun 多卡时有效批 = 该值 x 卡数）")
     p.add_argument("--lr", type=float, default=1e-4,
                    help="学习率；多卡放大有效批后建议按 sqrt(有效批/24)x1e-4 起步")
+    p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
+                   help="学习率调度：none（历史默认）/ cosine（按 epochs 余弦衰减；"
+                        "针对'train 还在降、val 已平'的形态）")
+    p.add_argument("--backbone-lr-ratio", type=float, default=0.1,
+                   help="差分学习率时**骨干**的相对学习率（历史写死 0.1；新域可试 0.3）")
     p.add_argument("--seed", type=int, default=0, help="随机种子")
+    p.add_argument("--deterministic", action="store_true",
+                   help="强制确定性算法（cudnn.deterministic + use_deterministic_"
+                        "algorithms）。会让训练变慢，且部分算子可能直接报错 ⇒ "
+                        "默认关闭，只在需要逐位复现时开启")
     p.add_argument("--epochs", type=int, default=8)
+    p.add_argument("--drop-blink", action="store_true",
+                   help="剔除闭眼帧（训练与评估都剔）：这些帧的真值语义无效（闭眼时"
+                        "不可能在看屏幕目标点），官方发布数据集已按论文口径剔除，"
+                        "而我们此前没有 ⇒ 既污染训练又把测试数字压低")
+    p.add_argument("--blink-scores", default=None,
+                   help="闭眼分数文件（默认 <index_dir>/blink_scores.csv，由 "
+                        "tools/data/rgbdgaze/build_blink_scores.py 生成）")
+    p.add_argument("--blink-threshold", type=float, default=0.5,
+                   help="闭眼判定阈值（分数越大越像闭眼；建议先在标注子集上核对误检率）")
     p.add_argument("--device", default="auto")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--loss", choices=["mse", "mse_angle", "l1"], default="mse",
-                   help="mse=纯MSE；mse_angle=MSE+几何角度；"
+                   help="mse=纯MSE；mse_angle=MSE+angle_weight·几何角度；"
                         "l1=平均绝对误差（贴近验收口径的平均距离，预期减轻预测收缩）")
+    p.add_argument("--angle-weight", type=float, default=1.0,
+                   help="几何角度损失的权重。⚠ 该损失以**度**为单位（典型 1~10），"
+                        "而归一化坐标 MSE 约 1e-4 ⇒ 默认 1.0 时角度项会压倒 MSE。"
+                        "若想两者同量级，建议 0.01~0.05（2026-10 审查）。")
     p.add_argument("--geom", dest="use_geom", action="store_true", default=True,
                    help="注入屏幕几何 token（宽高比 + 物理尺寸，默认开）")
     p.add_argument("--no-geom", dest="use_geom", action="store_false",
@@ -430,7 +527,9 @@ def parse():
                         "仅在 --augment 下生效，显式传 0 可关闭（消融用）")
     p.add_argument("--use-eye", dest="use_eye", action="store_true",
                    help="加入眼部放大支流：人脸 + 左右眼各一张裁剪（共用 DINOv2 骨干）。"
-                        "眼框表由 tools/data/rgbdgaze/build_eye_boxes.py 生成")
+                        "两个数据集均支持；眼框表分别是 "
+                        "tools/data/rgbdgaze/build_eye_boxes.py 与 "
+                        "tools/data/gazecapture/build_eye_boxes_mp.py（置于索引目录）")
     p.add_argument("--eye-shuffle", dest="eye_shuffle", action="store_true",
                    help="【对照实验】把眼部裁剪沿 batch 维 roll 一拍：输入分布与算力"
                         "完全不变，只破坏 眼图↔当前帧 的对应。用于分离眼支流收益"
@@ -480,16 +579,47 @@ def main():
     preflight_gpu_check(rank, local_rank, is_dist)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if getattr(args, "deterministic", False):
+        # 逐位复现的额外开关（默认关闭：变慢且个别算子可能不支持）
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
     if args.index_dir is None:
         args.index_dir = str(DATASET_SPECS[args.dataset]["default_index"])
 
+    # --use-imu 需要真实的 IMU 列：RGBDGaze 索引没有 imu_x/y/z，数据集会静默返回
+    # 全零向量（等于训练一个常量 token，实验名却写着 *_imu）。
+    if args.use_imu:
+        _names = TableIndex(Path(args.index_dir) / "index.csv").fieldnames
+        if "imu_x" not in _names:
+            raise SystemExit(
+                f"--use-imu 需要索引含 imu_x/imu_y/imu_z；{args.index_dir}/index.csv 没有"
+                f"（RGBDGaze 索引即如此）⇒ 去掉该开关，或改用 --dataset gazecapture")
+
     if args.tag is None:
-        args.tag = (f"loss{args.loss}_unfreeze{args.unfreeze}"
-                    + ("_difflr" if args.diff_lr else "")
-                    + ("_imu" if args.use_imu else "")
-                    + ("_ema" if args.ema else "")
-                    + ("_aug" if args.augment else "")
-                    + (f"_res{args.resolution}" if args.resolution != 224 else ""))
+        # 把所有**会改变行为**的参数编进 tag：以前只有 loss/unfreeze/aug/res，
+        # 不同 geom/eye/seed/lr 的 run 会落到同一目录并静默覆盖 best.pt。
+        parts = [f"loss{args.loss}", f"u{args.unfreeze}",
+                 "geom" if args.use_geom else "nogeom"]
+        if args.geom_randomize is None:
+            parts.append("grdef")
+        elif args.geom_randomize > 0:
+            parts.append(f"gr{args.geom_randomize:g}")
+        parts.append(f"eye{args.eye_scale:g}" if args.use_eye else "noeye")
+        if args.use_imu:
+            parts.append("imu")
+        if args.diff_lr:
+            parts.append("difflr")
+        if args.ema:
+            parts.append("ema")
+        if args.augment:
+            parts.append("aug")
+        parts += [f"lr{args.lr:g}", f"bs{args.batch_size}", f"ep{args.epochs}",
+                  f"seed{args.seed}"]
+        if args.resolution != 224:
+            parts.append(f"res{args.resolution}")
+        args.tag = "_".join(parts)
     run_dirs = experiment_dirs(args.dataset, "ablation")
     save_dir = run_dirs["checkpoint"] / args.tag
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -540,7 +670,7 @@ def main():
                 continue
             (backbone_params if n.startswith("rgb.backbone") else other_params).append(p)
         optimizer = optim.Adam([
-            {"params": backbone_params, "lr": args.lr * 0.1},
+            {"params": backbone_params, "lr": args.lr * args.backbone_lr_ratio},
             {"params": other_params, "lr": args.lr},
         ])
     else:
@@ -550,26 +680,42 @@ def main():
 
     # geom_randomize 只在训练集上传：val/test 的 augment=False 会让数据集
     # 把它强制为 0，评估口径始终是真实几何。
+    _blink = dict(drop_blink=args.drop_blink, blink_scores=args.blink_scores,
+                  blink_threshold=args.blink_threshold)
+    # 余弦衰减（可选）：按 epochs 从 args.lr 衰减到 ~0。针对"train 还在降、val 已平"的形态。
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+             if args.lr_schedule == "cosine" else None)
+    if sched is not None:
+        write_log(f"[lr] 调度=cosine  T_max={args.epochs}  "
+                  f"骨干比例={args.backbone_lr_ratio}")
     train_dl = build_dataloader(args.dataset, "train", Path(args.index_dir),
                                 args.batch_size, True, args.num_workers,
                                 augment=args.augment, resolution=args.resolution,
                                 distributed=is_dist,
                                 geom_randomize=args.geom_randomize,
                                 eye_crops=args.use_eye,
-                                eye_scale=args.eye_scale)
+                                eye_scale=args.eye_scale,
+                                aug_shift=args.aug_shift,
+                                aug_scale=args.aug_scale,
+                                aug_rotate=args.aug_rotate,
+                                seed=args.seed, **_blink)
     val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
                               args.batch_size, False, args.num_workers,
                               augment=False, resolution=args.resolution,
                               eye_crops=args.use_eye,
-                              eye_scale=args.eye_scale)
+                              eye_scale=args.eye_scale,
+                              seed=args.seed, **_blink)
     test_dl = build_dataloader(args.dataset, "test", Path(args.index_dir),
                                args.batch_size, False, args.num_workers,
                                augment=False, resolution=args.resolution,
                                eye_crops=args.use_eye,
-                               eye_scale=args.eye_scale)
+                               eye_scale=args.eye_scale,
+                               seed=args.seed, **_blink)
 
     tr_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     eff_bs = args.batch_size * world
+    # **实际生效**的增强参数（来自数据集实例，而不是命令行）——修掉"日志记录未生效值"
+    _aug = train_dl.dataset.aug_summary() if hasattr(train_dl.dataset, "aug_summary") else {}
     header = (f"{'='*70}\n 消融实验 | {args.tag}\n"
               f" 数据集={args.dataset}  索引={args.index_dir}\n"
               f" loss={args.loss} geom={args.use_geom} "
@@ -578,7 +724,14 @@ def main():
               f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze} "
               f"eye={args.use_eye} "
               f"diff_lr={args.diff_lr} "
-              f"aug(shift/scale/rot)={args.aug_shift}/{args.aug_scale}/{args.aug_rotate}\n"
+              # 生效值（此前打印的是命令行值，可能并未传进数据集 ⇒ 假记录）
+              f"aug(shift/scale/rot)={_aug.get('shift', 0.0)}/"
+              f"{_aug.get('scale', 0.0)}/{_aug.get('rotate', 0.0)}"
+              f" aug_seed={_aug.get('aug_seed')} "
+              f"eye_scale={_aug.get('eye_scale', args.eye_scale)} "
+              f"orient={_aug.get('orient', 'raw')} "
+              f"eye_shuffle={bool(getattr(args, 'eye_shuffle', False))}"
+              f" deterministic={bool(getattr(args, 'deterministic', False))}\n"
               f" 训练集 {len(train_dl.dataset)}"
               # DDP 下 len(train_dl.dataset) 是**全集**（DistributedSampler 在
               # 迭代时才切分），不写清每卡份数会让人误判每轮步数
@@ -600,6 +753,23 @@ def main():
                  if is_dist else "")
               + f" 权重输出: {save_dir}\n 日志: {log_file}\n{'='*70}")
     write_log(header)
+    # ---- 配置落盘（侧车文件）：ckpt 是纯 state_dict，无法反查"这份权重是怎么训的"。
+    # 审计发现：朝向/eye_shuffle/eye_scale/生效增强 都不在任何持久产物里，
+    # 事后只能靠翻日志且日志曾记录未生效值。这里把全部配置写在 ckpt 旁边。----
+    if is_main:
+        try:
+            import subprocess
+            _git = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                  capture_output=True, text=True, cwd=str(_PROJECT_ROOT))
+            _git_hash = _git.stdout.strip() if _git.returncode == 0 else None
+        except Exception:
+            _git_hash = None
+        sidecar = dict(vars(args), effective_aug=_aug, git_commit=_git_hash,
+                       world_size=world, argv=sys.argv,
+                       log_file=str(log_file), ckpt_dir=str(save_dir))
+        with open(save_dir / "train_args.json", "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, ensure_ascii=False, indent=2, default=str)
+        write_log(f" 配置侧车: {save_dir / 'train_args.json'}")
 
     # 部分数据集（或小样本子集）可能没有 val 划分：此时不做验证、每轮覆盖保存
     # best.pt（最终停在末轮权重），并在日志里明确警告，避免静默行为。
@@ -612,6 +782,12 @@ def main():
             # DistributedSampler 需要每 epoch 变一次种子，否则各 rank 的
             # 分片顺序固定不变，等价于每轮喂同一批数据顺序。
             train_dl.sampler.set_epoch(epoch)
+        # 数据集也要知道 epoch：增强的逐样本种子含 epoch，
+        # 否则同一帧在每轮都会拿到完全相同的增强（多样性变差）。
+        if hasattr(train_dl.dataset, "set_epoch"):
+            train_dl.dataset.set_epoch(epoch)
+        if sched is not None and epoch > 0:
+            sched.step()          # 每 epoch 衰减一次（epoch 0 用初始 lr）
         model.train()
         run_loss = 0.0
         n_step = 0
@@ -634,7 +810,7 @@ def main():
                 scm = inp.screen_cm.to(device).float()
                 loss_ang = geometric_angular_loss(
                     pred, label, scm, VIEWING_DISTANCE_CM).mean()
-                loss = loss_coord + loss_ang
+                loss = loss_coord + args.angle_weight * loss_ang
             loss.backward()
             optimizer.step()
             if ema is not None:

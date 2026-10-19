@@ -108,17 +108,20 @@ def crop_face_square(img: np.ndarray, bbox_xywh, margin: float, size: int,
 
 
 def geom_vector(w_cm: float, h_cm: float) -> torch.Tensor:
-    """由物理屏幕尺寸(cm)构造几何 token 向量 [宽高比, log(宽), log(h)]。
+    """由物理屏幕尺寸(cm)构造几何 token 向量 [短/长, log(短边), log(长边)]。
 
-    注意：这里的"宽高比"是 **w_cm/h_cm（物理宽高比）**，不是 w_pt/h_pt（逻辑分辨率比）。
-    两者通常相差 1~5%（例如 RGBDGaze 的 iPhone12 Pro Max：物理比 0.4857 vs 点比 0.4622），
-    原因是该数据集自带的 iphone_spec.csv 用的是**机身尺寸**而非屏幕尺寸
-    （7.81x16.08cm 恰为机身 78.1x160.8mm；而它自己的 inch 列 6.68" 对应的是屏幕对角）。
-    这里统一取物理宽高比，是为了与"几何域随机化"生成的合成几何保持一致
-    （合成屏只有 cm、没有点数）。
+    **短边/长边语义**（2026-10 审查修正）：以前用 w_cm/h_cm，导致同一台设备横竖屏
+    得到 1.78 与 0.56 两种"宽高比"，而配置的合成范围 (0.40,0.58) 只覆盖竖屏 ⇒
+    63% 的横屏帧永远在分布之外。改为 short/long 后：
+      · 竖屏（RGBDGaze 全部）与原定义**完全一致**（short=w, long=h）⇒ 旧 ckpt 兼容；
+      · 横屏帧与竖屏帧落在同一语义空间，几何随机化可正常内插。
+
+    物理尺寸无法从人脸图推断（屏幕在正面摄像头画面里不可见），必须显式提供；
+    log 让 5~20cm 的跨度在数值上更均匀。
     """
+    short, long = (w_cm, h_cm) if w_cm <= h_cm else (h_cm, w_cm)
     return torch.tensor(
-        [w_cm / h_cm, math.log(w_cm), math.log(h_cm)], dtype=torch.float32)
+        [short / long, math.log(short), math.log(long)], dtype=torch.float32)
 
 
 def screen_geometry(screen_w: float, screen_h: float,
@@ -165,17 +168,46 @@ def randomize_screen_geometry(u: float, v: float, w_cm: float, h_cm: float, rng,
     物理标注是真实的，只有"假设的屏幕形状"是合成的，不属于编造数据。
 
     参数范围来自 configs（aspect_range / width_range / height_range）。
-    返回 (u', v', geom)；若合成点落到屏幕外、或多次抽样都没抽到合理的
-    (宽, 高) 组合，则返回 None，调用方应放弃本次随机化（用真实标签）。
+    返回 (u', v', geom, w', h')：后两项是**合成屏**的物理宽高（cm）。
+    调用方必须用它们替换 screen_cm —— 否则 _loss 的几何项会用"重投影后的标签 +
+    真实屏尺寸"算角度，物理上自相矛盾（2026-10 审查）。
+
+    若合成点落到屏幕外、或多次抽样都没抽到合理的 (宽, 高) 组合，则返回 None，
+    调用方应放弃本次随机化（用真实标签）。
     """
+    a_lo, a_hi = float(aspect_range[0]), float(aspect_range[1])
+    portrait = h_cm >= w_cm
+    need_w = 2.0 * abs(u - 0.5) * w_cm      # u 轴要求（w' 的下界）
+    need_h = 2.0 * abs(v - 0.5) * h_cm      # v 轴要求（h' 的下界）
+    short_lo, short_hi = float(width_range[0]), float(width_range[1])
+    long_lo = float(height_range[0])
+    long_hi = max(float(height_range[1]), short_hi / a_lo) * 2.5
+
     for _ in range(max_tries):
-        aspect = rng.uniform(*aspect_range)
-        w = rng.uniform(*width_range)
-        h = w / aspect
-        if not (height_range[0] <= h <= height_range[1]):
+        aspect = rng.uniform(a_lo, a_hi)        # aspect = 短边 / 长边
+        # 可行性：u/v 各自对应哪个物理边取决于横竖屏；先求短边下界，再放大一点取多样
+        if portrait:
+            s_min = max(short_lo, need_w, need_h * aspect)
+        else:
+            s_min = max(short_lo, need_h, need_w * aspect)
+        s = rng.uniform(s_min, max(short_hi, s_min * 1.2))
+        long = s / aspect
+        if not (long_lo <= long <= long_hi):
             continue
-        up = 0.5 + (u - 0.5) * (w_cm / w)
-        vp = 0.5 + (v - 0.5) * (h_cm / h)
+        w2, h2 = (s, long) if portrait else (long, s)
+        up = 0.5 + (u - 0.5) * (w_cm / w2)
+        vp = 0.5 + (v - 0.5) * (h_cm / h2)
         if 0.0 <= up <= 1.0 and 0.0 <= vp <= 1.0:
-            return up, vp, geom_vector(w, h)
+            return up, vp, geom_vector(w2, h2), float(w2), float(h2)
     return None
+
+
+def randomize_screen_geometry_frame(u, v, w_cm, h_cm, rng, aspect_range,
+                                    width_range, height_range):
+    """兼容入口：横竖屏语义已在 `randomize_screen_geometry` 内处理（不再交换轴）。
+
+    以前这里会对横屏帧交换 (u,v)/(w,h)，等于把"水平注视"当成"垂直注视"，坐标轴语义
+    被旋转 ✗；现在改为按短/长边分配合成尺寸，u 始终对应屏幕 x 方向 ✓。
+    """
+    return randomize_screen_geometry(u, v, w_cm, h_cm, rng,
+                                     aspect_range, width_range, height_range)

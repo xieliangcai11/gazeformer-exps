@@ -1,8 +1,7 @@
 # ---- 原始数据与预处理产物（体积大，不入版本库）----
-gaze360/
 /data/
-.tmp_meta/
 /datasets/
+.tmp_meta/
 
 # ---- Python ----
 __pycache__/
@@ -22,17 +21,20 @@ wheels/
 experiments/*.pt
 *.pt
 *.pth
+temp/
+*.bak
+*.bak_*
 
-# ---- 推理输出 ----
+# ---- 推理/可视化输出 ----
 *_gaze.png
+*_result.png
+
+# ---- 临时文件与会话导出 ----
+.tmp_*
+omp-session-*.html
 
 # ---- 环境/工具 ----
 .vscode/
 .idea/
 *.swp
 .DS_Store
-
-# ---- 文档（不入版本库）----
-docs/
-
-temp/

@@ -65,7 +65,7 @@ from gazelab.datasets import (  # noqa: E402
     GazeCaptureDataset, RGBDGazeDataset, rgb_preprocess,
 )
 from gazelab.datasets.common import randomize_screen_geometry  # noqa: E402
-from gazelab.models.rgbdgaze import RGBDGazeDINOv2, load_state_dict_any_res  # noqa: E402
+from gazelab.models.dinov2_gaze import RGBDGazeDINOv2, load_state_dict_any_res  # noqa: E402
 from scripts.train import Subset, predict_frames, summarize  # noqa: E402
 
 # 各数据集用来分组的列（都存在于对应 index.csv 中）
@@ -130,10 +130,25 @@ def protocol_indices(dataset: str, rows, index_dir: Path, protocol: str, holdout
     return train_idx, val_idx, test_idx
 
 
-def write_split(index_dir_out: Path, rows, dataset: str, splits, log):
-    """把 train/val/test 清单写到指定目录（每行一个路径）。"""
+def write_split(index_dir_out: Path, rows, dataset: str, splits, log, index_csv=None):
+    """把 train/val/test 清单写到指定目录，并复制 index.csv（及眼框表）。
+
+    只写 *txt 是不够的：`scripts/train.py --index-dir <新目录>` 会在同目录找
+    index.csv（开 --use-eye 还要 eye_boxes.npz），否则直接 FileNotFoundError。
+    """
+    import shutil
     path_col = "rgb_path" if dataset == "rgbdgaze" else "frame_path"
     index_dir_out.mkdir(parents=True, exist_ok=True)
+    if index_csv is not None:
+        src = Path(index_csv)
+        dst = index_dir_out / "index.csv"
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+            log(f"[split] 复制索引 -> {dst}")
+        eye = src.parent / "eye_boxes.npz"
+        if eye.is_file() and (index_dir_out / "eye_boxes.npz").resolve() != eye.resolve():
+            shutil.copy2(eye, index_dir_out / "eye_boxes.npz")
+            log(f"[split] 复制眼框表 -> {index_dir_out / 'eye_boxes.npz'}")
     for name, idx in zip(("train", "val", "test"), splits):
         with open(index_dir_out / f"{name}.txt", "w", encoding="utf-8") as f:
             for i in idx:
@@ -185,8 +200,16 @@ class GeomShiftDataset(Dataset):
             (self.height_cm - eps, self.height_cm + eps))
         if out is None:
             raise RuntimeError("合成屏不小于真实屏，不应出现越界；请检查尺寸选取")
-        u, v, geom = out
+        u, v, geom, w_syn, h_syn = out
         inp.geom = geom
+        # screen_cm 必须同步成"合成屏"的物理尺寸：predict_frames 用它把归一化误差
+        # 换算成 cm，而标签已按 W/W' 重投影到合成屏 ⇒ 不同步会让 cm 口径错配
+        # （2026-10-15 审计；现在直接取函数返回的合成尺寸，避免再次硬编码）。
+        _scm = torch.tensor([w_syn, h_syn], dtype=torch.float32)
+        try:
+            inp.screen_cm = _scm
+        except Exception:
+            inp["screen_cm"] = _scm
         return inp, torch.tensor([u, v], dtype=torch.float32)
 
 
@@ -282,7 +305,8 @@ def main():
     for n, idx in zip(names, splits):
         log(f"  划分 {n}: {len(idx)} 帧")
     if args.write_split:
-        write_split(Path(args.write_split), rows, args.dataset, splits, log)
+        write_split(Path(args.write_split), rows, args.dataset, splits, log,
+                    index_csv=index_dir / "index.csv")
 
     if not args.ckpt:
         log("未提供 --ckpt，仅完成划分/清单生成。")

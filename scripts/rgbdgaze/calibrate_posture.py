@@ -27,8 +27,8 @@ from datetime import datetime
 
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR
 from gazelab.datasets.rgbdgaze import RGBDGazeDataset, rgb_preprocess
-from gazelab.models.rgbdgaze.rgbdgaze_dinov2 import RGBDGazeDINOv2
-from gazelab.models.rgbdgaze.calibrator import extract_features
+from gazelab.models.dinov2_gaze.rgbdgaze_dinov2 import RGBDGazeDINOv2
+from gazelab.models.dinov2_gaze.calibrator import extract_features
 
 # use_geom 必须与 ckpt 一致：模型类默认 use_geom=True，而 g5_nodepth_448_aug 是
 # --no-geom 训的、不含 proj_geom，不显式关闭会在 load_state_dict 处直接报错。
@@ -46,7 +46,10 @@ dataset = RGBDGazeDataset(RGBDGaze_INDEX_DIR / 'index.csv',
                           color_transform=rgb_preprocess, image_size=448)
 
 ACTIVITIES = ('sitting', 'standing', 'walking', 'lying')
-sw_cm, sh_cm = 7.81, 16.08
+# 逐样本屏幕物理尺寸（cm）：以前写死 7.81x16.08（iPhone 12 Pro Max），
+# 但测试集 34% 的帧来自 iPhone XR / 12 / 12 Pro ⇒ 这些被试的 cm 误差被系统性放大。
+CM = [(float(r["screen_w"]) * float(r["cm_px_x"]),
+       float(r["screen_h"]) * float(r["cm_px_y"])) for r in rows]
 ALPHAS = [0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
 groups = defaultdict(list)
@@ -59,6 +62,7 @@ subject_frames = {s: sorted(v) for s, v in groups.items()}
 # Extract features
 print("Extracting features...")
 all_feats, all_preds, all_gts, all_acts, all_imu = {}, {}, {}, {}, {}
+_imu_missing_warned = False
 with torch.no_grad():
     for start in range(0, len(test_ids), 32):
         batch = test_ids[start:start + 32]
@@ -72,7 +76,15 @@ with torch.no_grad():
             geoms.append(inp.geom)
             all_gts[idx] = (gx, gy)
             all_acts[idx] = r["activity"]
-            all_imu[idx] = [float(r["imu_x"]), float(r["imu_y"]), float(r["imu_z"])]
+            try:
+                all_imu[idx] = [float(r["imu_x"]), float(r["imu_y"]),
+                                float(r["imu_z"])]
+            except (KeyError, ValueError):
+                # RGBDGaze 的索引没有 IMU 列（只有 GazeCapture 有）⇒ 策略 C 不可用
+                all_imu[idx] = [0.0, 0.0, 0.0]
+                if not _imu_missing_warned:
+                    print("  [warn] 索引缺少 imu_x/y/z ⇒ 策略 C（IMU）退化为零向量")
+                    _imu_missing_warned = True
         f = torch.stack(faces).to('cuda').float()
         g = torch.stack(geoms).to('cuda').float()
         feat = extract_features(model, f)
@@ -99,10 +111,10 @@ def run_calibration(ratio):
         r = RidgeCV(alphas=ALPHAS)
         r.fit(cf, co)
         corr = tp + r.predict(tf)
-        for c, g in zip(corr, tg):
-            total_A.append(np.hypot((c[0]-g[0])*sw_cm, (c[1]-g[1])*sh_cm))
-        for p, g in zip(tp, tg):
-            total_base.append(np.hypot((p[0]-g[0])*sw_cm, (p[1]-g[1])*sh_cm))
+        for c, g, i in zip(corr, tg, test):
+            total_A.append(np.hypot((c[0]-g[0])*CM[i][0], (c[1]-g[1])*CM[i][1]))
+        for p, g, i in zip(tp, tg, test):
+            total_base.append(np.hypot((p[0]-g[0])*CM[i][0], (p[1]-g[1])*CM[i][1]))
         total_n += len(test)
     results['A_global'] = np.mean(total_A)
     results['baseline'] = np.mean(total_base)
@@ -139,7 +151,8 @@ def run_calibration(ratio):
                 corr = pred_i + calibrators[act].predict(feat_i)
             else:
                 corr = pred_i
-            total_B.append(np.hypot((corr[0,0]-g_i[0,0])*sw_cm, (corr[0,1]-g_i[0,1])*sh_cm))
+            total_B.append(np.hypot((corr[0,0]-g_i[0,0])*CM[idx][0],
+                                    (corr[0,1]-g_i[0,1])*CM[idx][1]))
     results['B_per_posture'] = np.mean(total_B)
 
     # Strategy C: per-posture + IMU
@@ -178,7 +191,8 @@ def run_calibration(ratio):
             pred_i = all_preds[idx].reshape(1, -1)
             g_i = np.array([all_gts[idx]])
             corr = pred_i + calibrators[act].predict(feat_i)
-            total_C.append(np.hypot((corr[0,0]-g_i[0,0])*sw_cm, (corr[0,1]-g_i[0,1])*sh_cm))
+            total_C.append(np.hypot((corr[0,0]-g_i[0,0])*CM[idx][0],
+                                    (corr[0,1]-g_i[0,1])*CM[idx][1]))
     results['C_per_posture_imu'] = np.mean(total_C)
     return results
 
