@@ -1,17 +1,7 @@
-"""项目路径与输出目录约定（不依赖 CLIP / torch 之外的任何东西）。
+"""项目路径与输出目录约定（只依赖 torch，不触碰任何模型/数据集）。
 
-为什么单独成文件：原先这些定义在 configs/gaze360_config.py 里，而该模块在
-**导入时**就执行 `clip.load("ViT-B/32", device="cuda")`。于是任何只想拿
-`DEVICE` / `experiment_dirs` 的脚本（如 RGBDGaze / GazeCapture 的训练脚本）
-都会顺带：
-  1) 把 CLIP 权重加载到 **cuda:0**（此时还没执行 torch.cuda.set_device(local_rank)，
-     所以 DEVICE="cuda" 恒指 0 号卡）；
-  2) 在 torchrun 多卡下每个 rank 各加载一份 -> GPU0 上白占 N x ~300MB，
-     且 N 个进程并发读同一个 checkpoint 文件。
-把路径类定义搬到这里后，训练脚本不再触碰 CLIP。
-
-configs/gaze360_config.py 会 re-export 本模块的名字，保持既有调用
-（`from configs.gaze360_config import *`）不变。
+只放"路径 + 设备 + 输出目录"这类零副作用定义，供所有脚本共用；
+数据集超参放在 configs/<dataset>_config.py，模型权重路径放在各模型模块内。
 """
 
 from pathlib import Path
@@ -33,7 +23,7 @@ CHECKPOINTS_PATH = OUT_PATH / "checkpoints"
 LOGS_PATH = OUT_PATH / "logs"
 RUNS_PATH = OUT_PATH / "runs"
 
-#: 默认设备（与 configs/gaze360_config.py 中同名变量保持一致）
+#: 默认设备
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -41,7 +31,6 @@ def experiment_dirs(dataset: str, task: str) -> dict:
     """返回按数据集+任务分层的输出目录。
 
     规范：out/<dataset>/<task>/{logs, checkpoints, runs}
-      - out/gaze360/train/{logs, checkpoints, runs}
       - out/rgbdgaze/train/{logs, checkpoints, runs}
       - out/gazecapture/ablation/{logs, checkpoints, runs}
 

@@ -99,9 +99,17 @@ def main():
     log("=" * 78)
 
     # ---------- 前向一遍，拿逐帧预测 ----------
-    from gazelab.models.rgbdgaze import RGBDGazeDINOv2, load_state_dict_any_res
-    model = RGBDGazeDINOv2(img_size=args.resolution, use_geom=args.use_geom).to(device)
+    from gazelab.models.dinov2_gaze import RGBDGazeDINOv2, load_state_dict_any_res
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    # ---- 守卫（2026-10-15 审计 B6）----
+    # 本脚本只构造"无眼支流"模型。若 ckpt 带 proj_eye.*，继续跑会得到一个**静默
+    # 与主评估分叉**的数字（曾让分析与主表不一致）。这里直接失败并给出可行路径。
+    if any(".proj_eye." in k or k.startswith("proj_eye.") for k in state):
+        raise SystemExit(
+            f"{args.ckpt} 带眼支流权重（proj_eye.*），而本脚本按无眼支流建模 ⇒ "
+            f"结果会与主评估口径分叉。请改用 dump_predictions.py（支持 --use-eye/"
+            f"--eye-scale/--eye-shuffle）导出逐帧预测 CSV，再做后续分析。")
+    model = RGBDGazeDINOv2(img_size=args.resolution, use_geom=args.use_geom).to(device)
     # any_res：--ckpt 与 --resolution 独立指定，权重可能来自另一种分辨率
     miss, unexp, resampled = load_state_dict_any_res(model, state)
     if resampled is not None:

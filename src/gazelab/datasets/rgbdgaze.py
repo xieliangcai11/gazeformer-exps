@@ -40,7 +40,7 @@ from configs.rgbdgaze_config import (
 from gazelab.datasets.table_index import TableIndex
 from gazelab.datasets.common import (
     crop_face_square,
-    randomize_screen_geometry,
+    randomize_screen_geometry_frame,
     rgb_preprocess,  # noqa: F401  (re-export，供既有调用方使用)
     screen_geometry,
 )
@@ -112,7 +112,9 @@ class RGBDGazeDataset(Dataset):
         # 是多卡训练卡顿的主因。TableIndex 取值语义与 DictReader 完全一致。
         self.rows = TableIndex(self.index_csv)
 
-        self.color_transform = color_transform
+        # 默认与 GazeCapture 一致：ImageNet 归一化（显式传 None 会得到 [0,1] 未归一化
+        # 输入，与 DINOv2 预训练/微调约定不符，且 augment 下 torch.flip 会 TypeError）。
+        self.color_transform = color_transform if color_transform is not None else rgb_preprocess
 
         self.target_transform = (
             target_transform if target_transform is not None else _to_tensor_label
@@ -135,6 +137,10 @@ class RGBDGazeDataset(Dataset):
         if not augment:
             self.geom_randomize = 0.0
         self._rng = np.random.RandomState()
+        # 逐样本确定性增强种子（由 scripts/train.py 的 build_dataloader 注入）：
+        # None = 旧行为（RandomState() 用 OS 熵 ⇒ 同 --seed 两次训练增强不同 ✗）
+        self._seed = None
+        self.epoch = 0
         # 输入分辨率（None = 使用配置的 IMAGE_SIZE）
         self.image_size = int(image_size) if image_size else IMAGE_SIZE
 
@@ -155,14 +161,19 @@ class RGBDGazeDataset(Dataset):
         # 8 帧检测失败用同被试中位数兜底，filled 掩码备查）。
         self.eye_crops = bool(eye_crops)
         if self.eye_crops:
-            _npz = np.load(Path(self.index_csv).parent / "eye_boxes.npz")
-            # 直接是 jsonl（MediaPipe）的原图坐标：与裁剪所用帧一致，无需映射
-            self.eye_boxes = _npz["boxes"].astype(np.float32)
-            self.eye_filled = _npz["filled"]
-            if len(self.eye_boxes) != len(self.rows):
+            # 必须校验 idx == arange(N)：只比长度会在"索引重建但行数恰好相同"时
+            # 让眼框与帧逐行错位（训练照跑、指标静默失真）。
+            with np.load(Path(self.index_csv).parent / "eye_boxes.npz") as _z:
+                self.eye_boxes = _z["boxes"].astype(np.float32)
+                self.eye_filled = _z["filled"]
+                _idx = _z["idx"]
+            n = len(self.rows)
+            if len(self.eye_boxes) != n or not np.array_equal(_idx, np.arange(n)):
                 raise ValueError(
-                    f"eye_boxes.npz 行数 {len(self.eye_boxes)} 与索引 {len(self.rows)} "
-                    f"不一致，请重跑 tools/data/rgbdgaze/build_eye_boxes.py")
+                    f"eye_boxes.npz 与索引不对齐（npz {len(self.eye_boxes)} 行 / "
+                    f"索引 {n} 行 / idx 是否 0..N-1: "
+                    f"{len(_idx) == n and np.array_equal(_idx, np.arange(n))}）⇒ "
+                    f"请重跑 tools/data/rgbdgaze/build_eye_boxes.py")
 
         # 每样本的"像素 -> 厘米"换算系数（来自 index，用于把预测误差转成物理 cm）
         # 整列取出（float_column）而不是逐行建 dict：14 万行下后者是启动期主要开销，
@@ -181,6 +192,32 @@ class RGBDGazeDataset(Dataset):
 
     def __len__(self):
         return len(self.rows)
+
+    def set_aug_seed(self, seed):
+        """设定增强的逐样本确定性种子（None = 恢复旧的不播种行为）。
+
+        动机（2026-10-15 审计 A2）：此前 self._rng = RandomState() 用 OS 熵，
+        实测同一 --seed、同一配置两次构造时 10/10 样本增强不同（含翻转方向不同
+        ⇒ 标签被镜像）⇒ 训练不可复现、run 间差异无法归因。
+        """
+        self._seed = None if seed is None else int(seed)
+
+    def set_epoch(self, epoch):
+        """训练循环每轮调用：让同一 idx 在不同 epoch 拿到不同增强（保持多样性）。"""
+        self.epoch = int(epoch)
+
+    def aug_summary(self):
+        """**实际生效**的增强/几何参数（供日志如实记录）。
+
+        以前日志打印的是命令行参数值，而 build_dataloader 并未把它传下来 ⇒
+        日志记录的 shift/scale/rotate 与实际生效的 config 默认值不一致 ✗。
+        """
+        return dict(augment=bool(self.augment), shift=self.aug_shift,
+                    scale=self.aug_scale, rotate=self.aug_rotate,
+                    geom_randomize=self.geom_randomize,
+                    eye_crops=self.eye_crops, eye_scale=self.eye_scale,
+                    orient=self.orient, image_size=self.image_size,
+                    aug_seed=self._seed)
 
     def _make_face(self, rgb_path, bbox_xywh, idx, rngs):
         """读 RGB 整帧，裁出人脸（以及可选的左右眼放大裁剪）。
@@ -286,6 +323,11 @@ class RGBDGazeDataset(Dataset):
         return post(eye_l), post(eye_r)
 
     def __getitem__(self, idx):
+        if self._seed is not None:
+            # 逐样本确定性增强：同一 (seed, epoch, idx) ⇒ 完全相同的增强，
+            # 与 worker 数/分片顺序无关（2026-10-15 审计 A2 的修复）。
+            self._rng = np.random.RandomState(
+                (self._seed * 100003 + self.epoch * 7919 + int(idx)) % (2 ** 31 - 1))
         row = self.rows[idx]
         rgb_path = _resolve_data_path(row["rgb_path"])
         # bbox 放在 index 的附加列（preprocess 写入）
@@ -317,23 +359,26 @@ class RGBDGazeDataset(Dataset):
             if self.eye_crops:
                 eye_l, eye_r = self._augment_eyes(eye_l, eye_r, flip, gain, bias)
 
-        # 屏幕物理尺寸(cm) 与几何 token 输入
-        cm_px_x = float(row["cm_px_x"])
-        cm_px_y = float(row["cm_px_y"])
-        w_cm = float(row["screen_w"]) * cm_px_x
-        h_cm = float(row["screen_h"]) * cm_px_y
+        # 屏幕物理尺寸(cm) 与几何 token 输入（用构造期缓存的整列数组，缺列兜底才生效）
+        cm_px_x, cm_px_y = (float(v) for v in self.cm_px[idx])
+        sw_pt = float(self.screen_size[idx, 0])
+        sh_pt = float(self.screen_size[idx, 1])
+        w_cm = sw_pt * cm_px_x
+        h_cm = sh_pt * cm_px_y
         screen_cm = torch.tensor([w_cm, h_cm], dtype=torch.float32)
-        geom = screen_geometry(float(row["screen_w"]), float(row["screen_h"]),
-                               cm_px_x, cm_px_y)
+        geom = screen_geometry(sw_pt, sh_pt, cm_px_x, cm_px_y)
         # 几何域随机化（与 GazeCapture 同源，见 common.randomize_screen_geometry）
         if self.geom_randomize > 0.0 and self._rng.random() < self.geom_randomize:
-            out = randomize_screen_geometry(
+            out = randomize_screen_geometry_frame(
                 gx, gy, w_cm, h_cm, self._rng,
                 aspect_range=GEOM_RAND_ASPECT,
                 width_range=GEOM_RAND_WIDTH_CM,
                 height_range=GEOM_RAND_HEIGHT_CM)
             if out is not None:
-                gx, gy, geom = out
+                # 标签已重投影到合成屏 ⇒ screen_cm 必须同步替换，
+                # 否则角度损失/ cm 指标用真实屏尺寸算，口径错配。
+                gx, gy, geom, w_cm, h_cm = out
+                screen_cm = torch.tensor([w_cm, h_cm], dtype=torch.float32)
 
         label = np.array([gx, gy], dtype=np.float32)
 

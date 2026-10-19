@@ -151,6 +151,16 @@ def main():
         raise SystemExit(f"坐标一致性未通过（{med:.4f} > {args.max_center_dist}），"
                          f"不要使用该表。")
 
+    # ---------- 4) 越界统计（知情用：越界样本裁剪时按边界截断、随后 resize ⇒ 会被拉伸）----------
+    for name, k in (("左眼", 0), ("右眼", 4)):
+        s = np.maximum(boxes[:, k + 2], boxes[:, k + 3])
+        xx = boxes[:, k] + boxes[:, k + 2] / 2
+        yy = boxes[:, k + 1] + boxes[:, k + 3] / 2
+        oob = (((xx - s / 2) < 0) | ((xx + s / 2) > W0)
+               | ((yy - s / 2) < 0) | ((yy + s / 2) > H0))
+        print(f"  {name}: 裁框出界 {oob.mean() * 100:.3f}%（这些样本会被截断+拉伸，"
+              f"放大倍数与其它样本不一致）")
+
     np.savez_compressed(args.out, idx=np.arange(N, dtype=np.int64),
                         boxes=boxes, filled=filled)
     print(f"已写出 {args.out}（{N} 帧，{Path(args.out).stat().st_size / 1e6:.1f} MB，"

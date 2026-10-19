@@ -33,6 +33,9 @@ import numpy as np
 #: 字符串列取值数不超过该阈值时改用编码存储（设备名/活动/split 等只有几十个取值）
 CODE_MAX_UNIQUE = 256
 
+#: 进程内索引缓存：键 = (绝对路径, mtime_ns, size, code_max_unique)
+_CACHE: dict = {}
+
 
 class TableIndex:
     """列式 CSV 索引，接口与 list[dict] 兼容（取值一律为 str）。
@@ -44,6 +47,17 @@ class TableIndex:
     def __init__(self, path, code_max_unique: int = CODE_MAX_UNIQUE):
         path = Path(path)
         self.path = path
+        # 同一进程内按 (路径, mtime, size) 缓存：train.py 为 train/val/test 各建
+        # 一个 loader，每个 loader 都 TableIndex(...) 一次 ⇒ 同一份索引被解析 2N 次
+        # （8 卡 × 3 loader = 24 遍全表扫描）。缓存后只解析一次、各 loader 共享数组。
+        try:
+            _st = path.stat()
+            key = (str(path.resolve()), _st.st_mtime_ns, _st.st_size, int(code_max_unique))
+        except OSError:
+            key = None
+        if key is not None and key in _CACHE:
+            self.__dict__.update(_CACHE[key])
+            return
 
         # ---- 第一遍：只统计 ----
         with open(path, encoding="utf-8", newline="") as f:
@@ -103,6 +117,8 @@ class TableIndex:
                 self._data[name] = ("code", bufs[j], tuple(sorted(uniques[j])))
             else:
                 self._data[name] = ("bytes", bufs[j])
+        if key is not None:
+            _CACHE[key] = dict(self.__dict__)
 
     # ---- 与 list[dict] 兼容的接口 ----
     @property

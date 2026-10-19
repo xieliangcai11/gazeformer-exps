@@ -54,11 +54,21 @@ _PROJECT_ROOT = _bootstrap()
 
 from configs.paths import DEVICE as DEFAULT_DEVICE, experiment_dirs  # noqa: E402
 from scripts.train import DATASET_SPECS, Subset, predict_frames  # noqa: E402
-from gazelab.models.rgbdgaze import load_state_dict_any_res  # noqa: E402
+from gazelab.models.dinov2_gaze import load_state_dict_any_res  # noqa: E402
 
 
 def load_ckpt(model, ckpt, log):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    # ---- 守卫（2026-10-15 审计 B6）----
+    # ckpt 带眼支流权重、而模型没建眼支流时，这里会**静默**给出与主评估分叉的数字
+    # （曾导致分析结论与主表不一致）。宁可失败，也不要一个"看起来对"的错数字。
+    _st_eye = any(".proj_eye." in k or k.startswith("proj_eye.") for k in state)
+    _mdl_eye = any(k.startswith("proj_eye.") for k in model.state_dict())
+    if _st_eye and not _mdl_eye:
+        raise SystemExit(
+            f"{ckpt} 带眼支流权重（proj_eye.*），但本脚本按无眼支流建模 ⇒ "
+            f"结果会与主评估口径分叉。请改用 dump_predictions.py（支持 --use-eye/"
+            f"--eye-scale/--eye-shuffle）导出逐帧预测 CSV，再做后续分析。")
     # any_res：--ckpt 与 --resolution 是独立指定的，权重可能来自另一种分辨率
     # （如 224 预训练 -> 448 分析），此时 pos_embed 形状不一致需先插值。
     missing, unexpected, resampled = load_state_dict_any_res(model, state)
@@ -104,7 +114,7 @@ def main():
     log("=" * 78)
 
     # ---- 模型与数据 ----
-    from gazelab.models.rgbdgaze import RGBDGazeDINOv2
+    from gazelab.models.dinov2_gaze import RGBDGazeDINOv2
     model = RGBDGazeDINOv2(img_size=args.resolution, use_geom=args.use_geom).to(device)
     load_ckpt(model, args.ckpt, log)
     model.eval()

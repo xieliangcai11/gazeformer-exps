@@ -168,9 +168,9 @@ def write_splits(samples, index_dir: Path, mode: str, ratios=(0.8, 0.1, 0.1)):
     """写 train/val/test 清单。
 
     mode:
-      sample    按样本随机（忽略被试）
-      subject   按被试 8:1:1
-      activity  按前3活动训练、最后1活动测试
+      sample    按样本随机（忽略被试）——**仅用于快速冒烟**，会跨被试泄漏
+      subject   按被试 8:1:1（默认）
+      activity  活动留出：两个活动训练 / 一个验证 / 一个测试（4 个活动各占一份）
     """
     import random
     rng = random.Random(0)
@@ -196,12 +196,27 @@ def write_splits(samples, index_dir: Path, mode: str, ratios=(0.8, 0.1, 0.1)):
         val = [s for s in samples if s["subject"] in subj_va]
         test = [s for s in samples if s["subject"] in subj_te]
     elif mode == "activity":
-        acts = ACTIVITIES
-        train = [s for s in samples if s["activity"] in acts[:3]]
-        val = [s for s in samples if s["activity"] in acts[3:4]]
-        test = [s for s in samples if s["activity"] in acts[4:]]
+        # 四个活动各占一份：2 训练 / 1 验证 / 1 测试。
+        # 以前 val=acts[3:4]、test=acts[4:] ⇒ test 恒为空（ACTIVITIES 只有 4 项）。
+        acts = list(ACTIVITIES)
+        if len(acts) < 3:
+            raise ValueError(f"activity 划分至少需要 3 个活动，当前 {acts}")
+        train = [s for s in samples if s["activity"] in acts[:-2]]
+        val = [s for s in samples if s["activity"] in acts[-2:-1]]
+        test = [s for s in samples if s["activity"] in acts[-1:]]
     else:
         raise ValueError(mode)
+
+    for name, part in (("train", train), ("val", val), ("test", test)):
+        if not part:
+            raise RuntimeError(f"划分 {name} 为空（mode={mode}）——拒绝写出空清单")
+    if mode == "subject":
+        _sets = {n: {s["subject"] for s in p} for n, p in
+                 (("train", train), ("val", val), ("test", test))}
+        leak = ((_sets["train"] & _sets["val"]) | (_sets["train"] & _sets["test"])
+                | (_sets["val"] & _sets["test"]))
+        if leak:
+            raise RuntimeError(f"按被试划分仍出现共享被试：{sorted(leak)[:5]}")
 
     index_dir.mkdir(parents=True, exist_ok=True)
     for name, part in [("train", train), ("val", val), ("test", test)]:
@@ -214,9 +229,10 @@ def write_splits(samples, index_dir: Path, mode: str, ratios=(0.8, 0.1, 0.1)):
 def main():
     p = argparse.ArgumentParser(description="RGBDGaze 预处理（建索引 + 划分）")
     p.add_argument("--index-dir", default=str(RGBDGaze_INDEX_DIR))
-    p.add_argument("--split", default="sample",
+    p.add_argument("--split", default="subject",
                    choices=["sample", "subject", "activity"],
-                   help="划分方式：sample随机 / subject按键验 / activity按活动")
+                   help="划分方式：subject按被试（默认，推荐）/ activity按活动留出 / "
+                        "sample按帧随机（**仅冒烟用**，会跨被试泄漏）")
     p.add_argument("--no-split", action="store_true",
                    help="只建索引，不写划分清单")
     args = p.parse_args()

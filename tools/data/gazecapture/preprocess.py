@@ -35,6 +35,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sys
 import tarfile
@@ -276,10 +277,13 @@ def _nearest_gravity(idx, dot_num, t, tol=0.05):
     return best[1] if abs(best[0] - t) <= tol else None
 
 
-def discover_samples(raw_root: Path, device_spec, log, subjects=None):
+def discover_samples(raw_root: Path, device_spec, log, subjects=None,
+                     keep_nan_cm: bool = False):
     """扫描 raw_root 下每个被试目录，返回 (样本列表, 统计 Counter)。
 
     subjects: 仅处理这些被试 ID（用于小样本自测）；None 表示全部。
+    keep_nan_cm: 设备不在规格表时 cm_px 为 NaN。默认**丢弃该帧**（NaN 会污染
+       角度损失与 cm 指标）；True 则保留并在索引里写 NaN（需自行处理）。
     统计量在"整段丢弃"过滤之后统一重算，保证与返回的样本严格一致。
     """
     if not raw_root.is_dir():
@@ -356,8 +360,12 @@ def discover_samples(raw_root: Path, device_spec, log, subjects=None):
             # 每帧的屏幕点数决定「显示缩放」与否 => 每点厘米须按帧选取
             sw, sh = float(screen["W"][j]), float(screen["H"][j])
             cpx, cpy = cm_per_point(device_spec, device, sw, sh)
-            if math.isnan(cpx):
+            if math.isnan(cpx) or math.isnan(cpy):
                 drops["cm_scale_unmatched"] += 1
+                if not keep_nan_cm:
+                    # NaN 会传播到 screen_cm → 角度损失/厘米指标整批变 NaN
+                    drops["drop_nan_cm"] += 1
+                    continue
             g = _nearest_gravity(gindex, dot["DotNum"][j], float(dot["Time"][j]))
             if g is None:
                 drops["imu_missing"] += 1
@@ -411,10 +419,11 @@ def discover_samples(raw_root: Path, device_spec, log, subjects=None):
 # 写出
 # --------------------------------------------------------------------------
 def write_index(samples, index_dir: Path, log) -> Path:
-    """写统一索引 CSV（列集合见 INDEX_FIELDS）。"""
+    """写统一索引 CSV（列集合见 INDEX_FIELDS）。先写 .tmp 再原子替换。"""
     index_dir.mkdir(parents=True, exist_ok=True)
     out = index_dir / "index.csv"
-    with open(out, "w", encoding="utf-8", newline="") as f:
+    tmp = out.with_name(out.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(INDEX_FIELDS)
         for s in samples:
@@ -429,6 +438,7 @@ def write_index(samples, index_dir: Path, log) -> Path:
                 s["subject"], s["orientation"], s["split"],
                 gx, gy, gw, gh, s["dot_num"], s["frame_index"],
             ])
+    os.replace(tmp, out)
     log(f"[index] 写入 {len(samples)} 样本 x {len(INDEX_FIELDS)} 列 -> {out}")
     return out
 
@@ -438,9 +448,12 @@ def write_splits(samples, index_dir: Path, log) -> None:
     index_dir.mkdir(parents=True, exist_ok=True)
     for name in SPLITS:
         part = [s for s in samples if s["split"] == name]
-        with open(index_dir / f"{name}.txt", "w", encoding="utf-8") as f:
+        out = index_dir / f"{name}.txt"
+        tmp = out.with_name(out.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             for s in part:
                 f.write(s["frame_path"] + "\n")
+        os.replace(tmp, out)
         n_sub = len({s["subject"] for s in part})
         log(f"[split] {name}: {len(part)} 帧 / {n_sub} 名被试 -> {index_dir / (name + '.txt')}")
 
@@ -497,7 +510,12 @@ def main():
                    help="只扫描已解压目录，不碰归档（默认行为）")
     p.add_argument("--subjects", default=None,
                    help="仅处理这些被试 ID，逗号分隔（小样本自测 / 分批解压用）；"
-                        "同时作用于 --extract 的解压范围")
+                        "同时作用于 --extract 的解压范围。默认写入独立的 subset/ 子目录，"
+                        "避免覆盖全量索引（除非显式 --allow-partial-index）")
+    p.add_argument("--allow-partial-index", action="store_true",
+                   help="允许 --subjects 的结果直接写入 --index-dir（会覆盖全量索引，慎用）")
+    p.add_argument("--keep-nan-cm", action="store_true",
+                   help="设备不在屏幕规格表的帧也保留（cm_px=NaN，会污染角度/厘米指标）")
     p.add_argument("--log-file", default=None,
                    help="日志文件路径；默认写到 out/gazecapture/preprocess/logs/")
     args = p.parse_args()
@@ -520,6 +538,12 @@ def main():
     if args.subjects:
         subjects = [s.strip() for s in args.subjects.split(",") if s.strip()]
         log(f"限定被试: {subjects}")
+        if not args.allow_partial_index:
+            # 关键防护：--subjects 只扫子集，若直接写 --index-dir 会把全量索引覆盖成
+            # 十几行，已生成的 eye_boxes.npz 行号随即全部错位。
+            args.index_dir = str(Path(args.index_dir) / "subset")
+            log(f"[保护] 子集模式写入独立目录: {args.index_dir}"
+                f"（如需覆盖主索引请加 --allow-partial-index）")
 
     # 1) 可选解压
     if args.extract:
@@ -539,7 +563,8 @@ def main():
     log.banner(f"步骤 3/4：扫描被试元数据 <- {raw_root}")
     log("坐标系结论：图像与标签在所有 orientation 下天然对齐，不做任何旋转"
         "（依据见脚本头部说明）")
-    samples, stats = discover_samples(raw_root, device_spec, log, subjects=subjects)
+    samples, stats = discover_samples(raw_root, device_spec, log, subjects=subjects,
+                                      keep_nan_cm=args.keep_nan_cm)
 
     # 4) 写出
     log.banner("步骤 4/4：写索引 / 划分 / 摘要")
