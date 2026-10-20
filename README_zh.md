@@ -80,8 +80,8 @@ python -m tools.data.gazecapture.build_eye_boxes_mp --shard 0 --nshards 8   # �
 python -m tools.data.gazecapture.build_eye_boxes_mp --merge \
     data/GazeCapture/index/eye_boxes_shard*.npz --out data/GazeCapture/index/eye_boxes.npz
 python -m tools.data.gazecapture.check_shards --nshards 8        # 完整性体检
-python -m tools.data.gazecapture.fix_eye_boxes --dry-run         # 退化框统计
-python -m tools.data.gazecapture.fix_eye_boxes                    # 同被试中位兜底 + filled 标记
+python -m tools.data.gazecapture.refine_eye_boxes --shard 0 --nshards 4   # 退化帧放大重检
+python -m tools.data.gazecapture.refine_eye_boxes --merge                 # 合并；仍失败者 filled=True
 ```
 
 ### 数据验证
@@ -131,7 +131,7 @@ python -m scripts.cross_eval --ckpt out/gazecapture/ablation/checkpoints/gc_run1
 - **坐标**：标签为屏幕像素点，数据集内归一化到 `[0,1]`；眼框为 `(x,y,w,h)` 原图坐标。
 - **几何 token**：`[短边/长边, log(短边cm), log(长边cm)]`（横竖屏同一语义）；`--geom-randomize` 把标签与几何一起重投影到合成屏，并把 `screen_cm` 同步替换；尺寸按标签可行性反推，生效率≈100%。
 - **增强可复现**：逐样本种子 `(aug_seed, epoch, idx)`，与 worker 数无关；DataLoader 每 epoch 重建 worker（`persistent_workers=False`），保证 `set_epoch` 生效。
-- **眼框质量**：MediaPipe 在侧脸/遮挡下会产生退化框（<8px，实测约 1.8%）。`fix_eye_boxes` 用**同被试中位框**替换并置 `filled=True`；**不做镜像**（镜像会把瞳孔水平翻转）。
+- **眼框质量**：MediaPipe 在侧脸/遮挡下会产生退化框（<8px，实测约 1.8%）。**不要用中位框兜底**（实测会落到额头/头发上，相对人脸框的中位偏移也不稳，IoU 中位仅 0.16）；正确做法是 `refine_eye_boxes` 对退化帧**放大 2×/3× 重检**（实测 96% 可恢复），仍失败的置 `filled=True` 并由数据集丢弃；**不做镜像**（镜像会把瞳孔水平翻转）。
 
 ---
 

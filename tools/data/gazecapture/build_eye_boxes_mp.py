@@ -71,6 +71,35 @@ def _save_npz(p: Path, idx, boxes, filled):
     os.replace(tmp, p)
 
 
+def _is_degenerate(le, re_, face, min_px: float, min_area_ratio: float) -> bool:
+    """眼框算退化：短边过小，或面积占人脸框比例过小。"""
+    w, h, wr, hr = float(le[2]), float(le[3]), float(re_[2]), float(re_[3])
+    if min(w, h, wr, hr) < min_px or w <= 0 or h <= 0 or wr <= 0 or hr <= 0:
+        return True
+    fa = max(float(face[2]) * float(face[3]), 1e-9)
+    return (w * h) / fa < min_area_ratio or (wr * hr) / fa < min_area_ratio
+
+
+def _detect(img, lm, scales, min_px: float, min_area_ratio: float):
+    """检测；若退化且给了重试尺度，则放大重试（坐标已除回原尺度）。"""
+    face, le, re_, partial = detect_mp(img, lm)
+    if face is None:
+        return face, le, re_, partial
+    if scales and _is_degenerate(le, re_, face, min_px, min_area_ratio):
+        h0, w0 = img.shape[:2]
+        for s in scales:
+            up = cv2.resize(img, (int(w0 * s), int(h0 * s)),
+                            interpolation=cv2.INTER_CUBIC)
+            f2, l2, r2, p2 = detect_mp(up, lm)
+            if f2 is None:
+                continue
+            cand = ((l2[0] / s, l2[1] / s, l2[2] / s, l2[3] / s),
+                    (r2[0] / s, r2[1] / s, r2[2] / s, r2[3] / s))
+            if not _is_degenerate(cand[0], cand[1], face, min_px, min_area_ratio):
+                return face, cand[0], cand[1], p2
+    return face, le, re_, partial
+
+
 def _row_count(index: Path) -> int:
     """索引行数（不含表头）。用 sidecar 缓存，避免每个分片都重扫 400MB 索引。"""
     side = index.with_name(index.name + ".rows")
@@ -101,6 +130,13 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 行（调试）")
     ap.add_argument("--merge", nargs="*", default=None,
                     help="合并模式：把给定 npz 合并到 --out ✓（不再检测）")
+    ap.add_argument("--min-px", type=float, default=8.0,
+                    help="眼框短边小于该值判为退化（filled=True，训练时剔除）")
+    ap.add_argument("--min-area-ratio", type=float, default=0.003,
+                    help="眼框面积/人脸框面积 小于该值判为退化")
+    ap.add_argument("--retry-scales", type=float, nargs="*", default=None,
+                    help="退化帧的放大重试尺度（如 2.0；默认不重试。实测多数退化=闭眼，"
+                         "重试收益很小）")
     args = ap.parse_args()
 
     if args.out is None:
@@ -155,11 +191,13 @@ def main():
         if img is None:
             le = re = (0, 0, 1, 1); filled = True
         else:
-            face, le, re, partial = detect_mp(img, lm)
+            face, le, re, partial = _detect(img, lm, args.retry_scales,
+                                            args.min_px, args.min_area_ratio)
             if face is None:
                 le = re = (0, 0, 1, 1); filled = True
             else:
-                filled = bool(partial)
+                filled = bool(partial) or _is_degenerate(
+                    le, re, face, args.min_px, args.min_area_ratio)
         b = [*le, *re]
         new_idx.append(i); new_box.append(b); new_fill.append(filled)
         processed += 1

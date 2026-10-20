@@ -203,6 +203,18 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
             kwargs[_k] = float(_v)
     ds = spec["cls"](index_csv, augment=augment, image_size=resolution,
                      geom_randomize=geom_randomize, **kwargs)
+    if eye_crops:
+        # filled=True 的行是"眼框不可用"（MediaPipe 退化且放大重检也救不回，
+        # 实测 1.81%）。决不编造框：直接从该 split 中剔除（三个 split 同规则）。
+        _filled = getattr(ds, "eye_filled", None)
+        if _filled is not None:
+            _keep = [i for i in idx if not bool(_filled[i])]
+            if len(_keep) < len(idx):
+                print(f"[eye] 丢弃眼框不可用帧（{split}）：{len(idx)} -> {len(_keep)} "
+                      f"（filled 掩码）")
+            idx = _keep
+            if not idx:
+                raise RuntimeError(f"{split} 在剔除 filled 眼框后为空")
     if seed is not None and hasattr(ds, "set_aug_seed"):
         # 逐样本确定性增强种子：修掉 RandomState() 无播种导致的"同 seed 不可复现"
         # （2026-10-15 审计 A2）
@@ -482,6 +494,8 @@ def parse():
                    help="rgbdgaze=域内训练/消融；gazecapture=大规模预训练")
     p.add_argument("--index-dir", default=None,
                    help="索引目录；默认按 --dataset 取各自 config 里的路径")
+    p.add_argument("--resume", default="auto",
+                   help="断点续训：auto=若 <tag>/last.pt 存在则续训；off=从头；或指定 last.pt 路径")
     p.add_argument("--init-ckpt", default=None,
                    help="从该权重起训（如 GazeCapture 预训练 -> RGBDGaze 微调）")
     p.add_argument("--batch-size", type=int, default=64,
@@ -542,8 +556,7 @@ def parse():
                    help="解冻 DINOv2 最后 N 个 block（0=全冻结）")
     p.add_argument("--diff-lr", action="store_true",
                    help="差分学习率：解冻的骨干用小lr(0.1x)，其余用 --lr")
-    p.add_argument("--use-imu", action="store_true",
-                   help="注入 IMU 姿态 token（需 index 含 imu 列）")
+    # （--use-imu 已移除：历史遗留，项目当前所有实验都不使用 IMU）
     p.add_argument("--ema", action="store_true",
                    help="使用 EMA 权重做验证与保存（decay=0.999）")
     p.add_argument("--augment", action="store_true",
@@ -588,14 +601,6 @@ def main():
     if args.index_dir is None:
         args.index_dir = str(DATASET_SPECS[args.dataset]["default_index"])
 
-    # --use-imu 需要真实的 IMU 列：RGBDGaze 索引没有 imu_x/y/z，数据集会静默返回
-    # 全零向量（等于训练一个常量 token，实验名却写着 *_imu）。
-    if args.use_imu:
-        _names = TableIndex(Path(args.index_dir) / "index.csv").fieldnames
-        if "imu_x" not in _names:
-            raise SystemExit(
-                f"--use-imu 需要索引含 imu_x/imu_y/imu_z；{args.index_dir}/index.csv 没有"
-                f"（RGBDGaze 索引即如此）⇒ 去掉该开关，或改用 --dataset gazecapture")
 
     if args.tag is None:
         # 把所有**会改变行为**的参数编进 tag：以前只有 loss/unfreeze/aug/res，
@@ -607,8 +612,6 @@ def main():
         elif args.geom_randomize > 0:
             parts.append(f"gr{args.geom_randomize:g}")
         parts.append(f"eye{args.eye_scale:g}" if args.use_eye else "noeye")
-        if args.use_imu:
-            parts.append("imu")
         if args.diff_lr:
             parts.append("difflr")
         if args.ema:
@@ -637,25 +640,45 @@ def main():
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
 
+    # ---- 断点续训：先确定路径（auto=有 last.pt 就续），再建模型 ----
+    resume_path = None
+    if args.resume == "auto":
+        _cand = save_dir / "last.pt"
+        if _cand.is_file():
+            resume_path = _cand
+    elif args.resume not in ("off", ""):
+        resume_path = Path(args.resume)
+    _resume = None
+    start_epoch, best_val = 0, float("inf")
+
     model = RGBDGazeDINOv2(
         unfreeze_last=args.unfreeze,
-        use_imu=args.use_imu,
         use_geom=args.use_geom,
         use_eye=args.use_eye,
         img_size=args.resolution,
     ).to(device)
-    if args.init_ckpt:
+
+    if resume_path is not None:
+        # last.pt：model + optimizer + scheduler + epoch + best_val（每轮末原子写入）
+        _resume = torch.load(resume_path, map_location="cpu", weights_only=False)
+        _m, _u, _r = load_state_dict_any_res(model, _resume["model"])
+        start_epoch = int(_resume.get("epoch", -1)) + 1
+        best_val = float(_resume.get("best_val", float("inf")))
+        write_log(f"[resume] {resume_path}：已完成 epoch {start_epoch - 1}"
+                  f"（best val {best_val:.3f}）⇒ 从 epoch {start_epoch} 继续")
+        if _m or _u:
+            write_log(f"[resume] 缺失键 {list(_m) or '无'} | 多余键 {list(_u) or '无'}")
+    elif args.init_ckpt:
         state = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         # 用 any_res 版加载：init-ckpt 是"跨运行复用"的权重（如 224 预训练 ->
         # 448 微调），pos_embed 形状常不一致，普通 load_state_dict 会直接崩。
         missing, unexpected, resampled = load_state_dict_any_res(model, state)
-        # 必须打印：缺 proj_geom 说明几何 token 是随机初始化的；
-        # 出现 unexpected 说明架构不匹配（如残留的 depth 分支）。
         write_log(f"[init] 从 {args.init_ckpt} 载入权重")
         if resampled is not None:
             cur = tuple(model.state_dict()["rgb.backbone.pos_embed"].shape)
             write_log(f"[init] pos_embed 分辨率不一致 {resampled} -> {cur}，已插值")
         write_log(f"[init] 缺失键 {list(missing) or '无'} | 多余键 {list(unexpected) or '无'}")
+
     # DDP：先加载 init-ckpt 再包装，保证权重加载路径不依赖 DDP 的 key 前缀
     raw_model = model
     if is_dist:
@@ -688,6 +711,13 @@ def main():
     if sched is not None:
         write_log(f"[lr] 调度=cosine  T_max={args.epochs}  "
                   f"骨干比例={args.backbone_lr_ratio}")
+    if _resume is not None:
+        if "optimizer" in _resume and _resume["optimizer"]:
+            optimizer.load_state_dict(_resume["optimizer"])
+            write_log("[resume] 优化器状态已恢复")
+        if sched is not None and _resume.get("scheduler"):
+            sched.load_state_dict(_resume["scheduler"])
+            write_log("[resume] 学习率调度状态已恢复")
     train_dl = build_dataloader(args.dataset, "train", Path(args.index_dir),
                                 args.batch_size, True, args.num_workers,
                                 augment=args.augment, resolution=args.resolution,
@@ -720,7 +750,6 @@ def main():
               f" 数据集={args.dataset}  索引={args.index_dir}\n"
               f" loss={args.loss} geom={args.use_geom} "
               f"geom_rand={train_dl.dataset.base.geom_randomize} "
-              f"imu={args.use_imu} "
               f"ema={args.ema} augment={args.augment} unfreeze={args.unfreeze} "
               f"eye={args.use_eye} "
               f"diff_lr={args.diff_lr} "
@@ -776,8 +805,8 @@ def main():
     has_val = len(val_dl.dataset) > 0
     if not has_val:
         write_log("[warn] 验证集为空，将不做验证、每轮覆盖 best.pt（末轮权重生效）")
-    best_val = float("inf")
-    for epoch in range(args.epochs):
+    # best_val 已在续训时从 last.pt 恢复
+    for epoch in range(start_epoch, args.epochs):
         if is_dist:
             # DistributedSampler 需要每 epoch 变一次种子，否则各 rank 的
             # 分片顺序固定不变，等价于每轮喂同一批数据顺序。
@@ -795,7 +824,7 @@ def main():
         for i, (inp, label) in enumerate(train_dl):
             face = inp.rgb.to(device).float()
             label = label.to(device)
-            imu = inp.imu.to(device).float() if args.use_imu else None
+            imu = None      # IMU 已废弃（历史遗留）
             geom = inp.geom.to(device).float() if args.use_geom else None
             optimizer.zero_grad()
             if args.use_eye:
@@ -849,6 +878,20 @@ def main():
             else:
                 torch.save(raw_model.state_dict(), ckpt)
             saved = f"  [保存 → {ckpt} ({mean_ang:.2f}°)]"
+        if is_main:
+            # 断点续训：每轮结束（best 更新之后）存 last.pt，原子替换。
+            # 存 model/optimizer/scheduler/epoch/best_val ⇒ 崩溃后最多丢 1 个 epoch。
+            _ck = {
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": sched.state_dict() if sched is not None else None,
+                "epoch": int(epoch),
+                "best_val": float(best_val),
+                "args": vars(args),
+            }
+            _tmp = save_dir / "last.pt.tmp"
+            torch.save(_ck, _tmp)
+            os.replace(_tmp, save_dir / "last.pt")
         if is_dist:
             dist.barrier()      # 等 rank0 评估+保存完再进下一轮
         if vres is None:

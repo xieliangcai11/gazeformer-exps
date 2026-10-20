@@ -49,8 +49,8 @@ python -m tools.data.gazecapture.build_eye_boxes_mp --shard 0 --nshards 8
 python -m tools.data.gazecapture.build_eye_boxes_mp --merge \
     data/GazeCapture/index/eye_boxes_shard*.npz --out data/GazeCapture/index/eye_boxes.npz
 python -m tools.data.gazecapture.check_shards --nshards 8
-python -m tools.data.gazecapture.fix_eye_boxes --dry-run     # degenerate-box stats
-python -m tools.data.gazecapture.fix_eye_boxes               # subject-median fallback
+python -m tools.data.gazecapture.refine_eye_boxes --shard 0 --nshards 4   # upscale re-detect
+python -m tools.data.gazecapture.refine_eye_boxes --merge                 # leftovers -> filled=True
 
 # validation
 python -m tools.data.gazecapture.verify
