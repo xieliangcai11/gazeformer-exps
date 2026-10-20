@@ -75,13 +75,15 @@ GROUP_COLUMNS = {
 }
 
 
-def build_dataset(dataset: str, index_dir: Path, image_size: int):
+def build_dataset(dataset: str, index_dir: Path, image_size: int,
+                  eye_crops: bool = False):
     """按数据集名构造基础数据集（评估用：不做任何增强）。"""
     index_csv = index_dir / "index.csv"
     if dataset == "rgbdgaze":
         return RGBDGazeDataset(index_csv, color_transform=rgb_preprocess,
-                               image_size=image_size)
-    return GazeCaptureDataset(index_csv=index_csv, image_size=image_size)
+                               image_size=image_size, eye_crops=eye_crops)
+    return GazeCaptureDataset(index_csv=index_csv, image_size=image_size,
+                              eye_crops=eye_crops)
 
 
 def protocol_indices(dataset: str, rows, index_dir: Path, protocol: str, holdout):
@@ -213,7 +215,8 @@ class GeomShiftDataset(Dataset):
         return inp, torch.tensor([u, v], dtype=torch.float32)
 
 
-def load_model(ckpt: Path, device, image_size: int, use_geom: bool = True):
+def load_model(ckpt: Path, device, image_size: int, use_geom: bool = True,
+               use_eye: bool = False):
     """加载 RGBDGazeDINOv2 权重。
 
     use_geom=False 用于评估"加入几何 token 之前"训练的老权重：老权重没有
@@ -225,7 +228,8 @@ def load_model(ckpt: Path, device, image_size: int, use_geom: bool = True):
     pos_embed 会自动插值到 image_size 对应的网格：被评估权重可能来自另一种
     分辨率的运行（如 224 预训练权重直接在 448 上做零样本评估）。
     """
-    model = RGBDGazeDINOv2(img_size=image_size, use_geom=use_geom).to(device)
+    model = RGBDGazeDINOv2(img_size=image_size, use_geom=use_geom,
+                           use_eye=use_eye).to(device)
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     missing, unexpected, resampled = load_state_dict_any_res(model, state)
     if resampled is not None:
@@ -270,6 +274,10 @@ def main():
                     help="把 train/val/test 清单写到该目录（供训练用）")
     ap.add_argument("--no-geom", dest="use_geom", action="store_false", default=True,
                     help="关闭屏幕几何 token（评估 P0 之前训练的老权重时必须加）")
+    ap.add_argument("--use-eye", dest="use_eye", action="store_true", default=None,
+                    help="权重含眼支流；默认从 ckpt 旁 train_args.json 读取")
+    ap.add_argument("--no-eye", dest="use_eye", action="store_false",
+                    help="权重不含眼支流")
     ap.add_argument("--geom-shift", nargs="*", type=float, default=None,
                     help="几何外推实验：把标签+几何重投影到给定宽高比(可多个)，"
                          "比较各 aspect 下的误差（需配合带几何 token 的权重）")
@@ -295,12 +303,34 @@ def main():
     log(f"索引={index_dir}  设备={device}  日志={log_file}")
     log("=" * 78)
 
-    ds = build_dataset(args.dataset, index_dir, args.image_size)
+    # geom/eye/imu 开关以 ckpt 侧车为准（否则结构性权重会被当不存在而静默丢弃）
+    if args.ckpt:
+        _side = Path(args.ckpt[0]).parent / "train_args.json"
+        _cfg = {}
+        if _side.is_file():
+            import json as _json
+            try:
+                _cfg = _json.loads(_side.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                _cfg = {}
+        if args.use_eye is None:
+            args.use_eye = bool(_cfg.get("use_eye", False))
+        log(f"[cfg] use_eye={args.use_eye} "
+            f"(来源: {_side.name if _side.is_file() else '命令行/默认'})")
+    args.use_eye = bool(args.use_eye)
+    ds = build_dataset(args.dataset, index_dir, args.image_size,
+                       eye_crops=args.use_eye)
     rows = ds.rows
     log(f"数据集 {len(rows)} 帧 / {len({r['subject'] for r in rows})} 被试 / "
         f"{len({r['device'] for r in rows})} 机型")
 
     splits = protocol_indices(args.dataset, rows, index_dir, args.protocol, args.holdout)
+    if args.use_eye:
+        # filled=True 的帧眼框不可用（闭眼/检测失败）⇒ 训练时已剔除，评估同规则
+        _filled = np.asarray(ds.eye_filled, bool)
+        _before = sum(len(x) for x in splits)
+        splits = tuple([i for i in x if not _filled[i]] for x in splits)
+        log(f"[eye] 剔除 filled 帧：{_before} -> {sum(len(x) for x in splits)}")
     names = ["train", "val", "test"]
     for n, idx in zip(names, splits):
         log(f"  划分 {n}: {len(idx)} 帧")
@@ -322,9 +352,9 @@ def main():
     log("")
     for ckpt in args.ckpt:
         log("-" * 78)
-        log(f"权重: {ckpt}  (use_geom={args.use_geom})")
+        log(f"权重: {ckpt}  (use_geom={args.use_geom} use_eye={args.use_eye})")
         model = load_model(Path(ckpt), device, args.image_size,
-                           use_geom=args.use_geom)
+                           use_geom=args.use_geom, use_eye=args.use_eye)
 
         for split_name, idx in eval_sets:
             used = idx if not args.limit else idx[:args.limit]

@@ -75,7 +75,7 @@ def frame_sort_key(path_str):
 
 @torch.no_grad()
 def predict_batch(model, indices, dataset, device, batch_size=32,
-                  use_imu=False, use_eye=False):
+                  use_eye=False):
     """批量获取模型预测和 GT。use_imu/use_eye 必须与 ckpt 结构一致。"""
     preds, labels = {}, {}
     for start in range(0, len(indices), batch_size):
@@ -85,8 +85,6 @@ def predict_batch(model, indices, dataset, device, batch_size=32,
             inp, label = dataset[idx]
             faces.append(inp.rgb)
             geoms.append(inp.geom)
-            if use_imu:
-                imus.append(inp.imu)
             if use_eye:
                 el.append(inp.eye_l)
                 er.append(inp.eye_r)
@@ -94,8 +92,6 @@ def predict_batch(model, indices, dataset, device, batch_size=32,
         f = torch.stack(faces).to(device).float()
         g = torch.stack(geoms).to(device).float()
         kw = {}
-        if use_imu:
-            kw["imu"] = torch.stack(imus).to(device).float()
         if use_eye:
             kw["eye_l"] = torch.stack(el).to(device).float()
             kw["eye_r"] = torch.stack(er).to(device).float()
@@ -107,7 +103,7 @@ def predict_batch(model, indices, dataset, device, batch_size=32,
 
 @torch.no_grad()
 def feature_batch(model, indices, dataset, device, batch_size=32,
-                  use_imu=False, use_eye=False):
+                  use_eye=False):
     """批量提取骨干特征。眼/IMU 支流开启时，把它们的特征一并拼接。"""
     feats = {}
     for start in range(0, len(indices), batch_size):
@@ -119,15 +115,11 @@ def feature_batch(model, indices, dataset, device, batch_size=32,
             if use_eye:
                 el.append(inp.eye_l)
                 er.append(inp.eye_r)
-            if use_imu:
-                imus.append(inp.imu)
         f = torch.stack(faces).to(device).float()
         parts = [extract_features(model, f)]
         if use_eye:
             parts.append(extract_features(model, torch.stack(el).to(device).float()))
             parts.append(extract_features(model, torch.stack(er).to(device).float()))
-        if use_imu:
-            parts.append(torch.stack(imus).to(device).float().cpu())
         feat = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
         for i, idx in enumerate(batch):
             feats[idx] = feat[i].cpu()
@@ -151,7 +143,6 @@ def main():
                         "不显式关闭会直接 load_state_dict 失败")
     p.add_argument("--no-geom", dest="use_geom", action="store_false",
                    help="兼容 dump_predictions 的写法（本脚本默认已是关闭 geom）")
-    p.add_argument("--use-imu", action="store_true", help="骨干含 IMU token（须与 ckpt 一致）")
     p.add_argument("--use-eye", action="store_true", help="骨干含眼部支流（须与 ckpt 一致）")
     p.add_argument("--orient", choices=["raw", "rot90"], default="raw",
                    help="裁剪朝向，必须与 ckpt 训练时一致：raw=正立（当前代码默认）；"
@@ -183,8 +174,7 @@ def main():
 
     # 加载模型
     model = RGBDGazeDINOv2(unfreeze_last=12, img_size=args.resolution,
-                           use_geom=args.use_geom, use_imu=args.use_imu,
-                           use_eye=args.use_eye)
+                           use_geom=args.use_geom, use_eye=args.use_eye)
     model.load_state_dict(torch.load(args.backbone_ckpt, map_location="cpu", weights_only=False))
     model.to(device).eval()
     for param in model.parameters():
@@ -214,7 +204,7 @@ def main():
     # ---- 无校准基准 ----
     emit("\n[baseline] 无校准基准:")
     preds_all, labels_all = predict_batch(model, test_indices, dataset, device,
-                                          use_imu=args.use_imu, use_eye=args.use_eye)
+                                          use_eye=args.use_eye)
     base_errors = []
     base_by_sub = defaultdict(list)
     for idx in test_indices:
@@ -257,7 +247,7 @@ def main():
 
             # 校准帧的特征 + 模型预测 + GT
             calib_feats = (feature_batch(model, calib_ids, dataset, device,
-                                         use_imu=args.use_imu, use_eye=args.use_eye)
+                                         use_eye=args.use_eye)
                            if args.offset_mode == "feat" else None)
             offsets_target = []
             for idx in calib_ids:
@@ -299,7 +289,7 @@ def main():
 
             # 在测试帧上评估
             test_feats = (feature_batch(model, test_ids, dataset, device,
-                                        use_imu=args.use_imu, use_eye=args.use_eye)
+                                        use_eye=args.use_eye)
                           if args.offset_mode == "feat" else None)
             if calibrator is not None:
                 calibrator.eval()
