@@ -33,6 +33,9 @@ temp/
 .tmp_*
 omp-session-*.html
 
+# ---- 本地学习笔记（不入库）----
+docs/学习资料_*.md
+
 # ---- 环境/工具 ----
 .vscode/
 .idea/

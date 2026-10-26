@@ -111,6 +111,8 @@ class RGBDGazeDataset(Dataset):
         # 149 万行时约 2.4GB/进程，fork 给 DataLoader worker 后触发写时复制，
         # 是多卡训练卡顿的主因。TableIndex 取值语义与 DictReader 完全一致。
         self.rows = TableIndex(self.index_csv)
+        # 单设备数据集：所有样本同属一个组（均衡采样退化为普通 shuffle）
+        self.sample_groups = np.zeros(len(self.rows), dtype=np.int64)
 
         # 默认与 GazeCapture 一致：ImageNet 归一化（显式传 None 会得到 [0,1] 未归一化
         # 输入，与 DINOv2 预训练/微调约定不符，且 augment 下 torch.flip 会 TypeError）。

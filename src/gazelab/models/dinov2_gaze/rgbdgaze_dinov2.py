@@ -150,6 +150,8 @@ class RGBDGazeDINOv2(nn.Module):
 
     #: 几何 token 的输入维度：[宽高比, log(w_cm), log(h_cm)]
     GEOM_DIM = 3
+    #: 可选朝向 one-hot 维数（1=竖屏, 2=倒竖, 3/4=横屏；GazeCapture 专用）
+    GEOM_ORIENT_DIM = 4
 
     def __init__(
         self,
@@ -162,6 +164,7 @@ class RGBDGazeDINOv2(nn.Module):
         unfreeze_last=0,
         use_imu=False,
         use_geom=True,
+        use_geom_orient=False,
         use_eye=False,
         img_size=DINOV2_IMG_SIZE,
         dino_model=DINOV2_MODEL,
@@ -186,8 +189,10 @@ class RGBDGazeDINOv2(nn.Module):
 
         # ---- 屏幕几何 token（可选；跨设备泛化的关键，见模块 docstring） ----
         self.use_geom = use_geom
+        self.use_geom_orient = bool(use_geom_orient) and bool(use_geom)
+        self.geom_dim = self.GEOM_DIM + (self.GEOM_ORIENT_DIM if self.use_geom_orient else 0)
         if use_geom:
-            self.proj_geom = nn.Linear(self.GEOM_DIM, d_model)
+            self.proj_geom = nn.Linear(self.geom_dim, d_model)
 
         # ---- 眼部放大支流（可选）：与整脸共用骨干，只取各自的 cls token ----
         self.use_eye = use_eye

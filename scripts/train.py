@@ -124,8 +124,57 @@ DATASET_SPECS = {
                      kwargs=dict(color_transform=rgb_preprocess)),
     "gazecapture": dict(cls=GazeCaptureDataset, path_col="frame_path",
                         default_index=GAZECAPTURE_INDEX_DIR, supports_eye=True,
+                        supports_geom_orient=True,
                         kwargs={}),
 }
+
+
+class GroupBalancedSampler:
+    """按 (设备族, 朝向) 分组做均衡重采样（GazeCapture：iPad 仅占 14%）。
+
+    权重 = 1/该组样本数 ⇒ 每个 epoch 中各组期望步数相近。**有放回**采样，
+    因此存在重复样本（这是均衡采样与普通 RandomSampler 的固有差异）。
+    多卡时每个 rank 独立抽样（与 DistributedSampler 不同：不做互斥分片），
+    重叠是可接受的（每 epoch 的样本集合并集远大于单卡样本数）。
+
+    接口与 DistributedSampler 兼容：set_epoch + __len__ + __iter__。
+    """
+
+    def __init__(self, subset, rank=0, world_size=1, seed=0, num_samples=None):
+        self.subset = subset
+        # 兼容本项目的自定义 Subset(.base/.idces) 与 torch.utils.data.Subset(.dataset/.indices)
+        base = getattr(subset, "base", None)
+        if base is None:
+            base = subset.dataset
+        idces = getattr(subset, "idces", None)
+        if idces is None:
+            idces = subset.indices
+        groups = getattr(base, "sample_groups", None)
+        if groups is None:
+            raise ValueError("数据集没有 sample_groups ⇒ 无法做分组均衡采样")
+        groups = np.asarray(groups, dtype=np.int64)[np.asarray(idces, dtype=np.int64)]
+        counts = np.bincount(groups, minlength=int(groups.max()) + 1).astype(np.float64)
+        counts[counts == 0] = 1.0
+        w = 1.0 / counts[groups]
+        self.weights = torch.as_tensor(w, dtype=torch.double)
+        n = len(idces)
+        self.num_samples = int(num_samples) if num_samples else max(
+            1, int(ceil(n / max(1, world_size))))
+        self.rank, self.world_size, self.seed = int(rank), int(world_size), int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + 1000 * self.epoch + 7919 * self.rank)
+        idx = torch.multinomial(self.weights, self.num_samples,
+                                replacement=True, generator=g)
+        return iter(idx.tolist())
 
 
 def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers,
@@ -133,7 +182,8 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
                      geom_randomize=None, eye_crops=False, orient="raw",
                      eye_scale=0.0, aug_shift=None, aug_scale=None,
                      aug_rotate=None, seed=None, drop_blink=False,
-                     blink_scores=None, blink_threshold=0.5):
+                     blink_scores=None, blink_threshold=0.5,
+                     geom_orient=False, balance="off", rank=0, world_size=1):
     """构造 train/val/test 的 DataLoader。
 
     dataset 决定用哪个数据集类与索引。两个数据集的 edict 字段集兼容
@@ -194,6 +244,10 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
         if not spec.get("supports_orient"):
             raise ValueError(f"数据集 {dataset} 不支持 orient={orient!r}")
         kwargs["orient"] = orient
+    if geom_orient:
+        if not spec.get("supports_geom_orient"):
+            raise ValueError(f"数据集 {dataset} 不支持朝向 token（geom_orient=True）")
+        kwargs["geom_orient"] = True
     # 增强参数**必须**从这里传进数据集：此前 CLI 的 --aug-shift/--aug-scale/
     # --aug-rotate 只被解析与打印（build_dataloader 没有对应参数），实际生效的是
     # config 默认值 ⇒ 日志记录的是假配置（2026-10-15 审计 A1）。
@@ -214,7 +268,11 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
                       f"（filled 掩码）")
             idx = _keep
             if not idx:
-                raise RuntimeError(f"{split} 在剔除 filled 眼框后为空")
+                if split == "val":
+                    # CV 折可故意不给 val（用末轮权重），允许为空
+                    print("[eye] val 为空（跳过验证，best.pt = 末轮权重）")
+                else:
+                    raise RuntimeError(f"{split} 在剔除 filled 眼框后为空")
     if seed is not None and hasattr(ds, "set_aug_seed"):
         # 逐样本确定性增强种子：修掉 RandomState() 无播种导致的"同 seed 不可复现"
         # （2026-10-15 审计 A2）
@@ -245,6 +303,11 @@ def build_dataloader(dataset, split, index_dir, batch_size, shuffle, num_workers
         gen = torch.Generator()
         gen.manual_seed(int(seed))
         common["generator"] = gen
+    if balance == "group" and split == "train" and shuffle:
+        sampler = GroupBalancedSampler(sub, rank=rank,
+                                       world_size=world_size if distributed else 1,
+                                       seed=0 if seed is None else seed)
+        return DataLoader(sub, sampler=sampler, shuffle=False, **common)
     if distributed:
         # 每个 rank 只吃 1/world 的数据；shuffle 交给 sampler（DataLoader 的
         # shuffle 必须为 False）。每个 epoch 前要调 sampler.set_epoch(epoch)。
@@ -539,6 +602,13 @@ def parse():
                    help="几何域随机化的触发概率（P2，把宽高比外推变内插）；"
                         "None=用各自 config 默认（rgbdgaze=0.35 / gazecapture=0.5）。"
                         "仅在 --augment 下生效，显式传 0 可关闭（消融用）")
+    p.add_argument("--geom-orient", action="store_true",
+                   help="几何 token 追加 4 维朝向 one-hot（1=竖屏/2=倒竖/3,4=横屏）。"
+                        "仅 GazeCapture 支持；须与 --geom 同用。朝向是实测最大误差来源"
+                        "（倒竖 2.82cm vs 横屏 1.66cm）")
+    p.add_argument("--balance", choices=["off", "group"], default="off",
+                   help="训练采样策略：off=普通随机；group=按(设备族,朝向)分组均衡"
+                        "（有放回；缓解 iPad 仅占 14%% 的欠拟合）")
     p.add_argument("--use-eye", dest="use_eye", action="store_true",
                    help="加入眼部放大支流：人脸 + 左右眼各一张裁剪（共用 DINOv2 骨干）。"
                         "两个数据集均支持；眼框表分别是 "
@@ -580,6 +650,8 @@ def main():
     EYE_SHUFFLE = bool(getattr(args, "eye_shuffle", False))
     if EYE_SHUFFLE and not getattr(args, "use_eye", False):
         raise SystemExit("--eye-shuffle 需要与 --use-eye 同用（没有眼图可打乱）")
+    if args.geom_orient and not args.use_geom:
+        raise SystemExit("--geom-orient 需要 --geom（朝向是几何 token 的一部分）")
     rank, world, local_rank, is_dist = init_distributed()
     is_main = (rank == 0)
     if is_dist:
@@ -607,6 +679,10 @@ def main():
         # 不同 geom/eye/seed/lr 的 run 会落到同一目录并静默覆盖 best.pt。
         parts = [f"loss{args.loss}", f"u{args.unfreeze}",
                  "geom" if args.use_geom else "nogeom"]
+        if args.geom_orient:
+            parts.append("go")
+        if args.balance != "off":
+            parts.append(f"bal{args.balance}")
         if args.geom_randomize is None:
             parts.append("grdef")
         elif args.geom_randomize > 0:
@@ -654,6 +730,7 @@ def main():
     model = RGBDGazeDINOv2(
         unfreeze_last=args.unfreeze,
         use_geom=args.use_geom,
+        use_geom_orient=args.geom_orient,
         use_eye=args.use_eye,
         img_size=args.resolution,
     ).to(device)
@@ -728,18 +805,23 @@ def main():
                                 aug_shift=args.aug_shift,
                                 aug_scale=args.aug_scale,
                                 aug_rotate=args.aug_rotate,
+                                geom_orient=args.geom_orient,
+                                balance=args.balance,
+                                rank=rank, world_size=world,
                                 seed=args.seed, **_blink)
     val_dl = build_dataloader(args.dataset, "val", Path(args.index_dir),
                               args.batch_size, False, args.num_workers,
                               augment=False, resolution=args.resolution,
                               eye_crops=args.use_eye,
                               eye_scale=args.eye_scale,
+                              geom_orient=args.geom_orient,
                               seed=args.seed, **_blink)
     test_dl = build_dataloader(args.dataset, "test", Path(args.index_dir),
                                args.batch_size, False, args.num_workers,
                                augment=False, resolution=args.resolution,
                                eye_crops=args.use_eye,
                                eye_scale=args.eye_scale,
+                               geom_orient=args.geom_orient,
                                seed=args.seed, **_blink)
 
     tr_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
@@ -807,9 +889,8 @@ def main():
         write_log("[warn] 验证集为空，将不做验证、每轮覆盖 best.pt（末轮权重生效）")
     # best_val 已在续训时从 last.pt 恢复
     for epoch in range(start_epoch, args.epochs):
-        if is_dist:
-            # DistributedSampler 需要每 epoch 变一次种子，否则各 rank 的
-            # 分片顺序固定不变，等价于每轮喂同一批数据顺序。
+        if hasattr(train_dl.sampler, "set_epoch"):
+            # DistributedSampler / GroupBalancedSampler 都靠 set_epoch 变种子
             train_dl.sampler.set_epoch(epoch)
         # 数据集也要知道 epoch：增强的逐样本种子含 epoch，
         # 否则同一帧在每轮都会拿到完全相同的增强（多样性变差）。

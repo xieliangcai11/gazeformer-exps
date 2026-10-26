@@ -159,6 +159,17 @@ class TableIndex:
             return {uniq[c]: i for i, c in enumerate(d[1])}
         return {v.decode(): i for i, v in enumerate(d[1])}
 
+    def code_column(self, name):
+        """返回 (codes, uniques)：编码列（如 device / orientation）的整数码表。
+
+        与 __getitem__ 的字符串语义等价，但避免逐行构造 dict（125 万行时
+        这是启动期的主要开销）。非编码列（唯一值过多）会抛 ValueError。
+        """
+        d = self._data[name]
+        if d[0] != "code":
+            raise ValueError(f"列 {name!r} 不是编码列（唯一值过多），无法用 code_column")
+        return d[1], d[2]
+
     def float_column(self, name, dtype=np.float32):
         """把一列按浮点语义整列取出为 numpy 数组。
 

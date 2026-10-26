@@ -90,6 +90,7 @@ class GazeCaptureDataset(Dataset):
         image_size: int = None,
         eye_crops: bool = False,
         eye_scale: float = 0.0,
+        geom_orient: bool = False,
     ):
         super().__init__()
         # 本数据集的所有增强/翻转/几何重投影都建立在归一化坐标上；像素口径下
@@ -147,6 +148,16 @@ class GazeCaptureDataset(Dataset):
         # （boxes = 左眼(x,y,w,h)+右眼(x,y,w,h)，原图坐标；filled 标记兜底/退化）。
         self.eye_crops = bool(eye_crops)
         self.eye_scale = float(eye_scale)
+        # ---- 朝向 token（GazeCapture）：设备/朝向是最大误差来源 ----
+        # 1=竖屏、2=倒竖（iPad）、3/4=横屏。作为 4 维 one-hot 追加到几何 token，
+        # 让模型显式知道"屏幕坐标轴是哪个方向"，避免从图像里反推。
+        self.geom_orient = bool(geom_orient)
+        # (设备族, 朝向) 分组标签：供 GroupBalancedSampler 均衡采样（iPad 只占 14%）
+        _codes, _uniq = self.rows.code_column("device")
+        _fam = np.array([1 if u.startswith("iPad") else 0 for u in _uniq], dtype=np.int64)
+        _fam = _fam[_codes]
+        _ori = np.clip(self.rows.float_column("orientation", np.int64) - 1, 0, 3)
+        self.sample_groups = (_fam * 4 + _ori).astype(np.int64)
         if self.eye_crops:
             npz_path = self.index_csv.parent / "eye_boxes.npz"
             if not npz_path.is_file():
@@ -189,6 +200,7 @@ class GazeCaptureDataset(Dataset):
                     scale=self.aug_scale, rotate=self.aug_rotate,
                     geom_randomize=self.geom_randomize,
                     eye_crops=self.eye_crops, eye_scale=self.eye_scale,
+                    geom_orient=self.geom_orient,
                     orient="raw", image_size=self.image_size, aug_seed=self._seed)
 
     @staticmethod
@@ -298,6 +310,13 @@ class GazeCaptureDataset(Dataset):
                 # 标签已重投影到合成屏 ⇒ screen_cm 必须同步替换（否则角度/ cm 口径错配）
                 gx, gy, geom, w_cm, h_cm = out
                 screen_cm = torch.tensor([w_cm, h_cm], dtype=torch.float32)
+
+        if self.geom_orient:
+            o = int(float(row["orientation"])) if row.get("orientation") else 1
+            oh = torch.zeros(4, dtype=torch.float32)
+            if 1 <= o <= 4:
+                oh[o - 1] = 1.0
+            geom = torch.cat([geom, oh])
 
         label = np.array([gx, gy], dtype=np.float32)
         # 人脸在 25x25 网格中的位置（iTracker 风格输入特征）
