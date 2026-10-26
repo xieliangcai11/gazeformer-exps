@@ -58,8 +58,11 @@ def build_prior_cmd(args):
     want = set(paths)
     lab = []
     with open(index_csv, encoding="utf-8") as fh:
-        for r in csv.DictReader(fh):
-            if r["rgb_path"] in want:
+        rd = csv.DictReader(fh)
+        fields = rd.fieldnames or []
+        pcol = "rgb_path" if "rgb_path" in fields else "frame_path"   # RGBDGaze / GazeCapture
+        for r in rd:
+            if r[pcol] in want:
                 lab.append([float(r["gaze_x"]) / float(r["screen_w"]),
                             float(r["gaze_y"]) / float(r["screen_h"])])
     prior = build_prior(np.array(lab))
@@ -307,6 +310,9 @@ def main():
         args.use_eye = bool(_cfg.get("use_eye", True))
         print(f"[cfg] use_eye={args.use_eye}"
               f"（来源: {_side.name if _side.is_file() else '默认值'}）")
+    args.geom_orient = bool(_cfg.get("geom_orient", False)) and bool(args.use_geom)
+    print(f"[cfg] geom_orient={args.geom_orient}"
+          f"（来源: {_side.name if _side.is_file() else '默认值'}）")
 
     # 硬性门禁：目标矩/目标点分布若来自测试真值，必须显式声明，否则结果只能当无标签报
     if not args.oracle_targets and args.prior_mode != "global":
@@ -334,7 +340,8 @@ def main():
     dl = build_dataloader(args.dataset, args.split, index_dir, 64, False, 0,
                           augment=False, resolution=args.resolution,
                           eye_crops=args.use_eye, orient=args.orient,
-                          eye_scale=args.eye_scale)
+                          eye_scale=args.eye_scale,
+                          geom_orient=args.geom_orient)
     ds = dl.dataset
     prior = json.loads(Path(args.prior).read_text(encoding="utf-8")) \
         if Path(args.prior).is_file() else {"mean": [0.5, 0.5], "std": [0.3, 0.3]}
@@ -343,6 +350,7 @@ def main():
 
     # ---- 模型（冻结）----
     model = RGBDGazeDINOv2(unfreeze_last=0, use_geom=args.use_geom,
+                           use_geom_orient=args.geom_orient,
                            use_eye=args.use_eye, img_size=args.resolution).to(device)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     miss, unexp, resampled = load_state_dict_any_res(model, state)
@@ -364,6 +372,35 @@ def main():
         print(f"[filter] 只跑 {len(items)} 个会话（匹配 {_keys}）")
     if args.max_sessions:
         items = items[:args.max_sessions]
+    done_sessions = set()
+    if args.dump_preds and Path(args.dump_preds).is_file():
+        # 断点续跑：已落盘的会话直接跳过（GPU 偶发掉线时不用从头再来 ✓）
+        with open(args.dump_preds, encoding="utf-8") as fh:
+            rd = csv.reader(fh)
+            next(rd, None)
+            for row in rd:
+                if row:
+                    done_sessions.add(row[0])
+                    dump_rows.append(row)
+        before = len(items)
+        items = [(s, v) for (s, v) in items if s not in done_sessions]
+        print(f"[resume] 已有 {len(done_sessions)} 个会话，跳过；剩余 {len(items)}/{before}")
+
+    def _flush_dump():
+        if not args.dump_preds or not dump_rows:
+            return
+        dp = Path(args.dump_preds)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dp.with_suffix(dp.suffix + ".tmp")
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["session", "path", "frame_no",
+                        "base_px", "base_py", "tta_px", "tta_py",
+                        "label_x", "label_y",
+                        "em_base_cm", "em_tta_cm", "ang_base_deg", "ang_tta_deg"])
+            w.writerows(dump_rows)
+        tmp.replace(dp)
+
     for si, (s, idx) in enumerate(items):
         sub = Subset(ds, idx)
         n_adapt = max(1, int(len(idx) * args.adapt_frac))
@@ -553,22 +590,15 @@ def main():
               f"（{100 * (e1 / e0 - 1):+.1f}%）"
               + (f"  [后段口径：{t0}/{len(em0)} 帧起]" if t0 else ""))
         results.append((s, e0, e1, len(frames)))
+        _flush_dump()          # 每会话落盘 ⇒ 崩溃后可从断点续跑 ✓
     if len(results) > 1:
         a = np.array([[r[1], r[2]] for r in results])
         print(f"\n  总体：不标定 {a[:, 0].mean():.3f} → TTA 后 {a[:, 1].mean():.3f}"
               f"（{100 * (a[:, 1].mean() / a[:, 0].mean() - 1):+.1f}%）  "
               f"会话数 {len(results)}")
     if args.dump_preds and dump_rows:
-        dp = Path(args.dump_preds)
-        dp.parent.mkdir(parents=True, exist_ok=True)
-        with open(dp, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["session", "path", "frame_no",
-                        "base_px", "base_py", "tta_px", "tta_py",
-                        "label_x", "label_y",
-                        "em_base_cm", "em_tta_cm", "ang_base_deg", "ang_tta_deg"])
-            w.writerows(dump_rows)
-        print(f"  逐帧 CSV: {dp}（{len(dump_rows)} 帧）")
+        _flush_dump()
+        print(f"  逐帧 CSV: {args.dump_preds}（{len(dump_rows)} 帧）")
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

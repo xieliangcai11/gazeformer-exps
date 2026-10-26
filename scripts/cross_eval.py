@@ -76,14 +76,14 @@ GROUP_COLUMNS = {
 
 
 def build_dataset(dataset: str, index_dir: Path, image_size: int,
-                  eye_crops: bool = False):
+                  eye_crops: bool = False, geom_orient: bool = False):
     """按数据集名构造基础数据集（评估用：不做任何增强）。"""
     index_csv = index_dir / "index.csv"
     if dataset == "rgbdgaze":
         return RGBDGazeDataset(index_csv, color_transform=rgb_preprocess,
                                image_size=image_size, eye_crops=eye_crops)
     return GazeCaptureDataset(index_csv=index_csv, image_size=image_size,
-                              eye_crops=eye_crops)
+                              eye_crops=eye_crops, geom_orient=geom_orient)
 
 
 def protocol_indices(dataset: str, rows, index_dir: Path, protocol: str, holdout):
@@ -216,7 +216,7 @@ class GeomShiftDataset(Dataset):
 
 
 def load_model(ckpt: Path, device, image_size: int, use_geom: bool = True,
-               use_eye: bool = False):
+               use_eye: bool = False, use_geom_orient: bool = False):
     """加载 RGBDGazeDINOv2 权重。
 
     use_geom=False 用于评估"加入几何 token 之前"训练的老权重：老权重没有
@@ -229,7 +229,8 @@ def load_model(ckpt: Path, device, image_size: int, use_geom: bool = True,
     分辨率的运行（如 224 预训练权重直接在 448 上做零样本评估）。
     """
     model = RGBDGazeDINOv2(img_size=image_size, use_geom=use_geom,
-                           use_eye=use_eye).to(device)
+                           use_eye=use_eye,
+                           use_geom_orient=use_geom_orient).to(device)
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     missing, unexpected, resampled = load_state_dict_any_res(model, state)
     if resampled is not None:
@@ -272,7 +273,10 @@ def main():
                     help="domain 协议下同时评估 train/val/test（跨数据集零样本用）")
     ap.add_argument("--write-split", default=None,
                     help="把 train/val/test 清单写到该目录（供训练用）")
-    ap.add_argument("--no-geom", dest="use_geom", action="store_false", default=True,
+    ap.add_argument("--geom", dest="use_geom", action="store_true", default=None,
+                    help="启用屏幕几何 token；默认从 ckpt 旁 train_args.json 读取"
+                         "（缺失时 True）")
+    ap.add_argument("--no-geom", dest="use_geom", action="store_false",
                     help="关闭屏幕几何 token（评估 P0 之前训练的老权重时必须加）")
     ap.add_argument("--use-eye", dest="use_eye", action="store_true", default=None,
                     help="权重含眼支流；默认从 ckpt 旁 train_args.json 读取")
@@ -315,11 +319,20 @@ def main():
                 _cfg = {}
         if args.use_eye is None:
             args.use_eye = bool(_cfg.get("use_eye", False))
-        log(f"[cfg] use_eye={args.use_eye} "
+        if args.use_geom is None:
+            # 无侧车的老权重默认 True（历史约定）；有侧车则以训练时为准：
+            # 否则会给"无几何 token"的权重塞进随机 proj_geom（实测会污染预测 ✗）
+            args.use_geom = bool(_cfg.get("use_geom", True))
+        args.geom_orient = bool(_cfg.get("geom_orient", False))
+        log(f"[cfg] use_eye={args.use_eye} use_geom={args.use_geom} "
+            f"geom_orient={args.geom_orient} "
             f"(来源: {_side.name if _side.is_file() else '命令行/默认'})")
     args.use_eye = bool(args.use_eye)
+    if args.use_geom is None:
+        args.use_geom = True
+    args.geom_orient = bool(getattr(args, "geom_orient", False)) and args.use_geom
     ds = build_dataset(args.dataset, index_dir, args.image_size,
-                       eye_crops=args.use_eye)
+                       eye_crops=args.use_eye, geom_orient=args.geom_orient)
     rows = ds.rows
     log(f"数据集 {len(rows)} 帧 / {len({r['subject'] for r in rows})} 被试 / "
         f"{len({r['device'] for r in rows})} 机型")
@@ -354,7 +367,8 @@ def main():
         log("-" * 78)
         log(f"权重: {ckpt}  (use_geom={args.use_geom} use_eye={args.use_eye})")
         model = load_model(Path(ckpt), device, args.image_size,
-                           use_geom=args.use_geom, use_eye=args.use_eye)
+                           use_geom=args.use_geom, use_eye=args.use_eye,
+                           use_geom_orient=args.geom_orient)
 
         for split_name, idx in eval_sets:
             used = idx if not args.limit else idx[:args.limit]

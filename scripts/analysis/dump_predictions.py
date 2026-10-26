@@ -90,7 +90,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=6)
     ap.add_argument("--device", default="auto")
-    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--limit", type=int, default=0, help="总共最多评估多少帧（0=全部）")
+    ap.add_argument("--per-session", type=int, default=0,
+                    help="每个 (subject,activity) 会话最多取多少帧（0=全部；用于快速生成源域表）")
     ap.add_argument("--eye-scale", type=float, default=0.0,
                     help="眼框收紧倍数：**必须与训练时一致**，否则眼支流输入与训练不符"
                          "（此前评估脚本无法传该参数 ⇒ 用 eye_scale>0 训的权重会被按 0 评估）")
@@ -107,11 +109,16 @@ def main():
     # ckpt 旁边的配置侧车（training 时写入）：打印出来，避免"靠日志猜配置"
     import json
     _sc = Path(args.ckpt).parent / "train_args.json"
+    args.geom_orient = False
     if _sc.is_file():
         try:
             _cfg = json.loads(_sc.read_text(encoding="utf-8"))
             print(f"[ckpt] 训练配置侧车 {_sc}")
             print("       " + json.dumps(_cfg, ensure_ascii=False)[:500])
+            # 以训练时配置为准：给无几何权重塞随机 proj_geom / 给带朝向权重
+            # 少喂 4 维都会让指标失真
+            args.use_geom = bool(_cfg.get("use_geom", args.use_geom))
+            args.geom_orient = bool(_cfg.get("geom_orient", False)) and args.use_geom
         except Exception as e:  # 侧车损坏不应影响评估
             print(f"[ckpt] 侧车读取失败（忽略）：{e}")
 
@@ -126,16 +133,64 @@ def main():
     dev = args.device if args.device != "auto" else (
         "cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # ---- 数据（朝向/眼支流必须与训练一致）----
-    dl = build_dataloader(args.dataset, args.split, index_dir, args.batch_size, False,
-                          args.num_workers, augment=False, resolution=args.resolution,
-                          eye_crops=args.use_eye, orient=args.orient,
-                          eye_scale=args.eye_scale)
+    # ---- 选取帧（可选：每会话截断 / 总数截断）----
     paths = [ln.strip() for ln in (index_dir / f"{args.split}.txt").read_text(
         encoding="utf-8").splitlines() if ln.strip()]
+    data_dir = index_dir
+    if args.per_session or args.limit:
+        _tbl = TableIndex(index_dir / "index.csv")
+        _p2i = _tbl.lookup(spec["path_col"])
+        if args.per_session:
+            # **均匀抽样**（不能取前 N 帧：会话开头往往更容易，会把统计带偏）
+            by_key = {}
+            for i_, p_ in enumerate(paths):
+                r = _tbl[_p2i[p_]]
+                k = (r.get("subject", ""), r.get("activity", ""))
+                by_key.setdefault(k, []).append(i_)
+            sel = []
+            for k, idxs in by_key.items():
+                n = args.per_session
+                if len(idxs) <= n:
+                    sel.extend(idxs)
+                else:
+                    take = np.linspace(0, len(idxs) - 1, n).round().astype(int)
+                    sel.extend([idxs[t] for t in np.unique(take)])
+            paths = [paths[i] for i in sorted(set(sel))]
+        if args.limit:
+            paths = paths[: args.limit]
+        # 用临时目录承载"截断后的清单 + 同一份 index.csv"
+        tmp = Path(args.out).parent / "_split_tmp" if args.out else \
+            (experiment_dirs(args.dataset, "analysis")["root"] / "_split_tmp")
+        tmp.mkdir(parents=True, exist_ok=True)
+        idx_link = tmp / "index.csv"
+        if not idx_link.exists():
+            try:
+                idx_link.symlink_to((index_dir / "index.csv").resolve())
+            except OSError:
+                idx_link.write_bytes((index_dir / "index.csv").read_bytes())
+        # 眼框表也需就位（数据集按 index 同目录加载）
+        for _extra in ("eye_boxes.npz",):
+            _src, _dst = index_dir / _extra, tmp / _extra
+            if _src.is_file() and not _dst.exists():
+                try:
+                    _dst.symlink_to(_src.resolve())
+                except OSError:
+                    import shutil as _sh
+                    _sh.copy2(_src, _dst)
+        (tmp / f"{args.split}.txt").write_text("\n".join(paths) + "\n", encoding="utf-8")
+        data_dir = tmp
+        print(f"[split] 截断后 {len(paths)} 帧（per-session={args.per_session} limit={args.limit}）")
+
+    # ---- 数据（朝向/眼支流必须与训练一致）----
+    dl = build_dataloader(args.dataset, args.split, data_dir, args.batch_size, False,
+                          args.num_workers, augment=False, resolution=args.resolution,
+                          eye_crops=args.use_eye, orient=args.orient,
+                          eye_scale=args.eye_scale,
+                          geom_orient=getattr(args, "geom_orient", False))
 
     # ---- 模型 ----
     model = RGBDGazeDINOv2(unfreeze_last=args.unfreeze, use_geom=args.use_geom,
+                           use_geom_orient=getattr(args, "geom_orient", False),
                            use_eye=args.use_eye, img_size=args.resolution).to(dev)
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     miss, unexp, resampled = load_state_dict_any_res(model, state)
@@ -150,6 +205,13 @@ def main():
           f"分辨率={args.resolution} geom={args.use_geom} eye={args.use_eye} "
           f"eye_scale={args.eye_scale} eye_shuffle={bool(args.eye_shuffle)} 设备={dev}")
     fr = predict_frames(model, dl, dev)
+    # 加载器可能已剔除 filled 眼框行（build_dataloader 的行为）⇒ 用其 idces 对齐 paths
+    _idces = getattr(dl.dataset, "idces", None)
+    if _idces is not None:
+        # Subset.idces 是 index.csv 的**行号**（不是清单下标）
+        _tbl_all = TableIndex(index_dir / "index.csv")
+        _pcol = spec["path_col"]
+        paths = [_tbl_all[int(i)][_pcol] for i in _idces]
     n = len(fr["pred"])
     if n != len(paths):
         raise SystemExit(f"预测数 {n} != 清单帧数 {len(paths)}（顺序假设不成立，不能贴标签）")
