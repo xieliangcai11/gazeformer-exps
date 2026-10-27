@@ -260,6 +260,10 @@ def main():
     ap.add_argument("--w-photo", type=float, default=1.0, help="光度一致性权重")
     ap.add_argument("--w-geo", type=float, default=0.0, help="几何一致性权重（注视不变的小仿射）")
     ap.add_argument("--w-sym", type=float, default=0.0, help="左右翻转对称权重（2D: x→1-x）")
+    ap.add_argument("--gate", action="store_true", help="无标签安全门控：留出损失变差则回退")
+    ap.add_argument("--gate-margin", type=float, default=0.0)
+    ap.add_argument("--gate-alpha", type=float, default=0.75)
+    ap.add_argument("--init-adapter", default="", help="adapter 初始状态（源域预训练/元学习）")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--rank", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=128)
@@ -552,6 +556,10 @@ def main():
                                                  w_cons=args.w_photo,
                                                  w_geo=args.w_geo,
                                                  w_sym=args.w_sym,
+                                                 gate=args.gate,
+                                                 gate_margin=args.gate_margin,
+                                                 gate_alpha=args.gate_alpha,
+                                                 init_adapter=args.init_adapter,
                                                  holdout_frac=args.holdout_frac,
                                                  eval_every=args.eval_every,
                                                  early_stop=args.early_stop),

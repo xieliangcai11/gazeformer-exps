@@ -205,6 +205,13 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
     """
     torch.manual_seed(cfg.seed)
     opt_adapter = attach_adapter(model, cfg)
+    if cfg.init_adapter:
+        from pathlib import Path as _P
+        if _P(cfg.init_adapter).is_file():
+            opt_adapter.load_state_dict(torch.load(cfg.init_adapter, map_location="cpu"))
+            log(f"    [init] adapter 初始化 <- {cfg.init_adapter}")
+        else:
+            log(f"    [init] 未找到 {cfg.init_adapter}，从零开始")
     for p in model.parameters():
         p.requires_grad_(False)
     params = list(opt_adapter.parameters())
@@ -336,6 +343,16 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         else:
             opt_adapter.load_state_dict(best_state)
             log(f"    [tta] 采用最佳步 {best_step}（val {best_v:.5f} vs 恒等 {v0:.5f}）")
+    # ---- 无标签安全门控：留出损失变差则回退；变好则只应用 gate_alpha ----
+    if cfg.gate and pool_v is not None:
+        v_final = _val_loss(pool_v)
+        accept = v_final <= v0 * (1.0 + cfg.gate_margin)
+        scale = cfg.gate_alpha if accept else 0.0
+        with torch.no_grad():
+            for p_ in opt_adapter.parameters():
+                p_.mul_(scale)
+        log(f"    [gate] v0={v0:.5f} v_final={v_final:.5f} "
+            f"accept={accept} scale={scale:.2f}")
     for p in params:
         p.requires_grad_(False)
     return model
