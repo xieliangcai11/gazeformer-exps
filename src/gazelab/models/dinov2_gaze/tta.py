@@ -217,14 +217,22 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         f"w_reg={cfg.w_reg} holdout={cfg.holdout_frac} early_stop={cfg.early_stop} "
         f"gate={cfg.gate}(margin={cfg.gate_margin},alpha={cfg.gate_alpha},"
         f"min_gain={cfg.gate_min_gain}) init={cfg.init_adapter or '-'}")
+    if cfg.gate and cfg.early_stop:
+        log("    [warn] gate 与 early_stop 同时开启：早停可能已回退到 init，门控会被跳过；"
+            "建议 gate 实验加 --no-early-stop")
     opt_adapter = attach_adapter(model, cfg)
     if cfg.init_adapter:
         from pathlib import Path as _P
         if _P(cfg.init_adapter).is_file():
             st_init = torch.load(cfg.init_adapter, map_location="cpu")
-            missing, unexpected = opt_adapter.load_state_dict(st_init, strict=False)
+            try:
+                missing, unexpected = opt_adapter.load_state_dict(st_init, strict=False)
+            except Exception as e:  # noqa: BLE001
+                log(f"    [init] 加载失败（形状/键不匹配）: {e}")
+                raise
             log(f"    [init] adapter 初始化 <- {cfg.init_adapter} "
-                f"missing={list(missing)} unexpected={list(unexpected)}")
+                f"missing={list(missing)} unexpected={list(unexpected)} "
+                f"keys={ {k: tuple(v.shape) for k, v in st_init.items()} }")
         else:
             log(f"    [init] 未找到 {cfg.init_adapter}，从零开始")
     init_state = {k: v.detach().clone() for k, v in opt_adapter.state_dict().items()}
@@ -280,7 +288,8 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         if frames_pool is None:
             return {}
         m = min(bs, len(frames_pool))
-        idx = torch.arange(m)
+        # 均匀覆盖整个留出段，而不是只看最前面几帧（否则选步/门控有偏）。
+        idx = torch.linspace(0, len(frames_pool) - 1, m).long()
         kw = {k: v.float() for k, v in _batch(frames_pool, idx).items()}
         out = {}
         # 验证用的随机抖动必须固定种子：v0 与 v_final 才是同一把尺子。
@@ -313,8 +322,9 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         idx = torch.randint(0, n, (bs,), generator=gen)
         kw = {k: v.float() for k, v in _batch(pool_a, idx).items()}
         pred = extra_forward(model, kw) if extra_forward else model(**kw)
-        parts = {"moment": float(cfg.w_moment * _moment_loss(pred, prior, cfg.axis_weight))}
-        loss = cfg.w_moment * _moment_loss(pred, prior, cfg.axis_weight)
+        _moment = cfg.w_moment * _moment_loss(pred, prior, cfg.axis_weight)
+        parts = {"moment": float(_moment)}
+        loss = _moment
         if cfg.w_cons > 0:
             g = 1.0 + cfg.cons_jitter * (torch.rand(len(idx), 1, 1, 1, generator=gen) * 2 - 1)
             b = cfg.cons_jitter * (torch.rand(len(idx), 1, 1, 1, generator=gen) * 2 - 1)

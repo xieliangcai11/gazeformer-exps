@@ -354,12 +354,13 @@ def main():
     print(f"[run] dataset={args.dataset} split={args.split} index={index_dir} "
           f"ckpt={args.ckpt}")
     print(f"[run] res={args.resolution} eye={args.use_eye} geom={args.use_geom} "
-          f"geom_orient={args.geom_orient} eye_scale={args.eye_scale} "
+          f"imu={args.use_imu} geom_orient={args.geom_orient} eye_scale={args.eye_scale} "
           f"prior={args.prior}(mode={args.prior_mode})")
     print(f"[run] steps={args.steps} lr={args.lr} rank={args.rank} bs={args.batch_size} "
           f"w_moment={args.w_moment} w_photo={args.w_photo} w_geo={args.w_geo} "
           f"w_sym={args.w_sym} gate={args.gate}(margin={args.gate_margin},alpha={args.gate_alpha}) "
-          f"init={args.init_adapter or '-'} early_stop={args.early_stop}")
+          f"init={args.init_adapter or '-'} early_stop={args.early_stop} "
+          f"adapt_frac={args.adapt_frac} holdout={args.holdout_frac}")
     paths, sess_all = _sessions(index_dir, args.split)
     if args.smoke:
         sess_items = list(sess_all.items())[:1]
@@ -438,6 +439,11 @@ def main():
         tmp.replace(dp)
 
     for si, (s, idx) in enumerate(items):
+        # 必须按 frame_index 排序：holdout 的“后 30%”才真的是未来帧。
+        idx = sorted(idx, key=lambda i: int(ds.base.rows[ds.idces[i]].get("frame_index", i)))
+        if si == 0:
+            print(f"[order] 会话 {s}: 首帧={ds.base.rows[ds.idces[idx[0]]].get('frame_index')} "
+                  f"末帧={ds.base.rows[ds.idces[idx[-1]]].get('frame_index')} n={len(idx)}")
         sub = Subset(ds, idx)
         n_adapt = max(1, int(len(idx) * args.adapt_frac))
         n_adapt = min(n_adapt, args.max_frames) if args.max_frames else n_adapt
@@ -613,6 +619,8 @@ def main():
             # 因果口径（--adapt-frac < 1）：只统计**适配窗口之后**的帧，否则会含"已看过答案"的帧
             # ⇒ 与闭式因果臂不可比、且会自我美化 ✗（2026-10-16 发现并修）。
             fr1["tail_from"] = int(n_adapt) if args.adapt_frac < 1.0 else 0
+            print(f"    [eval] adapt_frac={args.adapt_frac} n_adapt={n_adapt} "
+                  f"tail_from={fr1['tail_from']} eval_frames={len(idx) - fr1['tail_from']}")
         if args.dump_preds:
             # 逐帧落盘：base 与 TTA 的预测/误差/角度 + 帧号（= 时序顺序，文件名即帧号）
             for j, _p in enumerate([paths[i] for i in idx]):
