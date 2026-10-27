@@ -260,6 +260,8 @@ def main():
     ap.add_argument("--w-photo", type=float, default=1.0, help="光度一致性权重")
     ap.add_argument("--w-geo", type=float, default=0.0, help="几何一致性权重（注视不变的小仿射）")
     ap.add_argument("--w-sym", type=float, default=0.0, help="左右翻转对称权重（2D: x→1-x）")
+    ap.add_argument("--w-coral", type=float, default=0.0, help="特征 CORAL 对齐权重")
+    ap.add_argument("--coral-stats", default="", help="源域特征 mean/cov npz")
     ap.add_argument("--gate", action="store_true", help="无标签安全门控：留出损失变差则回退")
     ap.add_argument("--gate-margin", type=float, default=0.0)
     ap.add_argument("--gate-alpha", type=float, default=0.75)
@@ -358,7 +360,7 @@ def main():
           f"prior={args.prior}(mode={args.prior_mode})")
     print(f"[run] steps={args.steps} lr={args.lr} rank={args.rank} bs={args.batch_size} "
           f"w_moment={args.w_moment} w_photo={args.w_photo} w_geo={args.w_geo} "
-          f"w_sym={args.w_sym} gate={args.gate}(margin={args.gate_margin},alpha={args.gate_alpha}) "
+          f"w_sym={args.w_sym} w_coral={args.w_coral} coral={args.coral_stats or '-'} gate={args.gate}(margin={args.gate_margin},alpha={args.gate_alpha}) "
           f"init={args.init_adapter or '-'} early_stop={args.early_stop} "
           f"adapt_frac={args.adapt_frac} holdout={args.holdout_frac}")
     paths, sess_all = _sessions(index_dir, args.split)
@@ -595,6 +597,8 @@ def main():
                                                  w_cons=args.w_photo,
                                                  w_geo=args.w_geo,
                                                  w_sym=args.w_sym,
+                                                 w_coral=args.w_coral,
+                                                 coral_stats=args.coral_stats,
                                                  gate=args.gate,
                                                  gate_margin=args.gate_margin,
                                                  gate_alpha=args.gate_alpha,

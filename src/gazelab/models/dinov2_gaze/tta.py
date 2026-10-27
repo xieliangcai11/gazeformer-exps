@@ -52,6 +52,9 @@ class TTAConfig:
     #: 左右翻转对称（2D 屏幕版）：f(flip(x)) 的 x 应等于 1 - f(x) 的 x，y 不变。
     #: 与 Alfa 的 3D 对称损失同源；2D 需要镜像标签（已在数据增强中验证 ✓）。
     w_sym: float = 0.0
+    #: 特征分布对齐（CORAL）：把目标域特征均值/协方差拉向源域
+    w_coral: float = 0.0
+    coral_stats: str = ""
     geo_scale_amp: float = 0.05
     geo_shift_amp: float = 0.02
     w_reg: float = 1e-3           # 参数正则（拉向恒等）
@@ -200,6 +203,13 @@ def _sym_loss(pred: torch.Tensor, pred_flip: torch.Tensor) -> torch.Tensor:
     return ((pred_flip - target) ** 2).mean()
 
 
+def _coral_loss(h: torch.Tensor, mu: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
+    """特征均值 + 协方差对齐（Frobenius）。"""
+    hc = h - h.mean(0, keepdim=True)
+    cov_b = hc.t() @ hc / max(len(h) - 1, 1)
+    return ((h.mean(0) - mu) ** 2).mean() + ((cov_b - cov) ** 2).mean()
+
+
 def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
           extra_forward: Optional[Callable] = None, log: Callable[[str], None] = print,
           probe: Optional[Callable] = None):
@@ -236,6 +246,19 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         else:
             log(f"    [init] 未找到 {cfg.init_adapter}，从零开始")
     init_state = {k: v.detach().clone() for k, v in opt_adapter.state_dict().items()}
+    coral_mu = coral_cov = None
+    if cfg.w_coral > 0 and cfg.coral_stats:
+        import numpy as _np
+        cz = _np.load(cfg.coral_stats)
+        coral_mu = torch.as_tensor(cz["mean"], device=next(model.parameters()).device)
+        coral_cov = torch.as_tensor(cz["cov"], device=next(model.parameters()).device)
+        log(f"    [coral] stats={cfg.coral_stats} w={cfg.w_coral} "
+            f"mu_norm={float(coral_mu.norm()):.3f} trace={float(torch.diagonal(coral_cov).sum()):.3f}")
+    # 必须抓 adapter 的**输出**（head 输入），否则 CORAL 与 adapter 无关、梯度为 0。
+    h_state = {"h": None}
+    def _h_hook(_m, _i, o):
+        h_state["h"] = o if o.requires_grad else o.detach()
+    h_handle = opt_adapter.register_forward_hook(_h_hook)
     n_par = sum(p.numel() for p in opt_adapter.parameters())
     log(f"    [tta] adapter params={n_par} device={next(model.parameters()).device} "
         f"init_norm={sum(float(v.norm()) for v in init_state.values()):.6f}")
@@ -296,6 +319,8 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         gen_eval = torch.Generator().manual_seed(12345)
         with torch.no_grad():
             p1 = extra_forward(model, kw) if extra_forward else model(**kw)
+            if cfg.w_coral > 0 and coral_mu is not None:
+                out["coral"] = float(cfg.w_coral * _coral_loss(h_state["h"], coral_mu, coral_cov))
             out["moment"] = float(cfg.w_moment * _moment_loss(p1, prior, cfg.axis_weight))
             if cfg.w_cons > 0:
                 g = 1.0 + cfg.cons_jitter * (torch.rand(m, 1, 1, 1, generator=gen_eval) * 2 - 1)
@@ -322,9 +347,14 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
         idx = torch.randint(0, n, (bs,), generator=gen)
         kw = {k: v.float() for k, v in _batch(pool_a, idx).items()}
         pred = extra_forward(model, kw) if extra_forward else model(**kw)
+        h_main = h_state["h"]
+        _coral = cfg.w_coral * _coral_loss(h_main, coral_mu, coral_cov) if (cfg.w_coral > 0 and coral_mu is not None) else None
         _moment = cfg.w_moment * _moment_loss(pred, prior, cfg.axis_weight)
         parts = {"moment": float(_moment)}
         loss = _moment
+        if _coral is not None:
+            parts["coral"] = float(_coral)
+            loss = loss + _coral
         if cfg.w_cons > 0:
             g = 1.0 + cfg.cons_jitter * (torch.rand(len(idx), 1, 1, 1, generator=gen) * 2 - 1)
             b = cfg.cons_jitter * (torch.rand(len(idx), 1, 1, 1, generator=gen) * 2 - 1)
@@ -410,6 +440,7 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
             log(f"    [gate] v0={v0:.6f} v_final={v_final:.6f} accept={accept} "
                 f"gain={gain:+.4f} scale={scale:.2f} "
                 f"init_norm={d_init:.6f} adapted_norm={d_now:.6f}")
+    h_handle.remove()
     for p in params:
         p.requires_grad_(False)
     return model
