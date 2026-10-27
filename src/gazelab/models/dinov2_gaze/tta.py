@@ -46,9 +46,12 @@ class TTAConfig:
     w_moment: float = 1.0         # 输出矩匹配（我们的）权重
     w_cons: float = 1.0           # 光度一致性权重（亮度/对比度）
     #: 几何一致性权重：小仿射（缩放/平移）后注视不变 ⇒ 等价"增强一致性"。
-    #: 与文献的"对称/旋转一致性"同族，但我们输出的是**屏幕点** ⇒ 左右翻转的几何映射
-    #: 依赖头姿与屏幕几何，不能直接照搬 ✗ ⇒ 用"注视不变的几何抖动"替代 ✓
+    #: 与文献的"对称/旋转一致性"同族。2D 屏幕版本：镜像输入的预测应为
+    #: (1 - x, y)（已在本项目模型上实测：翻转图 vs 镜像标签误差 0.1077→0.1079 ✓）。
     w_geo: float = 0.0
+    #: 左右翻转对称（2D 屏幕版）：f(flip(x)) 的 x 应等于 1 - f(x) 的 x，y 不变。
+    #: 与 Alfa 的 3D 对称损失同源；2D 需要镜像标签（已在数据增强中验证 ✓）。
+    w_sym: float = 0.0
     geo_scale_amp: float = 0.05
     geo_shift_amp: float = 0.02
     w_reg: float = 1e-3           # 参数正则（拉向恒等）
@@ -170,6 +173,25 @@ def _photometric_4d(x: torch.Tensor, gain: torch.Tensor, bias: torch.Tensor) -> 
     return x * gain.to(x.device) + bias.to(x.device)
 
 
+def _flip_kw(kw: dict) -> dict:
+    """水平镜像输入：face/眼图翻转，左右眼互换；非图像字段原样保留。"""
+    out = {}
+    for k, v in kw.items():
+        if v.dim() == 4:
+            out[k] = torch.flip(v, dims=[3])
+        else:
+            out[k] = v
+    if "eye_l" in out and "eye_r" in out:
+        out["eye_l"], out["eye_r"] = out["eye_r"], out["eye_l"]
+    return out
+
+
+def _sym_loss(pred: torch.Tensor, pred_flip: torch.Tensor) -> torch.Tensor:
+    """2D 屏幕翻转对称：镜像输入的预测 = (1 - x, y)。"""
+    target = torch.stack([1.0 - pred[:, 0], pred[:, 1]], dim=1)
+    return ((pred_flip - target) ** 2).mean()
+
+
 def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
           extra_forward: Optional[Callable] = None, log: Callable[[str], None] = print,
           probe: Optional[Callable] = None):
@@ -242,6 +264,10 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
                 kw2 = {k: (_photometric_4d(v, g, b) if v.dim() == 4 else v) for k, v in kw.items()}
                 p2 = extra_forward(model, kw2) if extra_forward else model(**kw2)
                 ls = ls + cfg.w_cons * ((p1 - p2) ** 2).mean()
+            if cfg.w_sym > 0:
+                kwf = _flip_kw(kw)
+                pf = extra_forward(model, kwf) if extra_forward else model(**kwf)
+                ls = ls + cfg.w_sym * _sym_loss(p1, pf)
         return float(ls)
 
     model.eval()
@@ -276,6 +302,10 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
                     kw3[k] = v
             pred3 = extra_forward(model, kw3) if extra_forward else model(**kw3)
             loss = loss + cfg.w_geo * ((pred - pred3) ** 2).mean()
+        if cfg.w_sym > 0:
+            kwf = _flip_kw(kw)
+            predf = extra_forward(model, kwf) if extra_forward else model(**kwf)
+            loss = loss + cfg.w_sym * _sym_loss(pred, predf)
         if cfg.w_reg > 0:
             loss = loss + cfg.w_reg * opt_adapter.reg_loss()
         opt.zero_grad()

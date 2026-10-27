@@ -63,6 +63,9 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=None)
     ap.add_argument("--half", action="store_true", help="特征存 float16（省一半空间）")
+    ap.add_argument("--max-subjects", type=int, default=0,
+                    help="只导出前/随机 N 个被试（0=全部）")
+    ap.add_argument("--subject-seed", type=int, default=0)
     ap.add_argument("--per-session", type=int, default=0,
                     help="每个被试最多取多少帧（0=全部；用于快速导出）")
     args = ap.parse_args()
@@ -134,20 +137,34 @@ def main():
 
     # 以 loader 实际使用的全局行号为准重建 paths（build_dataloader 会剔除眼框不可用帧）
     base_ds, gidces = dl.dataset.base, list(dl.dataset.idces)
+    from torch.utils.data import Subset as _TSubset, DataLoader as _TDL
+    from collections import defaultdict as _dd
+    cur_ds = dl.dataset
+    positions = list(range(len(gidces)))          # 相对 cur_ds 的位置
     if args.per_session:
-        from torch.utils.data import Subset as _TSubset, DataLoader as _TDL
-        from collections import defaultdict as _dd
         per = _dd(list); sel = []
         for pos, gi in enumerate(gidces):
             subj = base_ds.rows[gi].get("subject", "?")
             if len(per[subj]) < args.per_session:
                 per[subj].append(pos); sel.append(pos)
-        final_gi = [gidces[k] for k in sel]
-        dl = _TDL(_TSubset(dl.dataset, sel), batch_size=args.batch_size,
+        positions = sel
+        print(f"[subset] per-session={args.per_session} ⇒ {len(positions)} 帧 / {len(per)} 被试")
+    if args.max_subjects:
+        subs = {base_ds.rows[gidces[p]].get("subject", "?") for p in positions}
+        subs = sorted(subs)
+        if len(subs) > args.max_subjects:
+            rng = np.random.RandomState(args.subject_seed)
+            subs = set(rng.choice(subs, args.max_subjects, replace=False).tolist())
+        else:
+            subs = set(subs)
+        keep = [k for k, p in enumerate(positions)
+                if base_ds.rows[gidces[p]].get("subject", "?") in subs]
+        positions = [positions[k] for k in keep]
+        print(f"[subset] max-subjects={args.max_subjects} ⇒ {len(positions)} 帧 / {len(subs)} 被试")
+    if args.per_session or args.max_subjects:
+        dl = _TDL(_TSubset(cur_ds, positions), batch_size=args.batch_size,
                   shuffle=False, num_workers=args.num_workers)
-        print(f"[subset] per-session={args.per_session} ⇒ {len(final_gi)} 帧 / {len(per)} 被试")
-    else:
-        final_gi = gidces
+    final_gi = [gidces[k] for k in positions]
     paths = [base_ds.rows[gi][spec["path_col"]] for gi in final_gi]
     print(f"[eval] 划分={args.split} 帧数={len(paths)} res={args.resolution} "
           f"eye={args.use_eye} geom={args.use_geom}")
