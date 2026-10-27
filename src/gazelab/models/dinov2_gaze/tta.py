@@ -68,6 +68,14 @@ class TTAConfig:
     #: ⇒ 当初 109 帧失败的真因（batch 128 > 池子 ⇒ 矩统计退化为拟合那几帧）已被根除 ✓；
     #: 且因果版（--adapt-frac 0.3 再乘 0.7 留出）的有效池只有会话的 ~21%，
     #: 200 的门限会让它几乎全被跳过（实测 ③ 20/20 会话几乎全跳 ✗）。
+    #: 安全门控：适配结束后用**无标签留出损失**判断是否变差；
+    #: 变差则回退到恒等，变好则只应用 gate_alpha 比例的修正。
+    gate: bool = False
+    gate_margin: float = 0.0      # 允许的留出损失相对恶化（0 = 不允许变差）
+    gate_alpha: float = 0.75      # 通过门控后应用的修正比例
+    gate_min_gain: float = 0.0    # 要求留出损失至少改善这个比例才接受
+    #: 可选：adapter 初始状态（源域预训练 / 元学习初始化）
+    init_adapter: str = ""
     min_frames: int = 80
     #: 只对"输出偏置/尺度"更敏感的轴加权（x 与 y 分开；None = 等权）
     axis_weight: Optional[tuple] = None
@@ -204,14 +212,25 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
     只需图像，**不需要真值** ⇒ 满足"无标签测试时自适应"的设置。
     """
     torch.manual_seed(cfg.seed)
+    log(f"    [tta] cfg steps={cfg.steps} lr={cfg.lr} rank={cfg.rank} bs={cfg.batch_size} "
+        f"w_moment={cfg.w_moment} w_photo={cfg.w_cons} w_geo={cfg.w_geo} w_sym={cfg.w_sym} "
+        f"w_reg={cfg.w_reg} holdout={cfg.holdout_frac} early_stop={cfg.early_stop} "
+        f"gate={cfg.gate}(margin={cfg.gate_margin},alpha={cfg.gate_alpha},"
+        f"min_gain={cfg.gate_min_gain}) init={cfg.init_adapter or '-'}")
     opt_adapter = attach_adapter(model, cfg)
     if cfg.init_adapter:
         from pathlib import Path as _P
         if _P(cfg.init_adapter).is_file():
-            opt_adapter.load_state_dict(torch.load(cfg.init_adapter, map_location="cpu"))
-            log(f"    [init] adapter 初始化 <- {cfg.init_adapter}")
+            st_init = torch.load(cfg.init_adapter, map_location="cpu")
+            missing, unexpected = opt_adapter.load_state_dict(st_init, strict=False)
+            log(f"    [init] adapter 初始化 <- {cfg.init_adapter} "
+                f"missing={list(missing)} unexpected={list(unexpected)}")
         else:
             log(f"    [init] 未找到 {cfg.init_adapter}，从零开始")
+    init_state = {k: v.detach().clone() for k, v in opt_adapter.state_dict().items()}
+    n_par = sum(p.numel() for p in opt_adapter.parameters())
+    log(f"    [tta] adapter params={n_par} device={next(model.parameters()).device} "
+        f"init_norm={sum(float(v.norm()) for v in init_state.values()):.6f}")
     for p in model.parameters():
         p.requires_grad_(False)
     params = list(opt_adapter.parameters())
@@ -234,6 +253,7 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
     else:
         pool_a, pool_v = frames, None
     n = len(pool_a)
+    log(f"    [tta] frames total={n_all} adapt={n} val={0 if pool_v is None else len(pool_v)}")
     if n == 0:
         raise ValueError("adapt: 目标域数据为空")
     # ---- 内建护栏（无标签 ✓，让方法自带"不该用就别用"的判断）----
@@ -242,12 +262,12 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
     if n < cfg.min_frames:
         log(f"    [tta] 跳过：目标域可用帧 {n} < min_frames({cfg.min_frames}) ⇒ 不做 TTA")
         with torch.no_grad():
-            for p in opt_adapter.parameters():
-                p.zero_()
+            opt_adapter.load_state_dict(init_state)
         for p in params:
             p.requires_grad_(False)
         return model
     bs = int(min(cfg.batch_size, max(8, n // 4)))
+    log(f"    [tta] effective batch={bs} adapt_pool={n} val_pool={0 if pool_v is None else len(pool_v)}")
 
     def _batch(pool, idx):
         if is_dict_list:
@@ -255,42 +275,54 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
             return {k: torch.stack([pool[int(i)][k] for i in idx]).to(dev) for k in keys}
         return {"face": pool[idx]}
 
-    def _val_loss(frames_pool):
-        """无监督验证损失（同适配目标，仅前向、不含正则）。"""
+    def _val_parts(frames_pool):
+        """无监督验证损失（同适配目标，仅前向、不含正则），返回各分量。"""
         if frames_pool is None:
-            return float("nan")
+            return {}
         m = min(bs, len(frames_pool))
         idx = torch.arange(m)
         kw = {k: v.float() for k, v in _batch(frames_pool, idx).items()}
+        out = {}
+        # 验证用的随机抖动必须固定种子：v0 与 v_final 才是同一把尺子。
+        gen_eval = torch.Generator().manual_seed(12345)
         with torch.no_grad():
             p1 = extra_forward(model, kw) if extra_forward else model(**kw)
-            ls = cfg.w_moment * _moment_loss(p1, prior, cfg.axis_weight)
+            out["moment"] = float(cfg.w_moment * _moment_loss(p1, prior, cfg.axis_weight))
             if cfg.w_cons > 0:
-                g = 1.0 + cfg.cons_jitter * (torch.rand(m, 1, 1, 1, generator=gen) * 2 - 1)
-                b = cfg.cons_jitter * (torch.rand(m, 1, 1, 1, generator=gen) * 2 - 1)
+                g = 1.0 + cfg.cons_jitter * (torch.rand(m, 1, 1, 1, generator=gen_eval) * 2 - 1)
+                b = cfg.cons_jitter * (torch.rand(m, 1, 1, 1, generator=gen_eval) * 2 - 1)
                 kw2 = {k: (_photometric_4d(v, g, b) if v.dim() == 4 else v) for k, v in kw.items()}
                 p2 = extra_forward(model, kw2) if extra_forward else model(**kw2)
-                ls = ls + cfg.w_cons * ((p1 - p2) ** 2).mean()
+                out["photo"] = float(cfg.w_cons * ((p1 - p2) ** 2).mean())
             if cfg.w_sym > 0:
                 kwf = _flip_kw(kw)
                 pf = extra_forward(model, kwf) if extra_forward else model(**kwf)
-                ls = ls + cfg.w_sym * _sym_loss(p1, pf)
-        return float(ls)
+                out["sym"] = float(cfg.w_sym * _sym_loss(p1, pf))
+        return out
+
+    def _val_loss(frames_pool):
+        parts = _val_parts(frames_pool)
+        return float(sum(parts.values())) if parts else float("nan")
 
     model.eval()
-    v0 = _val_loss(pool_v)                       # 第 0 步 = 恒等（未训练）参考
+    v0_parts = _val_parts(pool_v)
+    v0 = float(sum(v0_parts.values())) if v0_parts else float("nan")   # 第 0 步参考
+    log(f"    [tta] v0={v0:.6f} parts={ {k: round(v, 6) for k, v in v0_parts.items()} }")
     best_v, best_state, best_step = (v0, None, 0) if (cfg.early_stop and pool_v is not None) else (float("inf"), None, -1)
     for step in range(cfg.steps):
         idx = torch.randint(0, n, (bs,), generator=gen)
         kw = {k: v.float() for k, v in _batch(pool_a, idx).items()}
         pred = extra_forward(model, kw) if extra_forward else model(**kw)
+        parts = {"moment": float(cfg.w_moment * _moment_loss(pred, prior, cfg.axis_weight))}
         loss = cfg.w_moment * _moment_loss(pred, prior, cfg.axis_weight)
         if cfg.w_cons > 0:
             g = 1.0 + cfg.cons_jitter * (torch.rand(len(idx), 1, 1, 1, generator=gen) * 2 - 1)
             b = cfg.cons_jitter * (torch.rand(len(idx), 1, 1, 1, generator=gen) * 2 - 1)
             kw2 = {k: (_photometric_4d(v, g, b) if v.dim() == 4 else v) for k, v in kw.items()}
             pred2 = extra_forward(model, kw2) if extra_forward else model(**kw2)
-            loss = loss + cfg.w_cons * ((pred - pred2) ** 2).mean()
+            _photo = cfg.w_cons * ((pred - pred2) ** 2).mean()
+            parts["photo"] = float(_photo)
+            loss = loss + _photo
         if cfg.w_geo > 0:
             # 注视不变的几何抖动（小仿射）⇒ 预测应不变（同族于文献的增强一致性 ✓）
             sc = 1.0 + cfg.geo_scale_amp * (torch.rand(len(idx), generator=gen) * 2 - 1)
@@ -308,17 +340,22 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
                 else:
                     kw3[k] = v
             pred3 = extra_forward(model, kw3) if extra_forward else model(**kw3)
-            loss = loss + cfg.w_geo * ((pred - pred3) ** 2).mean()
+            _geo = cfg.w_geo * ((pred - pred3) ** 2).mean()
+            parts["geo"] = float(_geo)
+            loss = loss + _geo
         if cfg.w_sym > 0:
             kwf = _flip_kw(kw)
             predf = extra_forward(model, kwf) if extra_forward else model(**kwf)
-            loss = loss + cfg.w_sym * _sym_loss(pred, predf)
+            _sym = cfg.w_sym * _sym_loss(pred, predf)
+            parts["sym"] = float(_sym)
+            loss = loss + _sym
         if cfg.w_reg > 0:
-            loss = loss + cfg.w_reg * opt_adapter.reg_loss()
+            _reg = cfg.w_reg * opt_adapter.reg_loss()
+            parts["reg"] = float(_reg)
+            loss = loss + _reg
         opt.zero_grad()
         loss.backward()
-        if cfg.grad_clip:
-            torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+        gn = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip) if cfg.grad_clip else None
         opt.step()
         if (step + 1) % max(1, cfg.eval_every) == 0:
             # 探针与早停解耦：--no-early-stop（= 采用最终状态）时也必须能采到完整曲线 ✓
@@ -330,29 +367,39 @@ def adapt(model: nn.Module, frames, prior: dict, cfg: TTAConfig,
                     best_v, best_step = v, step + 1
                     best_state = {k: t.detach().clone() for k, t in opt_adapter.state_dict().items()}
         if (step + 1) % max(1, cfg.steps // 5) == 0:
-            log(f"    [tta] step {step + 1}/{cfg.steps}  loss {float(loss.detach()):.5f}"
-                f"  |bias| {float(opt_adapter.bias.abs().mean()):.4f}"
-                f"  val {(_val_loss(pool_v) if pool_v is not None else float('nan')):.5f}"
-                f"  best@{best_step}")
+            log(f"    [tta] step {step + 1}/{cfg.steps} loss {float(loss.detach()):.6f} "
+                f"parts={ {k: round(v, 6) for k, v in parts.items()} } "
+                f"grad={float(gn) if gn is not None else float('nan'):.4f} "
+                f"|bias|={float(opt_adapter.bias.abs().mean()):.5f} "
+                f"val={(_val_loss(pool_v) if pool_v is not None else float('nan')):.6f} best@{best_step}")
     if cfg.early_stop:
-        if best_state is None:                   # 没有任何一步优于恒等 ⇒ 回退（不做 TTA）
-            log(f"    [tta] 留出段未优于恒等（v0={v0:.5f}）⇒ 回退为不做 TTA")
+        if best_state is None:                   # 没有任何一步优于参考 ⇒ 回退到初始状态
+            log(f"    [tta] 留出段未优于参考（v0={v0:.5f}）⇒ 回退到初始 adapter")
             with torch.no_grad():
-                for p in opt_adapter.parameters():
-                    p.zero_()
+                opt_adapter.load_state_dict(init_state)
         else:
             opt_adapter.load_state_dict(best_state)
             log(f"    [tta] 采用最佳步 {best_step}（val {best_v:.5f} vs 恒等 {v0:.5f}）")
     # ---- 无标签安全门控：留出损失变差则回退；变好则只应用 gate_alpha ----
     if cfg.gate and pool_v is not None:
-        v_final = _val_loss(pool_v)
-        accept = v_final <= v0 * (1.0 + cfg.gate_margin)
-        scale = cfg.gate_alpha if accept else 0.0
-        with torch.no_grad():
-            for p_ in opt_adapter.parameters():
-                p_.mul_(scale)
-        log(f"    [gate] v0={v0:.5f} v_final={v_final:.5f} "
-            f"accept={accept} scale={scale:.2f}")
+        _delta = sum(float((p_.detach() - init_state[n]).norm())
+                     for n, p_ in opt_adapter.named_parameters())
+        if _delta < 1e-8:
+            log("    [gate] 适配增量≈0（已被早停回退到初始状态）⇒ 跳过门控")
+        else:
+            v_final = _val_loss(pool_v)
+            gain = (v0 - v_final) / max(abs(v0), 1e-8)
+            accept = (gain >= cfg.gate_min_gain) and (v_final <= v0 * (1.0 + cfg.gate_margin))
+            scale = cfg.gate_alpha if accept else 0.0
+            with torch.no_grad():
+                for name, p_ in opt_adapter.named_parameters():
+                    base_ = init_state[name]
+                    p_.copy_(base_ + scale * (p_ - base_))
+            d_init = sum(float(v.norm()) for v in init_state.values())
+            d_now = sum(float(p_.detach().norm()) for _, p_ in opt_adapter.named_parameters())
+            log(f"    [gate] v0={v0:.6f} v_final={v_final:.6f} accept={accept} "
+                f"gain={gain:+.4f} scale={scale:.2f} "
+                f"init_norm={d_init:.6f} adapted_norm={d_now:.6f}")
     for p in params:
         p.requires_grad_(False)
     return model

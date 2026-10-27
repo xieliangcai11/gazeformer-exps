@@ -19,6 +19,7 @@
 import argparse
 import json
 import sys
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -37,9 +38,15 @@ def load_model(args, cfg_side):
     m = RGBDGazeDINOv2(unfreeze_last=0, use_geom=cfg_side.get("use_geom", True),
                        use_geom_orient=cfg_side.get("geom_orient", False),
                        use_eye=cfg_side.get("use_eye", True),
+                       use_imu=cfg_side.get("use_imu", False),
                        img_size=args.resolution)
     st = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    load_state_dict_any_res(m, st.get("model", st))
+    miss, unexp, resampled = load_state_dict_any_res(m, st.get("model", st))
+    print(f"[meta] load missing={len(miss)} unexpected={len(unexp)} resampled={resampled}")
+    if miss:
+        print(f"[meta] missing[:12]={list(miss)[:12]}")
+    if unexp:
+        print(f"[meta] unexpected[:12]={list(unexp)[:12]}")
     return m.to(args.device).eval()
 
 
@@ -76,9 +83,18 @@ def main():
         p = __import__("pathlib").Path(args.ckpt).parent / name
         if p.is_file():
             side = json.loads(p.read_text(encoding="utf-8"))
-    use_eye = bool(side.get("use_eye", True))
-    use_geom = bool(side.get("use_geom", False))
-    geom_orient = bool(side.get("geom_orient", False))
+    st_raw = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    sd = st_raw.get("model", st_raw)
+    use_geom = any(k.startswith("proj_geom") for k in sd)
+    use_eye = any(k.startswith("proj_eye") for k in sd)
+    use_imu = any(k.startswith("proj_imu") for k in sd)
+    geom_orient = False
+    if use_geom:
+        w = sd.get("proj_geom.weight")
+        geom_orient = bool(w is not None and w.shape[1] >= 4)
+    side = {"use_eye": use_eye, "use_geom": use_geom, "geom_orient": geom_orient,
+            "use_imu": use_imu}
+    print(f"[meta] 模型结构: geom={use_geom} eye={use_eye} imu={use_imu} geom_orient={geom_orient}")
 
     dl = build_dataloader(args.dataset, args.split, index_dir, 64, False, 0,
                           orient="raw", eye_crops=use_eye, resolution=args.resolution,
@@ -89,10 +105,16 @@ def main():
     sess = defaultdict(list)
     for pos, p in enumerate(paths):
         sess[str(__import__("pathlib").Path(p).parent)].append(pos)
+    for k in sess:
+        sess[k].sort(key=lambda pos: int(base.rows[int(ds.idces[pos])].get("frame_index", pos)))
     keys = sorted(sess)
-    if args.max_sessions:
-        keys = keys[:args.max_sessions]
-    print(f"[meta] 源域会话 {len(keys)}")
+    if args.max_sessions and args.max_sessions < len(keys):
+        rng = np.random.RandomState(args.seed)
+        keys = list(rng.choice(keys, args.max_sessions, replace=False))
+    print(f"[meta] 源域会话 {len(keys)}  split={args.split}")
+    print(f"[meta] 超参 inner_steps={args.inner_steps} inner_lr={args.inner_lr} "
+          f"meta_iters={args.meta_iters} meta_lr={args.meta_lr} rank={args.rank} "
+          f"adapt_frames={args.adapt_frames} eval_frames={args.eval_frames} bs={args.batch_size}")
 
     model = load_model(args, side)
     for p in model.parameters():
@@ -103,21 +125,26 @@ def main():
                     w_cons=0.0, w_geo=0.0, w_sym=args.w_sym, w_reg=args.w_reg,
                     holdout_frac=0.0, early_stop=False, gate=False)
     adapter = attach_adapter(model, cfg)
+    # 用 adapter 的默认初始化（up=0, down~N(0,0.02)）作为元参数起点。
+    # 注意：不能把 down 也清零，否则 up 的梯度恒为 0，元学习完全学不动。
     meta = {k: v.detach().clone() for k, v in adapter.state_dict().items()}
-    # 从零初始化开始（与现有 TTA 一致）
-    for k in meta:
-        meta[k].zero_()
     named_params = list(adapter.named_parameters())
     params = [p for _, p in named_params]
 
     gen = torch.Generator().manual_seed(args.seed)
     dev = torch.device(args.device)
+    print(f"[meta] meta init norm={sum(float(v.norm()) for v in meta.values()):.6f}")
 
     def batch_from(idxs):
         items = [ds[i] for i in idxs]
         kw = {}
-        allowed = {"rgb": "face", "eye_l": "eye_l", "eye_r": "eye_r",
-                   "geom": "geom", "imu": "imu"}
+        allowed = {"rgb": "face"}
+        if use_eye:
+            allowed.update({"eye_l": "eye_l", "eye_r": "eye_r"})
+        if use_geom:
+            allowed["geom"] = "geom"
+        if use_imu:
+            allowed["imu"] = "imu"
         for k in items[0][0].keys():
             if k not in allowed:
                 continue
@@ -134,7 +161,10 @@ def main():
     prior_arr = np.stack(prior_labels)
     prior = {"mean": prior_arr.mean(0).tolist(),
              "std": (prior_arr.std(0) + 1e-6).tolist()}
+    print(f"[meta] prior mean={np.round(prior['mean'],4).tolist()} "
+          f"std={np.round(prior['std'],4).tolist()} n={len(prior_arr)}")
 
+    t0 = time.time()
     for it in range(args.meta_iters):
         s = keys[torch.randint(len(keys), (1,), generator=gen).item()]
         idx = sess[s]
@@ -143,6 +173,7 @@ def main():
         adapt_idx = idx[:cut]
         eval_idx = idx[cut:]
         if len(eval_idx) < 8:
+            print(f"[meta] skip {s}: eval={len(eval_idx)} < 8")
             continue
         if len(adapt_idx) > args.adapt_frames:
             sel = torch.randperm(len(adapt_idx), generator=gen)[:args.adapt_frames].tolist()
@@ -157,6 +188,8 @@ def main():
                 adapter.state_dict()[k].copy_(v)
             adapter.zero_grad(set_to_none=True)
         opt = torch.optim.Adam(params, lr=args.inner_lr)
+        first_loss = float("nan")
+        last_loss = float("nan")
         for step in range(args.inner_steps):
             bs = min(args.batch_size, len(adapt_idx))
             sel = torch.randint(len(adapt_idx), (bs,), generator=gen).tolist()
@@ -168,6 +201,9 @@ def main():
                 predf = model(**kwf)
                 loss = loss + cfg.w_sym * _sym_loss(pred, predf)
             loss = loss + cfg.w_reg * adapter.reg_loss()
+            if step == 0:
+                first_loss = float(loss)
+            last_loss = float(loss)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -183,13 +219,18 @@ def main():
             for (name, p) in named_params:
                 g = p.grad.detach() if p.grad is not None else torch.zeros_like(p)
                 meta[name] = meta[name] - args.meta_lr * g
-        if (it + 1) % 20 == 0:
-            print(f"[meta] iter {it+1}/{args.meta_iters} out={float(loss_out):.5f} "
-                  f"session={s.split('/')[-2]}/{s.split('/')[-1]}")
+        gn = sum(float(p.grad.norm()) for _, p in named_params if p.grad is not None)
+        mn = sum(float(v.norm()) for v in meta.values())
+        if it == 0 or (it + 1) % 5 == 0:
+            print(f"[meta] iter {it+1}/{args.meta_iters} session={s.split('/')[-2]}/{s.split('/')[-1]} "
+                  f"adapt={len(adapt_idx)} eval={len(eval_idx)} "
+                  f"inner_first={first_loss:.6f} inner_last={last_loss:.6f} "
+                  f"outer={float(loss_out):.6f} grad={gn:.4f} meta_norm={mn:.6f} "
+                  f"t={time.time()-t0:.1f}s")
 
     detach_adapter(model)
     torch.save(meta, args.out)
-    print(f"[meta] saved {args.out}")
+    print(f"[meta] saved {args.out} keys={ {k: tuple(v.shape) for k, v in meta.items()} }")
 
 
 if __name__ == "__main__":

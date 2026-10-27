@@ -263,6 +263,8 @@ def main():
     ap.add_argument("--gate", action="store_true", help="无标签安全门控：留出损失变差则回退")
     ap.add_argument("--gate-margin", type=float, default=0.0)
     ap.add_argument("--gate-alpha", type=float, default=0.75)
+    ap.add_argument("--gate-min-gain", type=float, default=0.0,
+                    help="留出损失至少改善该比例才接受（0=只要不变差）")
     ap.add_argument("--init-adapter", default="", help="adapter 初始状态（源域预训练/元学习）")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--rank", type=int, default=8)
@@ -307,17 +309,29 @@ def main():
             _cfg = json.loads(_side.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             _cfg = {}
+    # 没有 sidecar 时，从 checkpoint 的键**推断**结构；否则会静默丢掉/随机初始化
+    # 几何/眼/IMU 分支（2026-10-27 冒烟实测：RGD ckpt 缺 proj_geom 两键）。
+    import torch
+    _state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    _sd = _state.get("model", _state)
+    _inf_geom = any(k.startswith("proj_geom") for k in _sd)
+    _inf_eye = any(k.startswith("proj_eye") for k in _sd)
+    _inf_imu = any(k.startswith("proj_imu") for k in _sd)
+    _inf_orient = False
+    if _inf_geom:
+        _w = _sd.get("proj_geom.weight")
+        _inf_orient = bool(_w is not None and _w.shape[1] >= 4)
+    src = _side.name if _side.is_file() else "checkpoint keys"
     if args.use_geom is None:
-        args.use_geom = bool(_cfg.get("use_geom", True))
-        print(f"[cfg] use_geom={args.use_geom}"
-              f"（来源: {_side.name if _side.is_file() else '默认值'}）")
+        args.use_geom = bool(_cfg["use_geom"]) if "use_geom" in _cfg else _inf_geom
+        print(f"[cfg] use_geom={args.use_geom}（来源: {src}）")
     if args.use_eye is None:
-        args.use_eye = bool(_cfg.get("use_eye", True))
-        print(f"[cfg] use_eye={args.use_eye}"
-              f"（来源: {_side.name if _side.is_file() else '默认值'}）")
-    args.geom_orient = bool(_cfg.get("geom_orient", False)) and bool(args.use_geom)
-    print(f"[cfg] geom_orient={args.geom_orient}"
-          f"（来源: {_side.name if _side.is_file() else '默认值'}）")
+        args.use_eye = bool(_cfg["use_eye"]) if "use_eye" in _cfg else _inf_eye
+        print(f"[cfg] use_eye={args.use_eye}（来源: {src}）")
+    args.use_imu = bool(_cfg["use_imu"]) if "use_imu" in _cfg else _inf_imu
+    print(f"[cfg] use_imu={args.use_imu}（来源: {src}）")
+    args.geom_orient = (bool(_cfg["geom_orient"]) if "geom_orient" in _cfg else _inf_orient) and bool(args.use_geom)
+    print(f"[cfg] geom_orient={args.geom_orient}（来源: {src}）")
 
     # 硬性门禁：目标矩/目标点分布若来自测试真值，必须显式声明，否则结果只能当无标签报
     if not args.oracle_targets and args.prior_mode != "global":
@@ -328,13 +342,24 @@ def main():
     if args.oracle_targets:
         print("[oracle] 已启用测试真值构造目标分布 ⇒ 结果**不可**声明为零用户真值")
 
-    import torch
     spec = DATASET_SPECS[args.dataset]
     index_dir = Path(args.index_dir) if args.index_dir else Path(spec["default_index"])
-    device = "cuda:0" if (torch.cuda.is_available() or not args.smoke) else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda:0"
+    else:
+        device = "cpu"
+        print("[warn] CUDA 不可用 ⇒ 回退 CPU（结果仅供流程验证）")
     if args.smoke:
-        # 冒烟也优先用 GPU：设备/ dtype 类问题只在 GPU 上暴露
-        print(f"[smoke] device={device}（有 CUDA 就用 CUDA，否则 CPU）")
+        print(f"[smoke] device={device}")
+    print(f"[run] dataset={args.dataset} split={args.split} index={index_dir} "
+          f"ckpt={args.ckpt}")
+    print(f"[run] res={args.resolution} eye={args.use_eye} geom={args.use_geom} "
+          f"geom_orient={args.geom_orient} eye_scale={args.eye_scale} "
+          f"prior={args.prior}(mode={args.prior_mode})")
+    print(f"[run] steps={args.steps} lr={args.lr} rank={args.rank} bs={args.batch_size} "
+          f"w_moment={args.w_moment} w_photo={args.w_photo} w_geo={args.w_geo} "
+          f"w_sym={args.w_sym} gate={args.gate}(margin={args.gate_margin},alpha={args.gate_alpha}) "
+          f"init={args.init_adapter or '-'} early_stop={args.early_stop}")
     paths, sess_all = _sessions(index_dir, args.split)
     if args.smoke:
         sess_items = list(sess_all.items())[:1]
@@ -356,10 +381,15 @@ def main():
     # ---- 模型（冻结）----
     model = RGBDGazeDINOv2(unfreeze_last=0, use_geom=args.use_geom,
                            use_geom_orient=args.geom_orient,
+                           use_imu=args.use_imu,
                            use_eye=args.use_eye, img_size=args.resolution).to(device)
-    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    state = _state
     miss, unexp, resampled = load_state_dict_any_res(model, state)
     print(f"[load] {args.ckpt}  缺失键={len(miss)} 多余键={len(unexp)}")
+    if miss:
+        print(f"[load] missing[:12]={list(miss)[:12]}")
+    if unexp:
+        print(f"[load] unexpected[:12]={list(unexp)[:12]}")
     model.eval()
 
     def fwd(m, x):
@@ -404,6 +434,7 @@ def main():
                         "label_x", "label_y",
                         "em_base_cm", "em_tta_cm", "ang_base_deg", "ang_tta_deg"])
             w.writerows(dump_rows)
+            print(f"[dump] {dp} rows={len(dump_rows)}")
         tmp.replace(dp)
 
     for si, (s, idx) in enumerate(items):
@@ -432,6 +463,8 @@ def main():
                     f["eye_r"] = inp.eye_r[b]
                 if args.use_geom:
                     f["geom"] = inp.geom[b]
+                if args.use_imu:
+                    f["imu"] = inp.imu[b]
                 frames.append(f)
         # U2：矩匹配的目标分布（global=训练集全局先验 / session=本会话目标点边缘 / blend=插值）
         if args.prior_mode in ("session", "blend") and lab_chunks:
@@ -559,6 +592,7 @@ def main():
                                                  gate=args.gate,
                                                  gate_margin=args.gate_margin,
                                                  gate_alpha=args.gate_alpha,
+                                                 gate_min_gain=args.gate_min_gain,
                                                  init_adapter=args.init_adapter,
                                                  holdout_frac=args.holdout_frac,
                                                  eval_every=args.eval_every,
