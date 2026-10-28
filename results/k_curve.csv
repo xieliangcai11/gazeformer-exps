@@ -15,3 +15,7 @@ rgbdgaze,B2,13,-0.1605,1.4651,1.2299
 rgbdgaze,RobustSequential,13,-0.1744,1.4651,1.2097
 rgbdgaze,B2,26,-0.1887,1.4580,1.1837
 rgbdgaze,RobustSequential,26,-0.1959,1.4552,1.1701
+gazecapture,HuberB2,52,-0.2642,1.6061,1.1817
+gazecapture,HuberB2,104,-0.2722,1.5951,1.1610
+rgbdgaze,HuberB2,52,-0.2139,1.4411,1.1329
+rgbdgaze,HuberB2,104,-0.2049,1.4018,1.1145

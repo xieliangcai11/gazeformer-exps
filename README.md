@@ -56,6 +56,20 @@ At K=9 (≈28 labels/session) error drops from **1.612 → 1.256 cm**.
 
 At K=9 error drops from **1.465 → 1.201 cm**.
 
+### Label-budget curve (Huber calibration, frame-weighted cm)
+
+| K/context | GazeCapture | RGBDGaze |
+|---|---|---|
+9  | 1.256 | 1.230 |
+13 | 1.237 | 1.208 |
+26 | 1.202 | 1.155 |
+52 | 1.182 | 1.133 |
+104| 1.161 | 1.115 |
+
+Labels are per context: GazeCapture has ≈3.1 orientations/session, so K=52
+means ≈160 labels/session; K=104 means ≈320. Returns are strongly diminishing:
+going from K=9 to K=104 buys 0.095 cm (GC) / 0.115 cm (RGD) for 10× labels.
+
 Ablations: quadratic/RBF residual models did not beat affine; active D-optimal
 selection was worse than coverage/random; device-family priors and context
 means did not help; checkpoint ensembles did not improve the base model. See
