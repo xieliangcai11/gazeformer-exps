@@ -154,6 +154,9 @@ def main():
     ap.add_argument("--noise-mode", choices=["model", "const"], default="model")
     ap.add_argument("--prior-mode", choices=["cov", "ridge"], default="cov")
     ap.add_argument("--prior-lam", type=float, default=1.0)
+    ap.add_argument("--huber-delta", type=float, default=0.0,
+                    help=">0 时启用 Huber IRLS（如 1.345）")
+    ap.add_argument("--huber-iters", type=int, default=5)
     ap.add_argument("--select-mode", choices=["info", "coverage", "coverage_b2"],
                     default="info")
     ap.add_argument("--coverage-cells", action="store_true",
@@ -273,27 +276,33 @@ def main():
 
         def build():
             n = len(chosen)
-            X = np.zeros((2 * n, 4)); y = np.zeros(2 * n); w = np.zeros(2 * n)
+            X = np.zeros((2 * n, 4)); y = np.zeros(2 * n); w0 = np.zeros(2 * n)
             for j, i in enumerate(chosen):
                 p = d["pred"][i]; u = d["label"][i]
                 s2 = sigma2(p, d["pose"][i], d["w"][i], d["h"][i])
                 X[2 * j] = [p[0], 1, 0, 0]; y[2 * j] = u[0]
                 X[2 * j + 1] = [0, 0, p[1], 1]; y[2 * j + 1] = u[1]
-                w[2 * j] = w[2 * j + 1] = 1.0 / s2
-            if len(w):
-                w = w / (w.mean() + 1e-12)   # 归一化：先验强度与 B2 可比
+                w0[2 * j] = w0[2 * j + 1] = 1.0 / s2
+            if len(w0):
+                w0 = w0 / (w0.mean() + 1e-12)
+            w = w0
             Lam = Lam0 + X.T @ (w[:, None] * X)
             eta = Lam0 @ mu + X.T @ (w * y)
-            if a.debug and len(chosen) <= 2:
-                print(f"      [build] n={n} X[:4]={np.round(X[:4],3).tolist()} "
-                      f"y[:4]={np.round(y[:4],3).tolist()} w[:4]={np.round(w[:4],5).tolist()} "
-                      f"mu={np.round(mu,3).tolist()}")
-                try:
-                    Xw = X * np.sqrt(w)[:, None]
-                    th_ls = np.linalg.lstsq(Xw, y * np.sqrt(w), rcond=None)[0]
-                    print(f"      [build] weighted_ls={np.round(th_ls,3).tolist()}")
-                except Exception as e:
-                    print("      [build] ls err", e)
+            th = np.linalg.solve(Lam, eta)
+            if a.huber_delta > 0 and n >= 3:
+                for _ in range(a.huber_iters):
+                    rx = y[0::2] - X[0::2] @ th
+                    ry = y[1::2] - X[1::2] @ th
+                    rn = np.hypot(rx, ry)
+                    scale = 1.4826 * np.median(np.abs(rn - np.median(rn))) + 1e-9
+                    hw = np.minimum(1.0, a.huber_delta * scale / (rn + 1e-12))
+                    w = w0 * np.repeat(hw, 2)
+                    Lam = Lam0 + X.T @ (w[:, None] * X)
+                    eta = Lam0 @ mu + X.T @ (w * y)
+                    th = np.linalg.solve(Lam, eta)
+                if a.debug and n <= 3:
+                    print(f"      [huber] n={n} downweight={float((hw<0.999).mean()):.2f} "
+                          f"delta={a.huber_delta}")
             return Lam, eta
 
         if a.select_mode == "coverage":
