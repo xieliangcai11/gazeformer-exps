@@ -15,6 +15,3 @@ rgbdgaze,B2,13,-0.1605,1.4651,1.2299
 rgbdgaze,RobustSequential,13,-0.1744,1.4651,1.2097
 rgbdgaze,B2,26,-0.1887,1.4580,1.1837
 rgbdgaze,RobustSequential,26,-0.1959,1.4552,1.1701
-rgbdgaze,RobustSequential+Smooth2,5,-0.2127,1.4704,1.1577
-rgbdgaze,RobustSequential+Smooth2,9,-0.2669,1.4673,1.0756
-rgbdgaze,RobustSequential+Smooth2,13,-0.2577,1.4651,1.0875

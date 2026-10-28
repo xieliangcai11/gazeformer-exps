@@ -25,9 +25,6 @@ with a population prior learned from source users and a robust (Huber) fit:
 4. **Sequential update (optional)** — points can be processed one by one with a
    Bayesian posterior; fixed K and sequential updates are mathematically
    equivalent when no early stopping is used.
-5. **Causal temporal smoothing (optional)** — for smoothly moving targets,
-   average the last 2 calibrated predictions. This is a large gain on RGBDGaze
-   and hurts on GazeCapture, so it is selected on validation data.
 
 No target-domain labels are used outside the K calibration points. Evaluation
 labels are used only for scoring.
@@ -47,20 +44,17 @@ K is per context (per orientation / per activity); 5 calibration-seed average.
 | 26 | −23.23% | **−25.26%** |
 
 At K=9 (≈28 labels/session) error drops from **1.612 → 1.256 cm**.
-Temporal smoothing is disabled here: the validation error increases because
-sequences mix orientations / jumps.
 
 ### RGBDGaze
 
-| K/activity | B2 | Robust sequential | Robust + causal smoothing (w=2) |
-|---|---|---|---|
-| 5  | −12.71% | −13.37% | **−21.27%** |
-| 9  | −16.96% | −18.19% | **−26.69%** |
-| 13 | −16.05% | −17.44% | **−25.77%** |
-| 26 | −18.87% | −19.59% | — |
+| K/activity | B2 | Robust sequential |
+|---|---|---|
+| 5  | −12.71% | **−13.37%** |
+| 9  | −16.96% | **−18.19%** |
+| 13 | −16.05% | **−17.44%** |
+| 26 | −18.87% | **−19.59%** |
 
-At K=9 error drops from **1.465 → 1.201 cm** without smoothing and
-**1.465 → 1.076 cm** with causal smoothing (w=2, selected on validation).
+At K=9 error drops from **1.465 → 1.201 cm**.
 
 Ablations: quadratic/RBF residual models did not beat affine; active D-optimal
 selection was worse than coverage/random; device-family priors and context
@@ -133,9 +127,7 @@ python -m scripts.calibration.seq_bayes_calib \
   --out out/gazecapture/analysis/calibrated.csv
 ```
 
-For RGBDGaze use `--context-key activity --prior-lam 0.1 --huber-delta 1.345`;
-add `--smooth-window 2` for smoothly moving targets. Do **not** enable smoothing
-on GazeCapture (mixed orientations; validation error increases).
+For RGBDGaze use `--context-key activity --prior-lam 0.1 --huber-delta 1.345`.
 
 ## Notes and limitations
 
