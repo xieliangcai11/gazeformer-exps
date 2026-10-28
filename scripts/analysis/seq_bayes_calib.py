@@ -151,7 +151,11 @@ def main():
     ap.add_argument("--min-dist", type=float, default=0.18)
     ap.add_argument("--margin", type=float, default=0.08)
     ap.add_argument("--ridge-noise", type=float, default=1e-2)
-    ap.add_argument("--select-mode", choices=["info", "coverage"], default="info")
+    ap.add_argument("--noise-mode", choices=["model", "const"], default="model")
+    ap.add_argument("--prior-mode", choices=["cov", "ridge"], default="cov")
+    ap.add_argument("--prior-lam", type=float, default=1.0)
+    ap.add_argument("--select-mode", choices=["info", "coverage", "coverage_b2"],
+                    default="info")
     ap.add_argument("--coverage-cells", action="store_true",
                     help="选点时强制覆盖 3×3 屏幕格子")
     ap.add_argument("--debug", action="store_true")
@@ -186,18 +190,23 @@ def main():
     nmu = NF.mean(0); nsd = NF.std(0) + 1e-6
     Xn = np.concatenate([(NF - nmu) / nsd, np.ones((len(NF), 1))], 1)
     Wn = np.linalg.solve(Xn.T @ Xn + a.ridge_noise * np.eye(Xn.shape[1]), Xn.T @ LR)
+    const_s2 = float(np.exp(LR.mean()))
     print(f"[seq] theta mean={np.round(mu,4).tolist()} std={np.round(np.sqrt(np.diag(S)),4).tolist()}")
     print(f"[seq] noise logvar mean={LR.mean():.3f} std={LR.std():.3f} "
-          f"features={NF.shape[1]}")
-
+          f"features={NF.shape[1]} const_s2={const_s2:.5f} mode={a.noise_mode} "
+          f"prior={a.prior_mode}(lam={a.prior_lam})")
     def sigma2(p, pose, w, h):
+        if a.noise_mode == "const":
+            return const_s2
         f = (noise_feats(p, pose, w, h) - nmu) / nsd
         x = np.concatenate([f, [1.0]])
         lv = float(x @ Wn)
         return float(np.clip(np.exp(lv), 1e-4, 5e-2))
 
     def prior_prec():
-        return np.linalg.inv(S)
+        if a.prior_mode == "ridge":
+            return a.prior_lam * np.eye(4)
+        return a.prior_lam * np.linalg.inv(S)
 
     # 候选位置网格
     qs = []
@@ -223,6 +232,21 @@ def main():
         x1 = np.array([q[0], 1, 0, 0]); x2 = np.array([0, 0, q[1], 1])
         M = Lam + (x1[:, None] @ x1[None, :] + x2[:, None] @ x2[None, :]) / s2
         return float(np.linalg.slogdet(M)[1]), i
+
+    def coverage_b2(d, k, seed=0):
+        rng = np.random.RandomState(abs(hash((d["label"][0, 0], k, seed))) % 2**31)
+        cells = defaultdict(list)
+        for j in range(len(d["pred"])):
+            cells[(min(2, int(d["pred"][j, 0] * 3)),
+                   min(2, int(d["pred"][j, 1] * 3)))].append(j)
+        per = max(1, k // max(1, len(cells)))
+        sel = []
+        for v in cells.values():
+            v = list(v); rng.shuffle(v); sel += v[:per]
+        rest = [j for j in range(len(d["pred"])) if j not in set(sel)]
+        if len(sel) < k:
+            sel += list(rng.choice(rest, min(k - len(sel), len(rest)), replace=False))
+        return sorted(set(sel))[:k]
 
     def coverage_order(d):
         cells = defaultdict(list)
@@ -256,6 +280,8 @@ def main():
                 X[2 * j] = [p[0], 1, 0, 0]; y[2 * j] = u[0]
                 X[2 * j + 1] = [0, 0, p[1], 1]; y[2 * j + 1] = u[1]
                 w[2 * j] = w[2 * j + 1] = 1.0 / s2
+            if len(w):
+                w = w / (w.mean() + 1e-12)   # 归一化：先验强度与 B2 可比
             Lam = Lam0 + X.T @ (w[:, None] * X)
             eta = Lam0 @ mu + X.T @ (w * y)
             if a.debug and len(chosen) <= 2:
@@ -270,11 +296,16 @@ def main():
                     print("      [build] ls err", e)
             return Lam, eta
 
-        order = coverage_order(d) if a.select_mode == "coverage" else None
+        if a.select_mode == "coverage":
+            order = coverage_order(d)
+        elif a.select_mode == "coverage_b2":
+            order = coverage_b2(d, a.kmax, 0)
+        else:
+            order = None
         for step in range(a.kmax):
             Lam, _ = build()
             best = (-1e9, None, None)
-            if a.select_mode == "coverage":
+            if a.select_mode in ("coverage", "coverage_b2"):
                 nxt = None
                 for i in order:
                     if i not in chosen:
