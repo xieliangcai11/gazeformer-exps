@@ -1,0 +1,17 @@
+dataset,method,K,relative,base_cm,calibrated_cm
+gazecapture,B2,5,-0.1586,1.6120,1.3564
+gazecapture,RobustSequential,5,-0.1768,1.6120,1.3270
+gazecapture,B2,9,-0.1997,1.6118,1.2900
+gazecapture,RobustSequential,9,-0.2210,1.6118,1.2555
+gazecapture,B2,13,-0.2212,1.6122,1.2556
+gazecapture,RobustSequential,13,-0.2362,1.6122,1.2314
+gazecapture,B2,26,-0.2323,1.6108,1.2360
+gazecapture,RobustSequential,26,-0.2526,1.6108,1.2039
+rgbdgaze,B2,5,-0.1271,1.4704,1.2835
+rgbdgaze,RobustSequential,5,-0.1337,1.4704,1.2738
+rgbdgaze,B2,9,-0.1696,1.4673,1.2184
+rgbdgaze,RobustSequential,9,-0.1819,1.4673,1.2005
+rgbdgaze,B2,13,-0.1605,1.4651,1.2299
+rgbdgaze,RobustSequential,13,-0.1744,1.4651,1.2097
+rgbdgaze,B2,26,-0.1887,1.4580,1.1837
+rgbdgaze,RobustSequential,26,-0.1959,1.4552,1.1701
