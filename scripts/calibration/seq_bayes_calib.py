@@ -167,6 +167,8 @@ def main():
                     help=">0 时启用 Huber IRLS（如 1.345）")
     ap.add_argument("--huber-iters", type=int, default=5)
     ap.add_argument("--bootstrap", type=int, default=1000)
+    ap.add_argument("--smooth-window", type=int, default=1,
+                    help=">1 时对校准后预测做因果滑动平均")
     ap.add_argument("--gate-quantile", type=float, default=0.0,
                     help=">0 时启用质量门控：验证残差该分位数为阈值")
     ap.add_argument("--select-mode", choices=["info", "coverage", "coverage_b2"],
@@ -399,7 +401,14 @@ def main():
         if len(ev) < 20:
             return None
         e0 = em(d["pred"][ev], d["label"][ev], d["sx"][ev], d["sy"][ev]).mean()
-        e1 = em(apply_theta(d["pred"][ev], th), d["label"][ev],
+        q = apply_theta(d["pred"][ev], th)
+        if a.smooth_window > 1:
+            w = a.smooth_window
+            qs = q.copy()
+            for i in range(len(q)):
+                qs[i] = q[max(0, i - w + 1):i + 1].mean(0)
+            q = qs
+        e1 = em(q, d["label"][ev],
                 d["sx"][ev], d["sy"][ev]).mean()
         return e0, e1, len(ev)
 
