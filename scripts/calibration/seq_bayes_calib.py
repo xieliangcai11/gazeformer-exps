@@ -166,6 +166,7 @@ def main():
     ap.add_argument("--huber-delta", type=float, default=0.0,
                     help=">0 时启用 Huber IRLS（如 1.345）")
     ap.add_argument("--huber-iters", type=int, default=5)
+    ap.add_argument("--bootstrap", type=int, default=1000)
     ap.add_argument("--gate-quantile", type=float, default=0.0,
                     help=">0 时启用质量门控：验证残差该分位数为阈值")
     ap.add_argument("--select-mode", choices=["info", "coverage", "coverage_b2"],
@@ -466,6 +467,12 @@ def main():
             w = _csv.writer(fh)
             w.writerow(["method", "session", "K", "stop", "sd_max", "base", "calib", "n"])
             w.writerows(rows)
+        rr = np.array([x[6] / x[5] - 1 for x in rows if x[0] == "seq"])
+        if len(rr) > 5 and a.bootstrap:
+            rng = np.random.RandomState(0)
+            bs = [rr[rng.randint(0, len(rr), len(rr))].mean() for _ in range(a.bootstrap)]
+            print(f"[seq] seq ratio {100*rr.mean():+.2f}% "
+                  f"CI [{100*np.percentile(bs,2.5):+.2f},{100*np.percentile(bs,97.5):+.2f}]")
         print(f"[seq] gated={gated}/{len(ST)}")
         print(f"[seq] saved {out} maxrss="
               f"{_maxrss():.2f}GB")
