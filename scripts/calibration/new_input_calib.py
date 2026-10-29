@@ -167,6 +167,7 @@ def main():
     ap.add_argument("--use-context", action="store_true")
     ap.add_argument("--use-imu", action="store_true")
     ap.add_argument("--semi", choices=["none", "transductive"], default="none")
+    ap.add_argument("--pseudo", choices=["none", "half"], default="none")
     ap.add_argument("--select", choices=["coverage", "random", "dopt"], default="coverage")
     ap.add_argument("--robust-iters", type=int, default=6)
     ap.add_argument("--use-pose", action="store_true")
@@ -350,7 +351,30 @@ def main():
                         corr = net(torch.tensor(Ze_raw, dtype=torch.float32)).numpy()
                     lams_used.append(0.0)
                 corr = np.clip(corr, -0.15, 0.15)
-                q1 = q0 + corr
+                if a.pseudo == "half" and len(q) >= 40 and a.method == "ridge":
+                    half = len(q) // 2
+                    qp, qe = q[:half], q[half:]
+                    # pseudo labels from the initial corrected prediction
+                    y_p = q0[:half] + corr[:half]
+                    Rp = y_p - apply_theta_np(d["pred"][qp], th)
+                    Zp = Ze[:half]
+                    w2 = []
+                    for ax in range(2):
+                        Zc = np.concatenate([Zs, Zp], 0)
+                        Rc = np.concatenate([Rs[:, ax], Rp[:, ax]], 0)
+                        if a.robust:
+                            w2.append(fit_robust(Zc, Rc, lam_used[ax],
+                                                 iters=a.robust_iters))
+                        else:
+                            w2.append(fit_ridge(Zc, Rc, lam_used[ax]))
+                    corr_e = np.stack([Ze[half:] @ w2[0], Ze[half:] @ w2[1]], 1)
+                    corr_e = np.clip(corr_e, -0.15, 0.15)
+                    q0, q = q0[half:], qe
+                    e0 = float(em(q0, d["label"][q], d["sx"][q],
+                                  d["sy"][q]).mean())
+                    q1 = q0 + corr_e
+                else:
+                    q1 = q0 + corr
                 e1 = float(em(q1, d["label"][q], d["sx"][q], d["sy"][q]).mean())
             r0 += e0 * len(q)
             r1 += e1 * len(q)
