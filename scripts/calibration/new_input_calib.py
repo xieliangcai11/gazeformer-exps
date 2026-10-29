@@ -166,6 +166,7 @@ def main():
     ap.add_argument("--robust", action="store_true")
     ap.add_argument("--use-context", action="store_true")
     ap.add_argument("--use-imu", action="store_true")
+    ap.add_argument("--depth-npz", default="")
     ap.add_argument("--semi", choices=["none", "transductive"], default="none")
     ap.add_argument("--pseudo", choices=["none", "half"], default="none")
     ap.add_argument("--select", choices=["coverage", "random", "dopt"], default="coverage")
@@ -230,6 +231,19 @@ def main():
         names = names + ["imu_x", "imu_y", "imu_z"]
         use = np.concatenate([use, np.ones(3, bool)])
         log("[ncal] appended IMU features")
+    if a.depth_npz:
+        dz = np.load(a.depth_npz, allow_pickle=True)
+        dnames = [str(n) for n in dz["names"].tolist()]
+        df = np.full((len(rows), len(dnames)), np.nan, np.float32)
+        dv = np.zeros(len(rows), bool)
+        dr = dz["row_idx"].astype(np.int64)
+        df[dr] = dz["feats"]
+        dv[dr] = dz["valid"]
+        F = np.concatenate([F, df], 1)
+        V = V & dv
+        names = names + dnames
+        use = np.concatenate([use, np.ones(len(dnames), bool)])
+        log(f"[ncal] appended depth dims={len(dnames)}")
     if a.use_context:
         ccol = "activity" if "activity" in rows[0] else (
             "orientation" if "orientation" in rows[0] else None)
