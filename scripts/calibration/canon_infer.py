@@ -51,6 +51,10 @@ def load_model(ckpt, device, use_geom=False, geom_orient=False):
         use_eye=True, img_size=224,
     ).to(device)
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "model" in state:
+        log(f"[canon] ckpt bundle epoch={state.get('epoch')} "
+            f"best_val={state.get('best_val')}")
+        state = state["model"]
     miss, unexp, resampled = load_state_dict_any_res(model, state)
     log(f"[canon] load missing={len(miss)} unexpected={len(unexp)} resampled={resampled}")
     if miss or unexp:
@@ -98,6 +102,7 @@ def main():
                     help="keep original geom (incl. orientation one-hot) or "
                          "replace it with the canonical orientation")
     ap.add_argument("--limit", type=int, default=0, help="debug: first N frames")
+    ap.add_argument("--stride", type=int, default=1, help="subsample stride")
     ap.add_argument("--log-every", type=int, default=25)
     a = ap.parse_args()
 
@@ -135,6 +140,8 @@ def main():
     paths = [str(p) for p in z["path"].tolist()]
     label = z["label"].astype(np.float32)
     fidx = z["frame_index"].astype(np.int64)
+    if a.stride > 1:
+        paths, label, fidx = paths[::a.stride], label[::a.stride], fidx[::a.stride]
     if a.limit:
         paths, label, fidx = paths[:a.limit], label[:a.limit], fidx[:a.limit]
     idxs = [lookup[p] for p in paths if p in lookup]
