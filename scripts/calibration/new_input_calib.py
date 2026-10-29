@@ -52,6 +52,33 @@ def load_sessions_rows(feat_npz, index_csv, context_key, path_to_row, invalid_ro
     return out
 
 
+def select_support(d, K, rng, F, V, rows, mode):
+    if mode == "coverage":
+        return support_indices(d, K, rng)
+    n = len(d["pred"])
+    if mode == "random":
+        return np.sort(rng.choice(n, min(K, n), replace=False))
+    # greedy max-min diversity in standardized feature space
+    X = F[rows].astype(np.float64).copy()
+    ok = V[rows] & np.isfinite(X).all(1)
+    if ok.sum() < K:
+        return support_indices(d, K, rng)
+    mu = X[ok].mean(0)
+    sd = X[ok].std(0) + 1e-6
+    X = np.clip((X - mu) / sd, -5.0, 5.0)
+    X[~np.isfinite(X)] = 0.0
+    X = np.concatenate([X, d["pred"] * 3.0], 1)
+    cand = np.where(ok)[0]
+    sel = [int(cand[rng.randint(len(cand))])]
+    dist = np.linalg.norm(X[cand] - X[sel[0]], axis=1)
+    while len(sel) < min(K, len(cand)):
+        j = int(np.argmax(dist))
+        sel.append(int(cand[j]))
+        d2 = np.linalg.norm(X[cand] - X[sel[-1]], axis=1)
+        dist = np.minimum(dist, d2)
+    return np.array(sorted(sel), np.int64)
+
+
 def region_feats(P, mode):
     if mode == "none":
         return np.zeros((len(P), 0), np.float64)
@@ -137,6 +164,7 @@ def main():
     ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="none")
     ap.add_argument("--robust", action="store_true")
     ap.add_argument("--use-context", action="store_true")
+    ap.add_argument("--select", choices=["coverage", "random", "dopt"], default="coverage")
     ap.add_argument("--robust-iters", type=int, default=6)
     ap.add_argument("--use-pose", action="store_true")
     ap.add_argument("--mlp-hidden", type=int, default=32)
@@ -221,7 +249,8 @@ def main():
     for si, (s, d) in enumerate(S.items()):
         r0 = r1 = rn = 0.0
         for seed in range(a.seeds):
-            sel = support_indices(d, a.K, np.random.RandomState(90000 + seed))
+            sel = select_support(d, a.K, np.random.RandomState(90000 + seed),
+                                 F, V, d["rows"], a.select)
             q = np.setdiff1d(np.arange(len(d["pred"])), sel)
             if len(q) < 20:
                 continue
