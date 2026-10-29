@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 
 sys.path[:0] = ["src", "."]
 from configs.rgbdgaze_config import RGBDGaze_INDEX_DIR  # noqa: E402
@@ -42,6 +43,23 @@ def load_model(ckpt, device, use_geom=False, geom_orient=False):
         raise RuntimeError("checkpoint mismatch")
     model.eval()
     return model
+
+
+def augment(x, mode):
+    """Small geometric / photometric augmentations on a batch of images."""
+    if mode == "scale90":
+        c = int(x.shape[-1] * 0.90)
+        return TF.resize(TF.center_crop(x, c), [x.shape[-2], x.shape[-1]])
+    if mode == "scale110":
+        c = int(x.shape[-1] * 1.10)
+        return TF.resize(TF.center_crop(x, c), [x.shape[-2], x.shape[-1]])
+    if mode == "rot5":
+        return TF.rotate(x, 5.0)
+    if mode == "rotm5":
+        return TF.rotate(x, -5.0)
+    if mode == "color":
+        return TF.adjust_contrast(TF.adjust_brightness(x, 1.05), 1.05)
+    raise ValueError(mode)
 
 
 def main():
@@ -114,7 +132,8 @@ def main():
                               eye_r=torch.flip(er, [3]), geom=gm)
                     q = torch.stack([1.0 - q[:, 0], q[:, 1]], 1)
                 else:
-                    raise ValueError(v)
+                    q = model(augment(face, v), eye_l=augment(el, v),
+                              eye_r=augment(er, v), geom=gm)
                 acc.append(q.cpu().numpy())
         out[st:st + len(sub)] = np.mean(acc, 0)
         if st % (a.batch * 25) == 0:

@@ -52,6 +52,19 @@ def load_sessions_rows(feat_npz, index_csv, context_key, path_to_row, invalid_ro
     return out
 
 
+def region_feats(P, mode):
+    if mode == "none":
+        return np.zeros((len(P), 0), np.float64)
+    R = 2 if mode == "2x2" else 3
+    rx = np.clip((P[:, 0] * R).astype(int), 0, R - 1)
+    ry = np.clip((P[:, 1] * R).astype(int), 0, R - 1)
+    idx = ry * R + rx
+    oh = np.zeros((len(P), R * R), np.float64)
+    oh[np.arange(len(P)), idx] = 1.0
+    inter = np.concatenate([oh * P[:, 0:1], oh * P[:, 1:2]], 1)
+    return np.concatenate([oh, inter], 1)
+
+
 def prep_features(F, V, idx):
     """Standardize on the support subset, fill missing with 0."""
     X = F[idx].astype(np.float64).copy()
@@ -69,6 +82,18 @@ def prep_features(F, V, idx):
 def fit_ridge(Z, y, lam):
     A = Z.T @ Z + lam * np.eye(Z.shape[1])
     return np.linalg.solve(A, Z.T @ y)
+
+
+def fit_robust(Z, y, lam, delta=1.345, iters=6):
+    w = fit_ridge(Z, y, lam)
+    for _ in range(iters):
+        r = y - Z @ w
+        scale = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-6
+        u = np.abs(r) / (delta * scale)
+        wt = np.where(u <= 1.0, 1.0, 1.0 / np.maximum(u, 1e-9))
+        A = Z.T @ (wt[:, None] * Z) + lam * np.eye(Z.shape[1])
+        w = np.linalg.solve(A, Z.T @ (wt * y))
+    return w
 
 
 def loo_lam(Z, y, lams):
@@ -108,6 +133,10 @@ def main():
     ap.add_argument("--split", choices=["val", "test"], default="val")
     ap.add_argument("--groups", nargs="+", default=["all"])
     ap.add_argument("--method", choices=["ridge", "mlp"], default="ridge")
+    ap.add_argument("--gate", action="store_true")
+    ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="none")
+    ap.add_argument("--robust", action="store_true")
+    ap.add_argument("--robust-iters", type=int, default=6)
     ap.add_argument("--use-pose", action="store_true")
     ap.add_argument("--mlp-hidden", type=int, default=32)
     ap.add_argument("--mlp-steps", type=int, default=300)
@@ -194,12 +223,50 @@ def main():
                 Ze_raw = np.clip((Ze_raw - fmu) / fsd, -5.0, 5.0)
                 Ze_raw[~np.isfinite(Ze_raw)] = 0.0
                 if a.method == "ridge":
+                    Zs = np.concatenate([Zs, region_feats(d["pred"][sel], a.regions)], 1)
+                    Ze_raw = np.concatenate(
+                        [Ze_raw, region_feats(d["pred"][q], a.regions)], 1)
                     w = []
                     lam_used = []
                     for ax in range(2):
                         lam_ax = loo_lam(Zs, Rs[:, ax], a.lams)
                         lam_used.append(lam_ax)
-                        w.append(fit_ridge(Zs, Rs[:, ax], lam_ax))
+                        if a.robust:
+                            w.append(fit_robust(Zs, Rs[:, ax], lam_ax,
+                                                iters=a.robust_iters))
+                        else:
+                            w.append(fit_ridge(Zs, Rs[:, ax], lam_ax))
+                    if a.gate:
+                        # baseline LOO: Huber fitted on support-minus-j
+                        base_loo = []
+                        for j in range(len(d["pred"][sel])):
+                            m = np.ones(len(d["pred"][sel]), bool)
+                            m[j] = False
+                            if m.sum() < 3:
+                                continue
+                            thj, _ = fit_theta_huber(d["pred"][sel][m],
+                                                     d["label"][sel][m],
+                                                     a.lam, mu_aff, a.delta)
+                            qj = apply_theta_np(d["pred"][sel][j:j + 1], thj)
+                            base_loo.append(float(
+                                em(qj, d["label"][sel][j:j + 1],
+                                   d["sx"][sel][j:j + 1],
+                                   d["sy"][sel][j:j + 1])[0]) ** 2)
+                        base_err = float(np.mean(base_loo)) if base_loo else 0.0
+                        loo_errs = []
+                        for j in range(len(Zs)):
+                            m = np.ones(len(Zs), bool)
+                            m[j] = False
+                            if m.sum() < 3:
+                                continue
+                            pred = []
+                            for ax in range(2):
+                                wj = fit_ridge(Zs[m], Rs[m, ax], lam_used[ax])
+                                pred.append(Zs[j] @ wj)
+                            loo_errs.append((pred[0] - Rs[j, 0]) ** 2 +
+                                            (pred[1] - Rs[j, 1]) ** 2)
+                        if loo_errs and float(np.mean(loo_errs)) > base_err:
+                            w = [np.zeros_like(w[0]), np.zeros_like(w[1])]
                     Ze = np.concatenate([Ze_raw, np.ones((len(Ze_raw), 1))], 1)
                     corr = np.stack([Ze @ w[0], Ze @ w[1]], 1)
                     lams_used.append(float(np.mean(lam_used)))
