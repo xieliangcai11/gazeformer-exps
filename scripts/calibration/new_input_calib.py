@@ -136,6 +136,7 @@ def main():
     ap.add_argument("--gate", action="store_true")
     ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="none")
     ap.add_argument("--robust", action="store_true")
+    ap.add_argument("--use-context", action="store_true")
     ap.add_argument("--robust-iters", type=int, default=6)
     ap.add_argument("--use-pose", action="store_true")
     ap.add_argument("--mlp-hidden", type=int, default=32)
@@ -188,6 +189,20 @@ def main():
         names = names + [f"pose{i}" for i in range(pz["feats"].shape[1])]
         use = np.concatenate([use, np.ones(pz["feats"].shape[1], bool)])
         log(f"[ncal] appended pose dims={pz['feats'].shape[1]}")
+    if a.use_context:
+        ccol = "activity" if "activity" in rows[0] else (
+            "orientation" if "orientation" in rows[0] else None)
+        if ccol is None:
+            raise SystemExit("no context column in index")
+        vals = sorted({r[ccol] for r in rows})
+        cmap = {v: i for i, v in enumerate(vals)}
+        oh = np.zeros((len(rows), len(vals)), np.float32)
+        for i, r in enumerate(rows):
+            oh[i, cmap[r[ccol]]] = 1.0
+        F = np.concatenate([F, oh], 1)
+        names = names + [f"ctx_{v}" for v in vals]
+        use = np.concatenate([use, np.ones(len(vals), bool)])
+        log(f"[ncal] appended context one-hot={vals}")
     F = np.vstack([F, np.zeros((1, F.shape[1]), np.float32)])
     V = np.append(V, False)
 
