@@ -145,6 +145,9 @@ def main():
     ap.add_argument("--groups", nargs="+", default=["all"])
     ap.add_argument("--use-pose", action="store_true")
     ap.add_argument("--clip", type=float, default=0.15)
+    ap.add_argument("--mode", choices=["full", "scalar"], default="full")
+    ap.add_argument("--per-context-src", action="store_true")
+    ap.add_argument("--alpha-lam", type=float, default=1e-3)
     ap.add_argument("--out", required=True)
     ap.add_argument("--detail", default="")
     a = ap.parse_args()
@@ -182,23 +185,31 @@ def main():
         X[~np.isfinite(X)] = 0.0
         return np.concatenate([X, np.ones((len(X), 1))], 1)
 
-    # learn source correction
-    Zs_list, Rs_list = [], []
+    # learn source correction (global or per-context)
+    by_ctx = defaultdict(lambda: [[], []])
     for s, d in D.items():
         if len(d["pred"]) < 20:
             continue
         th, _ = fit_theta_huber(d["pred"], d["label"], a.lam, mu_aff, a.delta)
         Z = Z_of(Fs, Vs, d["rows"])
         R = d["label"] - apply_theta_np(d["pred"], th)
-        Zs_list.append(Z)
-        Rs_list.append(R)
-    Zsrc = np.concatenate(Zs_list, 0)
-    Rsrc = np.concatenate(Rs_list, 0)
-    w_src = np.stack([fit_ridge_prior(Zsrc, Rsrc[:, ax], a.src_lam,
-                                      np.zeros(Zsrc.shape[1]))
-                      for ax in range(2)], 1)
-    log(f"[srcprior] source correction dim={w_src.shape} "
-        f"norm={np.linalg.norm(w_src):.4f}")
+        ctx = s.split("||")[-1] if "||" in s else "all"
+        by_ctx[ctx][0].append(Z)
+        by_ctx[ctx][1].append(R)
+    w_src_by_ctx = {}
+    for ctx, (Zl, Rl) in by_ctx.items():
+        Zc = np.concatenate(Zl, 0)
+        Rc = np.concatenate(Rl, 0)
+        w_src_by_ctx[ctx] = np.stack(
+            [fit_ridge_prior(Zc, Rc[:, ax], a.src_lam,
+                             np.zeros(Zc.shape[1])) for ax in range(2)], 1)
+    Zall = np.concatenate([x for c in by_ctx for x in by_ctx[c][0]], 0)
+    Rall = np.concatenate([x for c in by_ctx for x in by_ctx[c][1]], 0)
+    w_src = np.stack(
+        [fit_ridge_prior(Zall, Rall[:, ax], a.src_lam,
+                         np.zeros(Zall.shape[1])) for ax in range(2)], 1)
+    log(f"[srcprior] source correction contexts={list(w_src_by_ctx)} "
+        f"global_norm={np.linalg.norm(w_src):.4f}")
 
     acc0 = acc1 = nn = 0.0
     ratios = []
@@ -215,16 +226,32 @@ def main():
                                     a.lam, mu_aff, a.delta)
             q0 = apply_theta_np(d["pred"][q], th)
             e0 = float(em(q0, d["label"][q], d["sx"][q], d["sy"][q]).mean())
+            w_use = w_src
+            if a.per_context_src:
+                tctx = s.split("||")[-1] if "||" in s else "all"
+                w_use = w_src_by_ctx.get(tctx, w_src)
             Zs = Z_of(Ft, Vt, d["rows"][sel])
             Rs = d["label"][sel] - apply_theta_np(d["pred"][sel], th)
-            w = []
-            lam_used = []
-            for ax in range(2):
-                lam_ax = loo_lam_prior(Zs, Rs[:, ax], w_src[:, ax], a.lams)
-                lam_used.append(lam_ax)
-                w.append(fit_ridge_prior(Zs, Rs[:, ax], lam_ax, w_src[:, ax]))
             Ze = Z_of(Ft, Vt, d["rows"][q])
-            corr = np.stack([Ze @ w[0], Ze @ w[1]], 1)
+            if a.mode == "scalar":
+                Gs = Zs @ w_use
+                Ge = Ze @ w_use
+                alphas = []
+                for ax in range(2):
+                    denom = float(Gs[:, ax] @ Gs[:, ax]) + a.alpha_lam
+                    al = float(Gs[:, ax] @ Rs[:, ax]) / max(denom, 1e-9)
+                    al = float(np.clip(al, -0.5, 1.5))
+                    alphas.append(al)
+                corr = np.stack([alphas[0] * Ge[:, 0], alphas[1] * Ge[:, 1]], 1)
+                lam_used = [float(np.mean(alphas))]
+            else:
+                w = []
+                lam_used = []
+                for ax in range(2):
+                    lam_ax = loo_lam_prior(Zs, Rs[:, ax], w_use[:, ax], a.lams)
+                    lam_used.append(lam_ax)
+                    w.append(fit_ridge_prior(Zs, Rs[:, ax], lam_ax, w_use[:, ax]))
+                corr = np.stack([Ze @ w[0], Ze @ w[1]], 1)
             corr = np.clip(corr, -a.clip, a.clip)
             q1 = q0 + corr
             e1 = float(em(q1, d["label"][q], d["sx"][q], d["sy"][q]).mean())
@@ -240,7 +267,7 @@ def main():
             ratios.append(e / max(b, 1e-12) - 1)
             detail.append([s, rn, b, e, 100 * (e / b - 1)])
             if si % 5 == 0 or si == len(T) - 1:
-                log(f"[srcprior] session={s} n={rn:.0f} base={b:.4f} "
+                log(f"[srcprior] session={s} n={rn:.0f} mode={a.mode} base={b:.4f} "
                     f"srcprior={e:.4f} ({100*(e/b-1):+.2f}%)")
     B, E = acc0 / nn, acc1 / nn
     rr = np.array(ratios)
