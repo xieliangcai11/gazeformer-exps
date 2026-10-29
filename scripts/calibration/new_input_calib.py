@@ -167,6 +167,8 @@ def main():
     ap.add_argument("--use-context", action="store_true")
     ap.add_argument("--use-imu", action="store_true")
     ap.add_argument("--depth-npz", default="")
+    ap.add_argument("--extra-npz", default="")
+    ap.add_argument("--extra-groups", nargs="+", default=["all"])
     ap.add_argument("--semi", choices=["none", "transductive"], default="none")
     ap.add_argument("--pseudo", choices=["none", "half"], default="none")
     ap.add_argument("--select", choices=["coverage", "random", "dopt"], default="coverage")
@@ -244,6 +246,19 @@ def main():
         names = names + dnames
         use = np.concatenate([use, np.ones(len(dnames), bool)])
         log(f"[ncal] appended depth dims={len(dnames)}")
+    if a.extra_npz:
+        ez = np.load(a.extra_npz, allow_pickle=True)
+        enames = [str(n) for n in ez["names"].tolist()]
+        ef = np.full((len(rows), len(enames)), np.nan, np.float32)
+        ev = np.zeros(len(rows), bool)
+        er = ez["row_idx"].astype(np.int64)
+        ef[er] = ez["feats"]
+        ev[er] = ez["valid"]
+        F = np.concatenate([F, ef], 1)
+        V = V & ev
+        names = names + enames
+        use = np.concatenate([use, np.ones(len(enames), bool)])
+        log(f"[ncal] appended extra dims={len(enames)} from {a.extra_npz}")
     if a.use_context:
         ccol = "activity" if "activity" in rows[0] else (
             "orientation" if "orientation" in rows[0] else None)
