@@ -92,14 +92,15 @@ def region_feats(P, mode):
     return np.concatenate([oh, inter], 1)
 
 
-def prep_features(F, V, idx):
-    """Standardize on the support subset, fill missing with 0."""
+def prep_features(F, V, idx, stats_idx=None):
+    """Standardize using stats_idx (default idx), fill missing with 0."""
     X = F[idx].astype(np.float64).copy()
-    m = V[idx] & np.isfinite(X).all(1)
+    S = F[idx if stats_idx is None else stats_idx]
+    m = V[idx if stats_idx is None else stats_idx] & np.isfinite(S).all(1)
     if m.sum() < 5:
         return None, None, None
-    mu = X[m].mean(0)
-    sd = X[m].std(0) + 1e-6
+    mu = S[m].mean(0)
+    sd = S[m].std(0) + 1e-6
     X = np.clip((X - mu) / sd, -5.0, 5.0)
     X[~np.isfinite(X)] = 0.0
     X = np.concatenate([X, np.ones((len(X), 1))], 1)
@@ -165,6 +166,7 @@ def main():
     ap.add_argument("--robust", action="store_true")
     ap.add_argument("--use-context", action="store_true")
     ap.add_argument("--use-imu", action="store_true")
+    ap.add_argument("--semi", choices=["none", "transductive"], default="none")
     ap.add_argument("--select", choices=["coverage", "random", "dopt"], default="coverage")
     ap.add_argument("--robust-iters", type=int, default=6)
     ap.add_argument("--use-pose", action="store_true")
@@ -268,7 +270,8 @@ def main():
                                     a.lam, mu_aff, a.delta)
             q0 = apply_theta_np(d["pred"][q], th)
             e0 = float(em(q0, d["label"][q], d["sx"][q], d["sy"][q]).mean())
-            Zs, fmu, fsd = prep_features(F[:, use], V, d["rows"][sel])
+            stats_idx = d["rows"] if a.semi == "transductive" else d["rows"][sel]
+            Zs, fmu, fsd = prep_features(F[:, use], V, d["rows"][sel], stats_idx)
             if Zs is None:
                 e1 = e0
             else:
