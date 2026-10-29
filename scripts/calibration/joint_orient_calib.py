@@ -62,6 +62,17 @@ def fit_ridge(Z, y, lam):
     return np.linalg.solve(Z.T @ Z + lam * np.eye(Z.shape[1]), Z.T @ y)
 
 
+def make_feats(pc, ori, Xn, oris, oidx, mode):
+    """Build the joint design matrix for a given pooling mode."""
+    one = np.eye(len(oris))[[oidx.get(o, 0) for o in ori]]
+    if mode == "shared_slope":
+        return np.concatenate([pc, one, np.ones((len(pc), 1))], 1)
+    if mode == "shared_full":
+        return np.concatenate([pc, one * pc[:, :1], one * pc[:, 1:2], one,
+                               np.ones((len(pc), 1))], 1)
+    return np.concatenate([pc, Xn, one, np.ones((len(pc), 1))], 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-npz", required=True)
@@ -71,6 +82,8 @@ def main():
     ap.add_argument("--index-csv", required=True)
     ap.add_argument("--orientations", nargs="+", default=["1", "2", "3", "4"])
     ap.add_argument("--K", type=int, default=10, help="labels per orientation")
+    ap.add_argument("--mode", default="shared_slope",
+                    choices=["shared_slope", "shared_full", "lm"])
     ap.add_argument("--lam", type=float, default=0.1)
     ap.add_argument("--delta", type=float, default=1.0)
     ap.add_argument("--seeds", type=int, default=1)
@@ -139,17 +152,11 @@ def main():
                 continue
             sel = np.concatenate(sel)
             sel = np.unique(sel)
-            Zs = np.concatenate([
-                pc[sel], Xn[sel],
-                np.eye(len(oris))[[oidx[o] for o in ori[sel]]],
-                np.ones((len(sel), 1))], 1)
+            Zs = make_feats(pc[sel], ori[sel], Xn[sel], oris, oidx, a.mode)
             w = []
             for ax in range(2):
                 w.append(fit_ridge(Zs, lc[sel][:, ax], a.lam))
-            Z = np.concatenate([
-                pc, Xn,
-                np.eye(len(oris))[[oidx.get(o, 0) for o in ori]],
-                np.ones((len(pc), 1))], 1)
+            Z = make_feats(pc, ori, Xn, oris, oidx, a.mode)
             qc = np.stack([Z @ w[0], Z @ w[1]], 1)
             qo = rot_from_canon(qc, phi)
             sx = np.array([meta[path[i]][2] for i in idx])
@@ -176,8 +183,8 @@ def main():
                 by_ori[o][1] += e1 * m.sum()
                 by_ori[o][2] += int(m.sum())
     B, C = acc_p / nn, acc_j / nn
-    log(f"[joc] RESULT K_per_ori={a.K} per_ori={B:.4f} joint={C:.4f} "
-        f"({100*(C/B-1):+.2f}%) sessions={len(groups)}")
+    log(f"[joc] RESULT mode={a.mode} K_per_ori={a.K} per_ori={B:.4f} "
+        f"joint={C:.4f} ({100*(C/B-1):+.2f}%) sessions={len(groups)}")
     for o, (b, c, n) in sorted(by_ori.items()):
         if n:
             log(f"[joc] ori={o} n={n} per_ori={b/n:.4f} joint={c/n:.4f}")
