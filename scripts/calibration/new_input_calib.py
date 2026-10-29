@@ -164,6 +164,7 @@ def main():
     ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="none")
     ap.add_argument("--robust", action="store_true")
     ap.add_argument("--use-context", action="store_true")
+    ap.add_argument("--use-imu", action="store_true")
     ap.add_argument("--select", choices=["coverage", "random", "dopt"], default="coverage")
     ap.add_argument("--robust-iters", type=int, default=6)
     ap.add_argument("--use-pose", action="store_true")
@@ -217,6 +218,15 @@ def main():
         names = names + [f"pose{i}" for i in range(pz["feats"].shape[1])]
         use = np.concatenate([use, np.ones(pz["feats"].shape[1], bool)])
         log(f"[ncal] appended pose dims={pz['feats'].shape[1]}")
+    if a.use_imu:
+        if "imu_x" not in rows[0]:
+            raise SystemExit("index has no imu columns")
+        im = np.array([[float(r["imu_x"]), float(r["imu_y"]),
+                        float(r["imu_z"])] for r in rows], np.float32)
+        F = np.concatenate([F, im], 1)
+        names = names + ["imu_x", "imu_y", "imu_z"]
+        use = np.concatenate([use, np.ones(3, bool)])
+        log("[ncal] appended IMU features")
     if a.use_context:
         ccol = "activity" if "activity" in rows[0] else (
             "orientation" if "orientation" in rows[0] else None)

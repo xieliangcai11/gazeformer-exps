@@ -162,7 +162,14 @@ def main():
                                for s, dd in D.items() for c, d in dd.items()})
     log(f"[hier] sessions={len(T)} K={a.K} contexts={ctx_vals}")
 
-    def Zof(idx):
+    def std_of(idx):
+        X = F[idx].astype(np.float64).copy()
+        ok = V[idx] & np.isfinite(X).all(1)
+        if ok.sum() < 5:
+            return None, None
+        return X[ok].mean(0), X[ok].std(0) + 1e-6
+
+    def Zof(idx, fmu, fsd):
         X = F[idx].astype(np.float64).copy()
         X = np.clip((X - fmu) / fsd, -5.0, 5.0)
         X[~np.isfinite(X)] = 0.0
@@ -172,61 +179,48 @@ def main():
     ratios_i, ratios_h = [], []
     detail = []
     for s, dd in T.items():
-        # standardize on pooled support features
-        all_rows = []
-        for c, d in dd.items():
-            all_rows.append(d["rows"][:a.K])
-        all_rows = np.concatenate(all_rows)
-        Xs = F[all_rows].astype(np.float64)
-        ok = V[all_rows] & np.isfinite(Xs).all(1)
-        if ok.sum() < 5:
-            continue
-        fmu = Xs[ok].mean(0)
-        fsd = Xs[ok].std(0) + 1e-6
-        Zpool, Rpool = [], []
         info = {}
         for c, d in dd.items():
             sel = support_indices(d, a.K, np.random.RandomState(90000))
             q = np.setdiff1d(np.arange(len(d["pred"])), sel)
             if len(q) < 20:
                 continue
+            fmu, fsd = std_of(d["rows"][sel])
+            if fmu is None:
+                continue
             th, _ = fit_theta_huber(d["pred"][sel], d["label"][sel],
                                     a.lam, mu_aff, a.delta)
             q0 = apply_theta_np(d["pred"][q], th)
             e0 = float(em(q0, d["label"][q], d["sx"][q], d["sy"][q]).mean())
-            Zs = Zof(d["rows"][sel])
+            Zs = Zof(d["rows"][sel], fmu, fsd)
             Rs = d["label"][sel] - apply_theta_np(d["pred"][sel], th)
-            info[c] = dict(sel=sel, q=q, th=th, e0=e0, Zs=Zs, Rs=Rs)
-            Zpool.append(Zs)
-            Rpool.append(Rs)
+            info[c] = dict(d=d, q=q, th=th, e0=e0, Zs=Zs, Rs=Rs,
+                           fmu=fmu, fsd=fsd)
         if not info:
             continue
-        Zp = np.concatenate(Zpool, 0)
-        Rp = np.concatenate(Rpool, 0)
+        Zp = np.concatenate([v["Zs"] for v in info.values()], 0)
+        Rp = np.concatenate([v["Rs"] for v in info.values()], 0)
         wg = np.stack([fit_ridge_prior(Zp, Rp[:, ax], a.global_lam,
                                        np.zeros(Zp.shape[1]))
                        for ax in range(2)], 1)
-        # independent
         ei = eh = eb = 0.0
         n_i = 0
         for c, inf in info.items():
-            d = dd[c]
+            d = inf["d"]
             q = inf["q"]
             q0 = apply_theta_np(d["pred"][q], inf["th"])
             e0 = inf["e0"]
-            # independent per-context
+            Ze = Zof(d["rows"][q], inf["fmu"], inf["fsd"])
             wi = []
             for ax in range(2):
                 lam = loo_lam(inf["Zs"], inf["Rs"][:, ax],
                               np.zeros(inf["Zs"].shape[1]), a.lams)
                 wi.append(fit_ridge_prior(inf["Zs"], inf["Rs"][:, ax], lam,
                                           np.zeros(inf["Zs"].shape[1])))
-            Ze = Zof(d["rows"][q])
             ci = np.clip(np.stack([Ze @ wi[0], Ze @ wi[1]], 1),
                          -a.clip, a.clip)
             ei += float(em(q0 + ci, d["label"][q], d["sx"][q],
                            d["sy"][q]).mean()) * len(q)
-            # hierarchical
             wh = []
             for ax in range(2):
                 lam = loo_lam(inf["Zs"], inf["Rs"][:, ax], wg[:, ax], a.lams)
