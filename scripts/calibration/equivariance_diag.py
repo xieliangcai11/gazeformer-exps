@@ -221,11 +221,15 @@ def main():
                 rt = pt[j] - Ty
                 Tr = Tp - Ty
                 eq = float(np.linalg.norm(pt[j] - Tp))
+                eq_id = float(np.linalg.norm(pt[j] - p0[j]))
+                eq_lab = float(np.linalg.norm(pt[j] - y))
                 beq = float(np.linalg.norm(rt - Tr))
                 b0 = float(np.linalg.norm(r))
                 bt = float(np.linalg.norm(rt))
                 key = f"{c}->{t}"
                 acc[key]["eq"] += eq
+                acc[key]["eq_id"] += eq_id
+                acc[key]["eq_lab"] += eq_lab
                 acc[key]["bias_eq"] += beq
                 acc[key]["base"] += b0
                 acc[key]["target"] += bt
@@ -239,6 +243,8 @@ def main():
                 vec[key]["tbc"].append(Tr)
                 raw["pair"].append(key)
                 raw["eq"].append(eq)
+                raw["eq_id"].append(eq_id)
+                raw["eq_lab"].append(eq_lab)
                 raw["bias_eq"].append(beq)
                 raw["base"].append(b0)
                 raw["target"].append(bt)
@@ -266,7 +272,8 @@ def main():
         ))
         summary[k] = d
         log(f"[eq] {k} n={n} base={d['base']:.4f} target={d['target']:.4f} "
-            f"eq={d['eq']:.4f} sys_eq={d['sys_eq']:.4f} "
+            f"eq={d['eq']:.4f} eq_id={d['eq_id']:.4f} "
+            f"eq_label={d['eq_lab']:.4f} sys_eq={d['sys_eq']:.4f} "
             f"sys_c={d['sys_c']:.4f}/{d['tot_c']:.4f} "
             f"sys_t={d['sys_t']:.4f}/{d['tot_t']:.4f}")
     log("[eq] ---- per tilt bin ----")
