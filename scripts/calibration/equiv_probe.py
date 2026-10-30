@@ -238,7 +238,7 @@ def main():
 
     def eval_val():
         model.eval()
-        cm_sum = eq_sum = n = 0
+        cm_sum = eq_sum = eq_tgt_sum = n = 0
         pair = defaultdict(lambda: [0.0, 0])
         with torch.no_grad():
             for inp, lab in dl_va:
@@ -254,16 +254,20 @@ def main():
                 inp2["geom"] = g2
                 p2 = forward(inp2)
                 y2, _ = to_target(lab, scm, c, t, swap)
-                eq = (p2 - y2).norm(dim=1)
+                tp, _ = to_target(p, scm, c, t, swap)
+                eq = (p2 - tp).norm(dim=1)       # 等变误差（训练目标）
+                eq_tgt = (p2 - y2).norm(dim=1)  # 反事实目标误差
                 cm_sum += float(cm.sum())
                 eq_sum += float(eq.sum())
+                eq_tgt_sum += float(eq_tgt.sum())
                 n += len(cm)
                 for cc, tt, e in zip(c.tolist(), t.tolist(), eq.tolist()):
                     pair[f"{cc}->{tt}"][0] += e
                     pair[f"{cc}->{tt}"][1] += 1
         model.train()
         d = {k: v[0] / v[1] for k, v in pair.items()}
-        return cm_sum / max(n, 1), eq_sum / max(n, 1), d
+        return (cm_sum / max(n, 1), eq_sum / max(n, 1),
+                eq_tgt_sum / max(n, 1), d)
 
     start_step = 0
     if a.resume:
@@ -277,10 +281,11 @@ def main():
         log(f"[probe] resumed {a.resume} step={start_step} "
             f"base_cm={base_cm} base_eq={base_eq}")
     if "base_cm" not in dir() or base_cm < 0:
-        base_cm, base_eq, base_pair = eval_val()
+        base_cm, base_eq, base_tgt, base_pair = eval_val()
     else:
-        _, _, base_pair = eval_val()
+        _, _, base_tgt, base_pair = eval_val()
     log(f"[probe] BASE val_cm={base_cm:.4f} val_eq={base_eq:.4f} "
+        f"val_target={base_tgt:.4f} "
         f"pairs={ {k: round(v,4) for k,v in base_pair.items()} }")
     model.train()
     t0 = time.time()
@@ -358,8 +363,9 @@ def main():
                              f"{time.time()-t0:.2f}\n")
         step += 1
         if step % a.val_every == 0:
-            cm, eq, pair = eval_val()
+            cm, eq, eq_tgt, pair = eval_val()
             log(f"[probe] VAL step={step} val_cm={cm:.4f} val_eq={eq:.4f} "
+                f"val_target={eq_tgt:.4f} "
                 f"d_cm={cm-base_cm:+.4f} d_eq={eq-base_eq:+.4f} "
                 f"pairs={ {k: round(v,4) for k,v in pair.items()} }")
             if rank == 0:
@@ -392,7 +398,7 @@ def main():
         (model.module if distributed else model).load_state_dict(ck["model"])
         log(f"[probe] restored best.pt step={ck.get('step')} "
             f"val_cm={ck.get('val_cm')}")
-    cm, eq, pair = eval_val()
+    cm, eq, eq_tgt, pair = eval_val()
     if rank == 0:
         torch.save({"model": (model.module if distributed else model).state_dict(),
                     "optimizer": opt.state_dict(), "step": step,
@@ -400,7 +406,7 @@ def main():
                     "base_cm": base_cm, "base_eq": base_eq,
                     "args": vars(a)}, out / "last.pt")
     log(f"[probe] FINAL step={step} best_step={best_step} "
-        f"val_cm={cm:.4f} val_eq={eq:.4f} "
+        f"val_cm={cm:.4f} val_eq={eq:.4f} val_target={eq_tgt:.4f} "
         f"d_cm={cm-base_cm:+.4f} d_eq={eq-base_eq:+.4f} "
         f"eq_drop={100*(1-eq/max(base_eq,1e-9)):.2f}%")
     with open(out / "summary.json", "w", encoding="utf-8") as fh:

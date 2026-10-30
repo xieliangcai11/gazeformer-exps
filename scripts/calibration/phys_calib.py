@@ -126,8 +126,8 @@ def main():
         for j, i in enumerate(idx):
             pcm, _ = to_cm(pred[i:i + 1], mets[j])
             lcm, _ = to_cm(label[i:i + 1], mets[j])
-            pc[j] = rot(pcm, -phi[j])[0]
-            lc[j] = rot(lcm, -phi[j])[0]
+            pc[j] = rot(pcm, phi[j])[0]
+            lc[j] = rot(lcm, phi[j])[0]
         for seed in range(a.seeds):
             rng = np.random.RandomState(60000 + seed)
             if a.mode == "anchor":
@@ -147,7 +147,7 @@ def main():
             # back to each frame's original normalised screen frame
             qo = np.zeros_like(qc)
             for j, i in enumerate(idx):
-                qo[j] = from_cm(rot(qc[j:j + 1], phi[j]), mets[j])[0]
+                qo[j] = from_cm(rot(qc[j:j + 1], -phi[j]), mets[j])[0]
             sx = np.array([meta[path[i]][2] for i in idx])
             sy = np.array([meta[path[i]][3] for i in idx])
             e1 = float(em(qo, label[idx], sx, sy).mean())
