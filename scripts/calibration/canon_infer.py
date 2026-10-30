@@ -107,6 +107,10 @@ def main():
                          "replace it with the canonical orientation")
     ap.add_argument("--limit", type=int, default=0, help="debug: first N frames")
     ap.add_argument("--stride", type=int, default=1, help="subsample stride")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="split frames across this many processes")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="which shard this process handles")
     ap.add_argument("--log-every", type=int, default=25)
     a = ap.parse_args()
 
@@ -154,9 +158,14 @@ def main():
         paths, label, fidx = paths[::a.stride], label[::a.stride], fidx[::a.stride]
     if a.limit:
         paths, label, fidx = paths[:a.limit], label[:a.limit], fidx[:a.limit]
+    if a.num_shards > 1:
+        paths = paths[a.shard::a.num_shards]
+        label = label[a.shard::a.num_shards]
+        fidx = fidx[a.shard::a.num_shards]
     idxs = [lookup[p] for p in paths if p in lookup]
     keep = [i for i, p in enumerate(paths) if p in lookup]
-    log(f"[canon] frames={len(idxs)} variants={a.variants} mode={a.mode} "
+    log(f"[canon] shard={a.shard}/{a.num_shards} frames={len(idxs)} "
+        f"variants={a.variants} mode={a.mode} "
         f"sign={a.sign} geom_mode={a.geom_mode}")
     model = load_model(a.ckpt, device, a.use_geom, a.geom_orient)
 

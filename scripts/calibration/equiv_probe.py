@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -20,7 +21,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path[:0] = ["src", "."]
 from gazelab.datasets import GazeCaptureDataset  # noqa: E402
@@ -135,12 +138,27 @@ def main():
     ap.add_argument("--max-cm-rise", type=float, default=0.3)
     ap.add_argument("--min-eq-drop", type=float, default=0.3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume", default="", help="last.pt to resume from")
+    ap.add_argument("--save-every", type=int, default=25)
+    ap.add_argument("--distributed", action="store_true")
     a = ap.parse_args()
     log(f"[probe] args={vars(a)}")
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
-    device = "cuda" if (a.gpu >= 0 and torch.cuda.is_available()) else "cpu"
-    log(f"[probe] device={device}")
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = bool(a.distributed or world > 1)
+    rank = 0
+    if distributed:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        local = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local)
+        device = f"cuda:{local}"
+    else:
+        device = "cuda" if (a.gpu >= 0 and torch.cuda.is_available()) else "cpu"
+    log(f"[probe] device={device} rank={rank}/{world}")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "args.json", "w", encoding="utf-8") as fh:
@@ -158,20 +176,29 @@ def main():
     va_idx = split_indices(idx_dir / "index.csv", "test",
                            a.val_stride, a.val_limit)
     log(f"[probe] train frames={len(tr_idx)} val frames={len(va_idx)}")
-    dl_tr = DataLoader(Subset(ds_tr, tr_idx), batch_size=a.batch,
-                       shuffle=True, num_workers=a.num_workers,
+    train_sub = Subset(ds_tr, tr_idx)
+    sampler = (DistributedSampler(train_sub, num_replicas=world, rank=rank,
+                                  shuffle=True, seed=a.seed)
+               if distributed else None)
+    dl_tr = DataLoader(train_sub, batch_size=a.batch, sampler=sampler,
+                       shuffle=(sampler is None), num_workers=a.num_workers,
                        pin_memory=True, drop_last=True)
     dl_va = DataLoader(Subset(ds_va, va_idx), batch_size=a.batch,
                        shuffle=False, num_workers=a.num_workers,
                        pin_memory=True)
     model, use_geom, use_eye, use_imu, geom_orient = load_model(a.ckpt, device)
+    if distributed:
+        model = DDP(model, device_ids=[int(device.split(":")[1])],
+                    find_unused_parameters=False)
 
+    core0 = model.module if distributed else model
     if a.freeze_backbone:
-        for p in model.rgb.parameters():
+        for p in core0.rgb.parameters():
             p.requires_grad = False
         log("[probe] backbone frozen")
-    backbone = [p for p in model.rgb.parameters() if p.requires_grad]
-    head = [p for n, p in model.named_parameters()
+    core = model.module if distributed else model
+    backbone = [p for p in core.rgb.parameters() if p.requires_grad]
+    head = [p for n, p in core.named_parameters()
             if not n.startswith("rgb.")]
     opt = torch.optim.AdamW([
         {"params": backbone, "lr": a.lr * a.backbone_lr_ratio},
@@ -218,14 +245,35 @@ def main():
         d = {k: v[0] / v[1] for k, v in pair.items()}
         return cm_sum / max(n, 1), eq_sum / max(n, 1), d
 
-    base_cm, base_eq, base_pair = eval_val()
+    start_step = 0
+    if a.resume:
+        ck = torch.load(a.resume, map_location="cpu", weights_only=False)
+        (model.module if distributed else model).load_state_dict(ck["model"])
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+        start_step = int(ck.get("step", 0))
+        base_cm = float(ck.get("base_cm", -1.0))
+        base_eq = float(ck.get("base_eq", -1.0))
+        log(f"[probe] resumed {a.resume} step={start_step} "
+            f"base_cm={base_cm} base_eq={base_eq}")
+    if "base_cm" not in dir() or base_cm < 0:
+        base_cm, base_eq, base_pair = eval_val()
+    else:
+        _, _, base_pair = eval_val()
     log(f"[probe] BASE val_cm={base_cm:.4f} val_eq={base_eq:.4f} "
         f"pairs={ {k: round(v,4) for k,v in base_pair.items()} }")
     model.train()
     t0 = time.time()
-    step = 0
+    step = start_step
+    seen = 0
     losses = []
+    if step >= a.steps:
+        log("[probe] resume already reached target steps")
     for inp, lab in dl_tr:
+        if seen < start_step:
+            seen += 1
+            continue
+        seen += 1
         if step >= a.steps:
             break
         lab = lab.to(device).float()
@@ -261,15 +309,22 @@ def main():
             log(f"[probe] VAL step={step} val_cm={cm:.4f} val_eq={eq:.4f} "
                 f"d_cm={cm-base_cm:+.4f} d_eq={eq-base_eq:+.4f} "
                 f"pairs={ {k: round(v,4) for k,v in pair.items()} }")
-            torch.save({"model": model.state_dict(), "step": step,
-                        "val_cm": cm, "val_eq": eq, "args": vars(a)},
-                       out / "last.pt")
+            if rank == 0:
+                torch.save({"model": (model.module if distributed else model).state_dict(),
+                            "optimizer": opt.state_dict(), "step": step,
+                            "val_cm": cm, "val_eq": eq,
+                            "base_cm": base_cm, "base_eq": base_eq,
+                            "args": vars(a)}, out / "last.pt")
             if cm > base_cm + a.max_cm_rise:
                 log(f"[probe] STOP val_cm rose above {a.max_cm_rise}cm")
                 break
     cm, eq, pair = eval_val()
-    torch.save({"model": model.state_dict(), "step": step,
-                "val_cm": cm, "val_eq": eq, "args": vars(a)}, out / "last.pt")
+    if rank == 0:
+        torch.save({"model": (model.module if distributed else model).state_dict(),
+                    "optimizer": opt.state_dict(), "step": step,
+                    "val_cm": cm, "val_eq": eq,
+                    "base_cm": base_cm, "base_eq": base_eq,
+                    "args": vars(a)}, out / "last.pt")
     log(f"[probe] FINAL step={step} val_cm={cm:.4f} val_eq={eq:.4f} "
         f"d_cm={cm-base_cm:+.4f} d_eq={eq-base_eq:+.4f} "
         f"eq_drop={100*(1-eq/max(base_eq,1e-9)):.2f}%")
