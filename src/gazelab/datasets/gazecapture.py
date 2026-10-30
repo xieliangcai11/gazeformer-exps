@@ -91,6 +91,7 @@ class GazeCaptureDataset(Dataset):
         eye_crops: bool = False,
         eye_scale: float = 0.0,
         geom_orient: bool = False,
+        target_space: str = "norm",
     ):
         super().__init__()
         # 本数据集的所有增强/翻转/几何重投影都建立在归一化坐标上；像素口径下
@@ -148,6 +149,9 @@ class GazeCaptureDataset(Dataset):
         # （boxes = 左眼(x,y,w,h)+右眼(x,y,w,h)，原图坐标；filled 标记兜底/退化）。
         self.eye_crops = bool(eye_crops)
         self.eye_scale = float(eye_scale)
+        if target_space not in ("norm", "cm"):
+            raise ValueError("target_space 只能是 'norm' 或 'cm'")
+        self.target_space = target_space
         # ---- 朝向 token（GazeCapture）：设备/朝向是最大误差来源 ----
         # 1=竖屏、2=倒竖（iPad）、3/4=横屏。作为 4 维 one-hot 追加到几何 token，
         # 让模型显式知道"屏幕坐标轴是哪个方向"，避免从图像里反推。
@@ -318,7 +322,15 @@ class GazeCaptureDataset(Dataset):
                 oh[o - 1] = 1.0
             geom = torch.cat([geom, oh])
 
+        # 归一化屏幕坐标（评测/兼容旧口径）
         label = np.array([gx, gy], dtype=np.float32)
+        # 标准物理厘米：屏幕中心为原点，旋转到竖屏标准方向
+        phi = float(np.arctan2(float(imu[0]), -float(imu[1])))
+        xc = (gx - 0.5) * w_cm
+        yc = (gy - 0.5) * h_cm
+        c, s_ = np.cos(phi), np.sin(phi)
+        target_cm = torch.tensor([c * xc + s_ * yc,
+                                  -s_ * xc + c * yc], dtype=torch.float32)
         # 人脸在 25x25 网格中的位置（iTracker 风格输入特征）
         face_grid = torch.tensor(
             [float(row["face_grid_x"]), float(row["face_grid_y"]),
@@ -327,8 +339,13 @@ class GazeCaptureDataset(Dataset):
         )
 
         out = edict(rgb=face, screen_cm=screen_cm, imu=imu, geom=geom,
-                     face_grid=face_grid)
+                     face_grid=face_grid, phi=torch.tensor(phi),
+                     orientation=torch.tensor(
+                         int(float(row.get("orientation", 0) or 0))),
+                     label_norm=torch.from_numpy(label.copy()),
+                     target_cm=target_cm)
         if self.eye_crops:
             out.eye_l = eye_l
             out.eye_r = eye_r
-        return out, self.target_transform(label)
+        y = target_cm if self.target_space == "cm" else self.target_transform(label)
+        return out, y
