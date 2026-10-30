@@ -79,7 +79,8 @@ def to_norm(pred_cm, scm, phi):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default="")
+    ap.add_argument("--scratch", action="store_true")
     ap.add_argument("--index-dir", default="data/GazeCapture/index")
     ap.add_argument("--out", default="out/gazecapture/cm_train")
     ap.add_argument("--steps", type=int, default=2000)
@@ -98,6 +99,8 @@ def main():
     ap.add_argument("--save-every", type=int, default=250)
     ap.add_argument("--max-cm-rise", type=float, default=0.1)
     ap.add_argument("--warmup", type=int, default=200)
+    ap.add_argument("--accum", type=int, default=1)
+    ap.add_argument("--loss", choices=["cm", "norm_plus_cm"], default="norm_plus_cm")
     ap.add_argument("--resume", default="")
     ap.add_argument("--freeze-backbone", action="store_true")
     ap.add_argument("--distributed", action="store_true")
@@ -129,7 +132,7 @@ def main():
         mode = "a" if a.resume else "w"
         with open(out / "train_log.csv", mode, encoding="utf-8") as fh:
             if mode == "w":
-                fh.write("step,loss,gn,lr,elapsed\n")
+                fh.write("step,loss,lnorm,lcm,gn,lr,elapsed\n")
         with open(out / "val_log.csv", mode, encoding="utf-8") as fh:
             if mode == "w":
                 fh.write("step,val_cm,val_norm,d_cm,ori1,ori2,ori3,ori4\n")
@@ -156,7 +159,16 @@ def main():
     dl_va = DataLoader(Subset(va, va_idx), batch_size=a.batch, shuffle=False,
                        num_workers=a.num_workers, pin_memory=True)
 
-    model = load_model(a.ckpt, device)
+    if a.scratch:
+        model = RGBDGazeDINOv2(
+            gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
+            inter_dim=1536, freeze_dino=True, unfreeze_last=12,
+            use_imu=False, use_geom=True, use_geom_orient=False,
+            use_eye=True, img_size=224,
+        ).to(device)
+        log("[cm] scratch init (DINOv2 pretrain only)")
+    else:
+        model = load_model(a.ckpt, device)
     if distributed:
         model = DDP(model, device_ids=[int(device.split(":")[1])],
                     find_unused_parameters=True)
@@ -172,6 +184,7 @@ def main():
                     if not n.startswith("rgb.")], "lr": a.lr},
     ], weight_decay=a.weight_decay)
     crit = nn.MSELoss()
+    huber = nn.SmoothL1Loss(beta=1.0)
 
     def fwd(inp):
         return model(inp["rgb"].to(device).float(),
@@ -225,7 +238,7 @@ def main():
 
     step = start; seen = 0; t0 = time.time()
     base_lrs = [g["lr"] for g in opt.param_groups]
-    best_cm = float("inf"); best_step = -1
+    best_norm = float("inf"); best_step = -1
     for inp, lab in dl:
         if seen < start:
             seen += 1; continue
@@ -236,22 +249,38 @@ def main():
             scale = min(1.0, (step - start + 1) / a.warmup)
             for g, lr0 in zip(opt.param_groups, base_lrs):
                 g["lr"] = lr0 * scale
-        lab = lab.to(device).float()
+        lab_cm = lab.to(device).float()
+        lab_norm = inp["label_norm"].to(device).float()
+        scm = inp["screen_cm"].to(device).float()
+        phi = inp["phi"].to(device).float()
         p = fwd(inp)
-        loss = crit(p, lab)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gn = float(torch.nn.utils.clip_grad_norm_(
-            [p for p in core.parameters() if p.requires_grad], 1.0))
-        opt.step()
+        if a.loss == "cm":
+            lnorm = torch.zeros((), device=device)
+            lcm = crit(p, lab_cm)
+            loss = lcm
+        else:
+            pn = to_norm(p, scm, phi)
+            lnorm = crit(pn, lab_norm)
+            lcm = huber(p, lab_cm)
+            loss = lnorm + 0.1 * lcm
+        (loss / a.accum).backward()
+        if (step + 1) % a.accum == 0:
+            gn = float(torch.nn.utils.clip_grad_norm_(
+                [p for p in core.parameters() if p.requires_grad], 1.0))
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        else:
+            gn = 0.0
         if step % a.log_every == 0:
-            log(f"[cm] step={step} loss={loss.item():.5f} gn={gn:.3f} "
-                f"lr={opt.param_groups[-1]['lr']:.2e} "
+            log(f"[cm] step={step} loss={loss.item():.5f} "
+                f"lnorm={lnorm.item():.5f} lcm={lcm.item():.5f} "
+                f"gn={gn:.3f} lr={opt.param_groups[-1]['lr']:.2e} "
                 f"elapsed={time.time()-t0:.1f}s")
             if rank == 0:
                 with open(out / "train_log.csv", "a", encoding="utf-8") as fh:
-                    fh.write(f"{step},{loss.item():.6f},{gn:.3f},"
-                             f"{opt.param_groups[-1]['lr']:.3e},"
+                    fh.write(f"{step},{loss.item():.6f},"
+                             f"{lnorm.item():.6f},{lcm.item():.6f},"
+                             f"{gn:.3f},{opt.param_groups[-1]['lr']:.3e},"
                              f"{time.time()-t0:.2f}\n")
         step += 1
         if step % a.val_every == 0:
@@ -269,8 +298,8 @@ def main():
                             "val_cm": cm, "val_norm": nm,
                             "base_cm": base_cm, "args": vars(a)},
                            out / "last.pt")
-                if cm < best_cm:
-                    best_cm, best_step = cm, step
+                if nm < best_norm:
+                    best_norm, best_step = nm, step
                     torch.save({"model": core.state_dict(),
                                 "optimizer": opt.state_dict(), "step": step,
                                 "val_cm": cm, "val_norm": nm,
