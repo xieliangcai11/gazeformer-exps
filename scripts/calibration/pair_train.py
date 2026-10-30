@@ -117,6 +117,7 @@ def main():
     ap.add_argument("--lambda-eq", type=float, default=0.2)
     ap.add_argument("--lambda-ramp", type=int, default=100)
     ap.add_argument("--val-every", type=int, default=50)
+    ap.add_argument("--save-every", type=int, default=250)
     ap.add_argument("--val-limit", type=int, default=512)
     ap.add_argument("--val-pair-limit", type=int, default=256)
     ap.add_argument("--val-stride", type=int, default=300)
@@ -332,6 +333,13 @@ def main():
                                 "val_cm": cm, "pair_eq": pe,
                                 "args": vars(a)}, out / "best.pt")
                     log(f"[pair] BEST step={step} val_cm={cm:.4f}")
+                if step % a.save_every == 0:
+                    torch.save({"model": core.state_dict(),
+                                "optimizer": opt.state_dict(), "step": step,
+                                "val_cm": cm, "pair_eq": pe,
+                                "args": vars(a)},
+                               out / f"ckpt_step{step}.pt")
+                    log(f"[pair] SAVED ckpt_step{step}.pt")
     if rank == 0:
         torch.save({"model": core.state_dict(),
                     "optimizer": opt.state_dict(), "step": step,
