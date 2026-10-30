@@ -82,6 +82,7 @@ def main():
     ap.add_argument("--index-csv", required=True)
     ap.add_argument("--orientations", nargs="+", default=["1", "2", "3", "4"])
     ap.add_argument("--K", type=int, default=10, help="labels per orientation")
+    ap.add_argument("--budget", choices=["per_ori", "total"], default="per_ori")
     ap.add_argument("--mode", default="shared_slope",
                     choices=["shared_slope", "shared_full", "lm"])
     ap.add_argument("--lam", type=float, default=0.1)
@@ -141,17 +142,22 @@ def main():
         Xn[~np.isfinite(Xn)] = 0.0
         for seed in range(a.seeds):
             rng = np.random.RandomState(70000 + seed)
-            sel = []
-            for o in oris:
-                cand = np.where((ori == o) & ok)[0]
-                if len(cand) == 0:
-                    continue
+            if a.budget == "total":
+                cand = np.where(ok)[0]
                 kk = min(a.K, len(cand))
-                sel.append(rng.choice(cand, kk, replace=False))
-            if not sel:
+                sel = rng.choice(cand, kk, replace=False) if kk else np.array([], np.int64)
+            else:
+                parts = []
+                for o in oris:
+                    cand = np.where((ori == o) & ok)[0]
+                    if len(cand) == 0:
+                        continue
+                    kk = min(a.K, len(cand))
+                    parts.append(rng.choice(cand, kk, replace=False))
+                sel = np.concatenate(parts) if parts else np.array([], np.int64)
+                sel = np.unique(sel)
+            if len(sel) < 8:
                 continue
-            sel = np.concatenate(sel)
-            sel = np.unique(sel)
             Zs = make_feats(pc[sel], ori[sel], Xn[sel], oris, oidx, a.mode)
             w = []
             for ax in range(2):
@@ -183,7 +189,7 @@ def main():
                 by_ori[o][1] += e1 * m.sum()
                 by_ori[o][2] += int(m.sum())
     B, C = acc_p / nn, acc_j / nn
-    log(f"[joc] RESULT mode={a.mode} K_per_ori={a.K} per_ori={B:.4f} "
+    log(f"[joc] RESULT mode={a.mode} budget={a.budget} K={a.K} per_ori={B:.4f} "
         f"joint={C:.4f} ({100*(C/B-1):+.2f}%) sessions={len(groups)}")
     for o, (b, c, n) in sorted(by_ori.items()):
         if n:

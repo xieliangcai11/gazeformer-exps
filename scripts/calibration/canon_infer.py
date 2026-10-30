@@ -98,6 +98,10 @@ def main():
                     help="rotate crop by -sign*phi")
     ap.add_argument("--back-sign", type=int, choices=[1, -1], default=-1,
                     help="rotate prediction back by back_sign*phi")
+    ap.add_argument("--force-orient", default="none",
+                    help="override geom orientation one-hot (none|1|2|3|4)")
+    ap.add_argument("--only-orientation", default="none",
+                    help="keep only frames of this orientation")
     ap.add_argument("--geom-mode", choices=["keep", "canon"], default="keep",
                     help="keep original geom (incl. orientation one-hot) or "
                          "replace it with the canonical orientation")
@@ -140,6 +144,12 @@ def main():
     paths = [str(p) for p in z["path"].tolist()]
     label = z["label"].astype(np.float32)
     fidx = z["frame_index"].astype(np.int64)
+    if a.only_orientation != "none":
+        keep_o = [i for i, p in enumerate(paths)
+                  if ori_of.get(p, "0") == a.only_orientation]
+        paths = [paths[i] for i in keep_o]
+        label = label[keep_o]
+        fidx = fidx[keep_o]
     if a.stride > 1:
         paths, label, fidx = paths[::a.stride], label[::a.stride], fidx[::a.stride]
     if a.limit:
@@ -180,6 +190,10 @@ def main():
                     elv = rotate_batch(elv, ang_deg)
                     erv = rotate_batch(erv, ang_deg)
                 gmv = gm
+                if a.force_orient != "none" and gm is not None and gm.shape[1] >= 7:
+                    gmv = gm.clone()
+                    gmv[:, 3:7] = 0.0
+                    gmv[:, 3 + int(a.force_orient) - 1] = 1.0
                 if a.mode == "canon" and a.geom_mode == "canon" and gm is not None:
                     gmv = gm.clone()
                     if gmv.shape[1] >= 4:  # [aspect, log w, log h, onehot...]
@@ -198,7 +212,8 @@ def main():
     label = label[keep]
     err = np.hypot(out[:, 0] - label[:, 0], out[:, 1] - label[:, 1])
     log(f"[canon] RESULT mode={a.mode} sign={a.sign} geom={a.geom_mode} "
-        f"back_sign={a.back_sign} frames={len(out)} err={err.mean():.4f} "
+        f"back_sign={a.back_sign} force_orient={a.force_orient} "
+        f"frames={len(out)} err={err.mean():.4f} "
         f"elapsed={time.time()-t0:.1f}s")
     by = defaultdict(lambda: [0.0, 0])
     for i, p in enumerate([paths[i] for i in keep]):
