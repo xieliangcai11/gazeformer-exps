@@ -338,10 +338,12 @@ class GazeCaptureDataset(Dataset):
             dtype=torch.float32,
         )
 
+        imu_valid = bool(np.hypot(float(imu[0]), float(imu[1])) >= 0.05)
         out = edict(rgb=face, screen_cm=screen_cm, imu=imu, geom=geom,
                      face_grid=face_grid, phi=torch.tensor(phi),
                      orientation=torch.tensor(
                          int(float(row.get("orientation", 0) or 0))),
+                     imu_valid=torch.tensor(imu_valid),
                      label_norm=torch.from_numpy(label.copy()),
                      target_cm=target_cm)
         if self.eye_crops:
