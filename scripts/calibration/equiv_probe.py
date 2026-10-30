@@ -393,18 +393,18 @@ def main():
             if int(stop.item()):
                 log(f"[probe] STOP val_cm rose above {a.max_cm_rise}cm")
                 break
+    if rank == 0:
+        torch.save({"model": (model.module if distributed else model).state_dict(),
+                    "optimizer": opt.state_dict(), "step": step,
+                    "val_cm": None, "val_eq": None,
+                    "base_cm": base_cm, "base_eq": base_eq,
+                    "args": vars(a)}, out / "last.pt")
     if (out / "best.pt").exists() and a.best:
         ck = torch.load(out / "best.pt", map_location="cpu", weights_only=False)
         (model.module if distributed else model).load_state_dict(ck["model"])
         log(f"[probe] restored best.pt step={ck.get('step')} "
             f"val_cm={ck.get('val_cm')}")
     cm, eq, eq_tgt, pair = eval_val()
-    if rank == 0:
-        torch.save({"model": (model.module if distributed else model).state_dict(),
-                    "optimizer": opt.state_dict(), "step": step,
-                    "val_cm": cm, "val_eq": eq,
-                    "base_cm": base_cm, "base_eq": base_eq,
-                    "args": vars(a)}, out / "last.pt")
     log(f"[probe] FINAL step={step} best_step={best_step} "
         f"val_cm={cm:.4f} val_eq={eq:.4f} val_target={eq_tgt:.4f} "
         f"d_cm={cm-base_cm:+.4f} d_eq={eq-base_eq:+.4f} "
