@@ -164,6 +164,7 @@ def main():
     tilt_bins = defaultdict(lambda: defaultdict(float))
     tilt_cnt = defaultdict(int)
     raw = defaultdict(list)
+    vec = defaultdict(lambda: defaultdict(list))
     t0 = time.time()
     for st in range(0, len(idxs), a.batch):
         sub = idxs[st:st + a.batch]
@@ -233,6 +234,9 @@ def main():
                 tilt_bins[tb]["eq"] += eq
                 tilt_bins[tb]["bias_eq"] += beq
                 tilt_cnt[tb] += 1
+                vec[key]["bc"].append(r)
+                vec[key]["bt"].append(rt)
+                vec[key]["tbc"].append(Tr)
                 raw["pair"].append(key)
                 raw["eq"].append(eq)
                 raw["bias_eq"].append(beq)
@@ -247,9 +251,24 @@ def main():
     for k in sorted(acc):
         n = cnt[k]
         d = {m: acc[k][m] / n for m in acc[k]}
+        bc = np.array(vec[k]["bc"]); bt = np.array(vec[k]["bt"])
+        tbc = np.array(vec[k]["tbc"])
+        mb_c = bc.mean(0); mb_t = bt.mean(0); mtb = tbc.mean(0)
+        d.update(dict(
+            sys_c=float(np.linalg.norm(mb_c)),
+            tot_c=float(np.linalg.norm(bc, axis=1).mean()),
+            sys_t=float(np.linalg.norm(mb_t)),
+            tot_t=float(np.linalg.norm(bt, axis=1).mean()),
+            sys_eq=float(np.linalg.norm(mb_t - mtb)),
+            mean_bc_x=float(mb_c[0]), mean_bc_y=float(mb_c[1]),
+            mean_bt_x=float(mb_t[0]), mean_bt_y=float(mb_t[1]),
+            mean_tbc_x=float(mtb[0]), mean_tbc_y=float(mtb[1]),
+        ))
         summary[k] = d
         log(f"[eq] {k} n={n} base={d['base']:.4f} target={d['target']:.4f} "
-            f"eq={d['eq']:.4f} bias_eq={d['bias_eq']:.4f}")
+            f"eq={d['eq']:.4f} sys_eq={d['sys_eq']:.4f} "
+            f"sys_c={d['sys_c']:.4f}/{d['tot_c']:.4f} "
+            f"sys_t={d['sys_t']:.4f}/{d['tot_t']:.4f}")
     log("[eq] ---- per tilt bin ----")
     tilt_summary = {}
     for b in sorted(tilt_bins):
