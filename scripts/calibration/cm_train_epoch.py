@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -52,6 +53,31 @@ def load_model(ckpt, device):
     miss, unexp, resampled = load_state_dict_any_res(model, state)
     log(f"[cm] dropped={drop} missing={len(miss)} unexpected={len(unexp)}")
     return model
+
+
+def data_stats(index_csv):
+    from collections import Counter
+    n = 0
+    splits = Counter(); oris = Counter(); devs = Counter()
+    bad_imu = 0; nan_cm = 0
+    with open(index_csv, encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            n += 1
+            splits[r.get("split", "")] += 1
+            oris[str(r.get("orientation", ""))] += 1
+            devs[r.get("device", "")] += 1
+            try:
+                gx, gy = float(r["imu_x"]), float(r["imu_y"])
+                cmx, cmy = float(r["cm_px_x"]), float(r["cm_px_y"])
+            except Exception:
+                continue
+            if (gx * gx + gy * gy) < 0.05 ** 2:
+                bad_imu += 1
+            if cmx != cmx or cmy != cmy:
+                nan_cm += 1
+    return dict(n=n, splits=dict(splits), orientations=dict(oris),
+                devices=dict(devs.most_common(20)), bad_imu=bad_imu,
+                nan_cm=nan_cm)
 
 
 def split_indices(index_csv, split):
@@ -120,7 +146,12 @@ def main():
         device = "cuda" if (a.gpu >= 0 and torch.cuda.is_available()) else "cpu"
     global _RANK
     _RANK = rank
-    log(f"[cm] device={device} rank={rank}/{world} args={vars(a)}")
+    try:
+        git = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                      text=True).strip()
+    except Exception:
+        git = "unknown"
+    log(f"[cm] device={device} rank={rank}/{world} git={git} args={vars(a)}")
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     if rank == 0:
         with open(out / "args.json", "w", encoding="utf-8") as fh:
@@ -147,9 +178,13 @@ def main():
     tr_idx = split_indices(idx_dir / "index.csv", "train")
     va_idx = split_indices(idx_dir / "index.csv", "test")
     va_idx = va_idx[::a.val_stride][:a.val_limit]
-    log(f"[cm] train={len(tr_idx)} val={len(va_idx)} "
-        f"augment={a.augment} geom_randomize={tr.geom_randomize} "
-        f"aug_seed={tr._seed}")
+    if rank == 0:
+        stats = data_stats(idx_dir / "index.csv")
+        log(f"[cm] train={len(tr_idx)} val={len(va_idx)} "
+            f"augment={a.augment} geom_randomize={tr.geom_randomize} "
+            f"aug_seed={tr._seed} imu_bad={stats['bad_imu']} "
+            f"nan_cm={stats['nan_cm']} splits={stats['splits']} "
+            f"oris={stats['orientations']} top_devices={stats['devices']}")
     tr_sub = Subset(tr, tr_idx)
     if distributed:
         sampler = DistributedSampler(tr_sub, num_replicas=world, rank=rank,
@@ -180,6 +215,9 @@ def main():
         {"params": [p for n, p in core.named_parameters()
                     if not n.startswith("rgb.")], "lr": a.lr},
     ], weight_decay=a.weight_decay)
+    nparam = sum(p.numel() for p in core.parameters())
+    ntrain = sum(p.numel() for p in core.parameters() if p.requires_grad)
+    log(f"[cm] params total={nparam/1e6:.2f}M trainable={ntrain/1e6:.2f}M")
     base_lrs = [g["lr"] for g in opt.param_groups]
     huber = nn.SmoothL1Loss(beta=1.0, reduction="none")
 
@@ -191,7 +229,7 @@ def main():
 
     def eval_val():
         model.eval(); cm_s = nm_s = n = 0
-        ob = {i: [0.0, 0] for i in (1, 2, 3, 4)}
+        ob = {i: [0.0, 0, 0.0, 0.0] for i in (1, 2, 3, 4)}
         with torch.no_grad():
             for inp, _ in dl_va:
                 scm = inp["screen_cm"].to(device).float()
@@ -199,16 +237,23 @@ def main():
                 ln = inp["label_norm"].to(device).float()
                 ori = inp["orientation"].to(device).long()
                 pn = to_norm(fwd(inp), scm, phi)
-                cm = ((pn - ln) * scm).norm(dim=1)
+                rcm = (pn - ln) * scm
+                cm = rcm.norm(dim=1)
                 nm = (pn - ln).norm(dim=1)
                 cm_s += float(cm.sum()); nm_s += float(nm.sum()); n += len(cm)
                 for o in ob:
                     m = ori == o
                     ob[o][0] += float(cm[m].sum()); ob[o][1] += int(m.sum())
+                    ob[o][2] += float(rcm[m, 0].sum())
+                    ob[o][3] += float(rcm[m, 1].sum())
         model.train()
-        return (cm_s / max(n, 1), nm_s / max(n, 1),
-                {o: (v[0] / v[1] if v[1] else float("nan"))
-                 for o, v in ob.items()})
+        out = {}
+        for o, v in ob.items():
+            if v[1]:
+                out[o] = (v[0] / v[1], v[1], v[2] / v[1], v[3] / v[1])
+            else:
+                out[o] = (float("nan"), 0, float("nan"), float("nan"))
+        return cm_s / max(n, 1), nm_s / max(n, 1), out
 
     start_epoch = 0
     global_step = 0
@@ -235,6 +280,7 @@ def main():
         tr.set_epoch(epoch)
         model.train()
         opt.zero_grad(set_to_none=True)
+        ep_loss = 0.0; ep_n = 0; ep_t0 = time.time()
         for bi, (inp, lab) in enumerate(dl):
             if a.limit_batches and bi >= a.limit_batches:
                 break
@@ -257,20 +303,31 @@ def main():
                 lcm = huber(p, lab_cm).mean(dim=1)
                 w = valid
                 loss = ((lnorm * w).sum() + 0.1 * (lcm * w).sum()) / w.sum().clamp_min(1.0)
+            if not torch.isfinite(loss):
+                log(f"[cm] NONFINITE loss epoch={epoch} batch={bi} "
+                    f"loss={loss} lnorm={lnorm} lcm={lcm}")
+                raise RuntimeError("non-finite loss")
+            ep_loss += float(loss.item()); ep_n += 1
             (loss / a.accum).backward()
             if (bi + 1) % a.accum == 0:
                 gn = float(torch.nn.utils.clip_grad_norm_(
                     [pp for pp in core.parameters() if pp.requires_grad], 1.0))
                 opt.step(); opt.zero_grad(set_to_none=True)
             else:
-                gn = 0.0
+                gn = -1.0
             global_step += 1
-            if bi % a.log_every == 0:
-                log(f"[cm] epoch={epoch} batch={bi} step={global_step} "
-                    f"loss={loss.item():.5f} lnorm={lnorm.mean().item():.5f} "
+            if (bi + 1) % a.accum == 0 and (bi // a.accum) % max(1, a.log_every) == 0:
+                elapsed = time.time() - t0
+                sps = (bi + 1) * a.batch * world / max(elapsed, 1e-9)
+                total_b = min(len(dl), a.limit_batches) if a.limit_batches else len(dl)
+                eta = (total_b - bi - 1) * a.batch * world / max(sps, 1e-9) / 60
+                log(f"[cm] epoch={epoch} batch={bi}/{len(dl)} "
+                    f"step={global_step} loss={loss.item():.5f} "
+                    f"lnorm={lnorm.mean().item():.5f} "
                     f"lcm={lcm.mean().item():.5f} gn={gn:.3f} "
                     f"lr={opt.param_groups[-1]['lr']:.2e} "
-                    f"elapsed={time.time()-t0:.1f}s")
+                    f"sps={sps:.1f} eta={eta:.1f}min "
+                    f"elapsed={elapsed:.1f}s")
                 if rank == 0:
                     with open(out / "train_log.csv", "a", encoding="utf-8") as fh:
                         fh.write(f"{epoch},{bi},{global_step},{loss.item():.6f},"
@@ -284,8 +341,13 @@ def main():
                     f"val_cm={cm:.4f} val_norm={nm:.4f} "
                     f"ori={ {k: round(v,3) for k,v in ob.items()} }")
         cm, nm, ob = eval_val()
-        log(f"[cm] EPOCH {epoch} val_cm={cm:.4f} val_norm={nm:.4f} "
-            f"ori={ {k: round(v,3) for k,v in ob.items()} }")
+        train_loss = ep_loss / max(ep_n, 1)
+        log(f"[cm] EPOCH {epoch} train_loss={train_loss:.5f} "
+            f"val_cm={cm:.4f} val_norm={nm:.4f} "
+            f"epoch_time={(time.time()-ep_t0)/60:.1f}min")
+        for o, v in ob.items():
+            log(f"[cm] EPOCH {epoch} ori={o} n={v[1]} cm={v[0]:.4f} "
+                f"bias_cm=({v[2]:+.3f},{v[3]:+.3f})")
         opt.zero_grad(set_to_none=True)
         improved = nm < best_norm
         if improved:
@@ -306,7 +368,7 @@ def main():
                 torch.save(state, out / "best.pt")
             with open(out / "val_log.csv", "a", encoding="utf-8") as fh:
                 fh.write(f"{epoch},{global_step},{cm:.6f},{nm:.6f},"
-                         + ",".join(f"{ob[o]:.4f}" for o in (1, 2, 3, 4))
+                         + ",".join(f"{ob[o][0]:.4f}" for o in (1, 2, 3, 4))
                          + "\n")
         stop = torch.tensor([1 if bad_epochs >= 2 else 0],
                             device=device, dtype=torch.int32)
