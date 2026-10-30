@@ -34,8 +34,12 @@ from gazelab.models.dinov2_gaze import (  # noqa: E402
 NOMINAL = {"1": 0.0, "2": math.pi, "3": -math.pi / 2, "4": math.pi / 2}
 
 
+_RANK = 0
+
+
 def log(msg):
-    print(msg, flush=True)
+    if _RANK == 0:
+        print(msg, flush=True)
 
 
 def rot_t(v, ang):
@@ -141,6 +145,12 @@ def main():
     ap.add_argument("--resume", default="", help="last.pt to resume from")
     ap.add_argument("--save-every", type=int, default=25)
     ap.add_argument("--distributed", action="store_true")
+    ap.add_argument("--lambda-ramp", type=int, default=50,
+                    help="steps to linearly ramp lambda_eq from 0")
+    ap.add_argument("--orient-dropout", type=float, default=0.1)
+    ap.add_argument("--unfreeze-after", type=int, default=-1,
+                    help="if >0, start frozen and unfreeze backbone at this step")
+    ap.add_argument("--best", action="store_true", default=True)
     a = ap.parse_args()
     log(f"[probe] args={vars(a)}")
     torch.manual_seed(a.seed)
@@ -158,11 +168,21 @@ def main():
         device = f"cuda:{local}"
     else:
         device = "cuda" if (a.gpu >= 0 and torch.cuda.is_available()) else "cpu"
+    global _RANK
+    _RANK = rank
     log(f"[probe] device={device} rank={rank}/{world}")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    with open(out / "args.json", "w", encoding="utf-8") as fh:
-        json.dump(vars(a), fh, indent=2)
+    if (not distributed) or rank == 0:
+        with open(out / "args.json", "w", encoding="utf-8") as fh:
+            json.dump(vars(a), fh, indent=2)
+        mode = "a" if a.resume else "w"
+        with open(out / "train_log.csv", mode, encoding="utf-8") as fh:
+            if mode == "w":
+                fh.write("step,loss,gaze,eq,lam,gn,lr,elapsed\n")
+        with open(out / "val_log.csv", mode, encoding="utf-8") as fh:
+            if mode == "w":
+                fh.write("step,val_cm,val_eq,d_cm,d_eq\n")
 
     idx_dir = Path(a.index_dir)
     ds_tr = GazeCaptureDataset(idx_dir / "index.csv", augment=False,
@@ -189,7 +209,7 @@ def main():
     model, use_geom, use_eye, use_imu, geom_orient = load_model(a.ckpt, device)
     if distributed:
         model = DDP(model, device_ids=[int(device.split(":")[1])],
-                    find_unused_parameters=False)
+                    find_unused_parameters=True)
 
     core0 = model.module if distributed else model
     if a.freeze_backbone:
@@ -265,6 +285,9 @@ def main():
     model.train()
     t0 = time.time()
     step = start_step
+    best_cm = float("inf")
+    best_step = -1
+    unfrozen = not a.freeze_backbone
     seen = 0
     losses = []
     if step >= a.steps:
@@ -279,6 +302,28 @@ def main():
         lab = lab.to(device).float()
         scm = inp["screen_cm"].to(device).float()
         geom = inp["geom"].to(device).float()
+        if (a.unfreeze_after >= 0 and not unfrozen
+                and step >= a.unfreeze_after):
+            core_u = model.module if distributed else model
+            for pp in core_u.rgb.parameters():
+                pp.requires_grad = True
+            backbone_u = [pp for pp in core_u.rgb.parameters()
+                          if pp.requires_grad]
+            head_u = [pp for n, pp in core_u.named_parameters()
+                      if not n.startswith("rgb.")]
+            opt = torch.optim.AdamW([
+                {"params": backbone_u, "lr": a.lr * a.backbone_lr_ratio},
+                {"params": head_u, "lr": a.lr},
+            ], weight_decay=a.weight_decay)
+            unfrozen = True
+            log(f"[probe] UNFREEZE backbone at step={step}")
+        geom_in = geom
+        if a.orient_dropout > 0:
+            drop = (torch.rand(len(geom), device=device) < a.orient_dropout)
+            if drop.any():
+                geom_in = geom.clone()
+                geom_in[drop, 3:7] = 0.0
+        inp["geom"] = geom_in
         p = forward(inp)
         loss_g = crit(p, lab)
         c = geom[:, 3:7].argmax(1) + 1
@@ -291,7 +336,8 @@ def main():
         r = p.detach() - lab
         tr, _ = to_target(r, scm, c, t, swap, point=False)
         loss_e = crit(p2 - y2, tr)
-        loss = loss_g + a.lambda_eq * loss_e
+        lam = a.lambda_eq * min(1.0, step / max(1, a.lambda_ramp))
+        loss = loss_g + lam * loss_e
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = float(torch.nn.utils.clip_grad_norm_(
@@ -301,8 +347,15 @@ def main():
         if step % a.log_every == 0:
             log(f"[probe] step={step} loss={loss.item():.5f} "
                 f"gaze={loss_g.item():.5f} eq={loss_e.item():.5f} "
-                f"gn={gn:.3f} lr={opt.param_groups[1]['lr']:.2e} "
+                f"lam={lam:.4f} gn={gn:.3f} "
+                f"lr={opt.param_groups[-1]['lr']:.2e} "
                 f"elapsed={time.time()-t0:.1f}s")
+            if rank == 0:
+                with open(out / "train_log.csv", "a", encoding="utf-8") as fh:
+                    fh.write(f"{step},{loss.item():.6f},{loss_g.item():.6f},"
+                             f"{loss_e.item():.6f},{lam:.6f},{gn:.4f},"
+                             f"{opt.param_groups[-1]['lr']:.3e},"
+                             f"{time.time()-t0:.2f}\n")
         step += 1
         if step % a.val_every == 0:
             cm, eq, pair = eval_val()
@@ -315,9 +368,30 @@ def main():
                             "val_cm": cm, "val_eq": eq,
                             "base_cm": base_cm, "base_eq": base_eq,
                             "args": vars(a)}, out / "last.pt")
-            if cm > base_cm + a.max_cm_rise:
+                with open(out / "val_log.csv", "a", encoding="utf-8") as fh:
+                    fh.write(f"{step},{cm:.6f},{eq:.6f},"
+                             f"{cm-base_cm:+.6f},{eq-base_eq:+.6f}\n")
+                if cm < best_cm:
+                    best_cm, best_step = cm, step
+                    torch.save({"model": (model.module if distributed else model).state_dict(),
+                                "optimizer": opt.state_dict(), "step": step,
+                                "val_cm": cm, "val_eq": eq,
+                                "base_cm": base_cm, "base_eq": base_eq,
+                                "args": vars(a)}, out / "best.pt")
+                    log(f"[probe] BEST step={step} val_cm={cm:.4f}")
+            stop = torch.tensor(
+                [1 if cm > base_cm + a.max_cm_rise else 0],
+                device=device, dtype=torch.int32)
+            if distributed:
+                dist.broadcast(stop, 0)
+            if int(stop.item()):
                 log(f"[probe] STOP val_cm rose above {a.max_cm_rise}cm")
                 break
+    if (out / "best.pt").exists() and a.best:
+        ck = torch.load(out / "best.pt", map_location="cpu", weights_only=False)
+        (model.module if distributed else model).load_state_dict(ck["model"])
+        log(f"[probe] restored best.pt step={ck.get('step')} "
+            f"val_cm={ck.get('val_cm')}")
     cm, eq, pair = eval_val()
     if rank == 0:
         torch.save({"model": (model.module if distributed else model).state_dict(),
@@ -325,7 +399,8 @@ def main():
                     "val_cm": cm, "val_eq": eq,
                     "base_cm": base_cm, "base_eq": base_eq,
                     "args": vars(a)}, out / "last.pt")
-    log(f"[probe] FINAL step={step} val_cm={cm:.4f} val_eq={eq:.4f} "
+    log(f"[probe] FINAL step={step} best_step={best_step} "
+        f"val_cm={cm:.4f} val_eq={eq:.4f} "
         f"d_cm={cm-base_cm:+.4f} d_eq={eq-base_eq:+.4f} "
         f"eq_drop={100*(1-eq/max(base_eq,1e-9)):.2f}%")
     with open(out / "summary.json", "w", encoding="utf-8") as fh:
