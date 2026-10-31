@@ -24,10 +24,13 @@ def load_model(ckpt, device):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "model" in state:
         state = state["model"]
+    use_geom_orient = ("proj_geom.weight" in state
+                       and state["proj_geom.weight"].shape[1] == 7)
+    log(f"[cmi] geom_orient={use_geom_orient}")
     model = RGBDGazeDINOv2(
         gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
         inter_dim=1536, freeze_dino=True, unfreeze_last=0,
-        use_imu=False, use_geom=True, use_geom_orient=False,
+        use_imu=False, use_geom=True, use_geom_orient=use_geom_orient,
         use_eye=True, img_size=224,
     ).to(device)
     tgt = model.state_dict()
@@ -72,14 +75,19 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1)
+    ap.add_argument("--shard", type=int, default=0)
     a = ap.parse_args()
     device = "cuda" if (a.gpu >= 0 and torch.cuda.is_available()) else "cpu"
     log(f"[cmi] args={vars(a)} device={device}")
     idx_dir = Path(a.index_dir)
     ds = GazeCaptureDataset(idx_dir / "index.csv", augment=False,
                             image_size=224, eye_crops=True,
-                            geom_orient=False, target_space="cm")
+                            geom_orient=True, target_space="cm")
     idx = split_indices(idx_dir / "index.csv", a.split, a.stride, a.limit)
+    if a.num_shards > 1:
+        idx = idx[a.shard::a.num_shards]
+    log(f"[cmi] shard={a.shard}/{a.num_shards}")
     log(f"[cmi] frames={len(idx)}")
     dl = DataLoader(Subset(ds, idx), batch_size=a.batch, shuffle=False,
                     num_workers=4, pin_memory=True)

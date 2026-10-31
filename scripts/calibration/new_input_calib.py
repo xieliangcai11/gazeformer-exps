@@ -26,7 +26,8 @@ def log(msg):
     print(msg, flush=True)
 
 
-def load_sessions_rows(feat_npz, index_csv, context_key, path_to_row, invalid_row):
+def load_sessions_rows(feat_npz, index_csv, context_key, path_to_row, invalid_row,
+                       subject_of=None):
     z = np.load(feat_npz, allow_pickle=True)
     pred = z["pred"].astype(np.float64)
     label = z["label"].astype(np.float64)
@@ -36,7 +37,12 @@ def load_sessions_rows(feat_npz, index_csv, context_key, path_to_row, invalid_ro
     groups = defaultdict(list)
     for i, p in enumerate(path):
         if p in meta:
-            ctx = meta[p][4] if context_key != "none" else ""
+            if context_key == "subject":
+                ctx = subject_of.get(p, "") if subject_of else ""
+            elif context_key == "session":
+                ctx = p.rsplit("/", 1)[0]
+            else:
+                ctx = meta[p][4] if context_key != "none" else ""
             groups[f"{p.rsplit('/', 1)[0]}||{ctx}"].append(i)
     out = {}
     for s, idx in groups.items():
@@ -151,7 +157,9 @@ def main():
     ap.add_argument("--index-csv", required=True)
     ap.add_argument("--pose-npz", required=True)
     ap.add_argument("--landmark-npz", required=True)
-    ap.add_argument("--context-key", choices=["none", "orientation", "activity"], default="none")
+    ap.add_argument("--context-key", choices=["none", "orientation", "activity",
+                                              "subject", "session"],
+                    default="none")
     ap.add_argument("--K", type=int, default=52)
     ap.add_argument("--lam", type=float, default=0.1)
     ap.add_argument("--delta", type=float, default=1.345)
@@ -276,10 +284,15 @@ def main():
     F = np.vstack([F, np.zeros((1, F.shape[1]), np.float32)])
     V = np.append(V, False)
 
+    subject_of = {}
+    with open(a.index_csv, encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            subject_of[r.get("frame_path", r.get("rgb_path", ""))] = r.get("subject", "")
     D = load_sessions_rows(a.train_npz, a.index_csv, a.context_key,
                            path_to_row, invalid_row)
     S = load_sessions_rows(a.val_npz if a.split == "val" else a.test_npz,
-                           a.index_csv, a.context_key, path_to_row, invalid_row)
+                           a.index_csv, a.context_key, path_to_row, invalid_row,
+                           subject_of)
     mu_aff, _ = fit_source_mu({k: {"pred": d["pred"], "label": d["label"]}
                                for k, d in D.items()})
     log(f"[ncal] source={len(D)} eval={len(S)} K={a.K} dims={len(names)}")
