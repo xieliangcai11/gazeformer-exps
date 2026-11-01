@@ -170,6 +170,7 @@ def main():
     ap.add_argument("--groups", nargs="+", default=["all"])
     ap.add_argument("--method", choices=["ridge", "mlp"], default="ridge")
     ap.add_argument("--base-mode", choices=["affine", "bias"], default="affine")
+    ap.add_argument("--prior", choices=["source", "identity"], default="source")
     ap.add_argument("--gate", action="store_true")
     ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="none")
     ap.add_argument("--robust", action="store_true")
@@ -296,7 +297,10 @@ def main():
                            subject_of)
     mu_aff, _ = fit_source_mu({k: {"pred": d["pred"], "label": d["label"]}
                                for k, d in D.items()})
-    log(f"[ncal] source={len(D)} eval={len(S)} K={a.K} dims={len(names)}")
+    if a.prior == "identity":
+        mu_aff = np.array([1.0, 0.0, 1.0, 0.0])
+    log(f"[ncal] prior={a.prior} mu_aff={np.round(mu_aff,3).tolist()} "
+        f"source={len(D)} eval={len(S)} K={a.K} dims={len(names)}")
 
     acc0 = acc1 = nn = 0.0
     ratios = []
