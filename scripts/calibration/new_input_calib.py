@@ -169,6 +169,7 @@ def main():
     ap.add_argument("--split", choices=["val", "test"], default="val")
     ap.add_argument("--groups", nargs="+", default=["all"])
     ap.add_argument("--method", choices=["ridge", "mlp"], default="ridge")
+    ap.add_argument("--base-mode", choices=["affine", "bias"], default="affine")
     ap.add_argument("--gate", action="store_true")
     ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="none")
     ap.add_argument("--robust", action="store_true")
@@ -309,16 +310,23 @@ def main():
             q = np.setdiff1d(np.arange(len(d["pred"])), sel)
             if len(q) < 20:
                 continue
-            th, _ = fit_theta_huber(d["pred"][sel], d["label"][sel],
-                                    a.lam, mu_aff, a.delta)
-            q0 = apply_theta_np(d["pred"][q], th)
+            if a.base_mode == "bias":
+                b = np.median(d["label"][sel] - d["pred"][sel], axis=0)
+                q0 = d["pred"][q] + b
+                q0_s = d["pred"][sel] + b
+                th = None
+            else:
+                th, _ = fit_theta_huber(d["pred"][sel], d["label"][sel],
+                                        a.lam, mu_aff, a.delta)
+                q0 = apply_theta_np(d["pred"][q], th)
+                q0_s = apply_theta_np(d["pred"][sel], th)
             e0 = float(em(q0, d["label"][q], d["sx"][q], d["sy"][q]).mean())
             stats_idx = d["rows"] if a.semi == "transductive" else d["rows"][sel]
             Zs, fmu, fsd = prep_features(F[:, use], V, d["rows"][sel], stats_idx)
             if Zs is None:
                 e1 = e0
             else:
-                Rs = d["label"][sel] - apply_theta_np(d["pred"][sel], th)
+                Rs = d["label"][sel] - q0_s
                 Ze_raw = F[d["rows"][q]][:, use].astype(np.float64).copy()
                 Ze_raw = np.clip((Ze_raw - fmu) / fsd, -5.0, 5.0)
                 Ze_raw[~np.isfinite(Ze_raw)] = 0.0
@@ -336,7 +344,7 @@ def main():
                                                 iters=a.robust_iters))
                         else:
                             w.append(fit_ridge(Zs, Rs[:, ax], lam_ax))
-                    if a.gate:
+                    if a.gate and th is not None:
                         # baseline LOO: Huber fitted on support-minus-j
                         base_loo = []
                         for j in range(len(d["pred"][sel])):
