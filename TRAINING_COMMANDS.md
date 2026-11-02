@@ -262,6 +262,40 @@ fold3 旧 recipe 的最佳轮数在 8 epoch 左右。
 ```
 
 
+
+---
+
+## 0e. 旧 recipe 再加 1 epoch（epoch8）
+
+从 8 epoch 的 last.pt 续训 1 轮：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,5,7 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train \
+  --dataset rgbdgaze --index-dir data/RGBDGaze/index/cv/fold3 \
+  --resolution 224 --use-eye --no-geom --geom-randomize 0 \
+  --augment --aug-shift 0.05 --aug-scale 0.05 --aug-rotate 0 \
+  --unfreeze 12 --diff-lr --batch-size 6 --lr 1e-4 \
+  --num-workers 4 --epochs 9 --seed 0 \
+  --resume out/rgbdgaze/ablation/checkpoints/rgd_fold3_oldrecipe_b6/last.pt \
+  --tag rgd_fold3_oldrecipe_b6_e9
+```
+
+结果：
+
+```text
+epoch 7：1.51 cm
+epoch 8：1.55 cm
+epoch 15：1.61 cm
+```
+
+结论：
+
+```text
+再加 1 epoch 也不提升；8 epoch 的 epoch7 权重仍是最佳。
+```
+
+
 ---
 
 ## 1. GazeCapture（GC）最佳基线
