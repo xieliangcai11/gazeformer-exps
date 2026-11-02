@@ -35,14 +35,14 @@ def log(msg):
         print(msg, flush=True)
 
 
-def load_model(ckpt, device, geom_orient=True):
+def load_model(ckpt, device, geom_orient=True, use_imu=False):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "model" in state:
         state = state["model"]
     model = RGBDGazeDINOv2(
         gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
         inter_dim=1536, freeze_dino=True, unfreeze_last=12,
-        use_imu=False, use_geom=True, use_geom_orient=geom_orient,
+        use_imu=use_imu, use_geom=True, use_geom_orient=geom_orient,
         use_eye=True, img_size=224,
     ).to(device)
     tgt = model.state_dict()
@@ -102,6 +102,10 @@ def main():
     ap.add_argument("--scratch", action="store_true")
     ap.add_argument("--geom-orient", action="store_true", default=True)
     ap.add_argument("--no-geom-orient", dest="geom_orient", action="store_false")
+    ap.add_argument("--use-imu", action="store_true",
+                    help="加入 IMU 重力 token（GC cm 训练必须与 RGD 一致）")
+    ap.add_argument("--val-split", default="val", choices=["val", "test"],
+                    help="验证划分；默认 val，禁止用 test 选模")
     ap.add_argument("--freeze-backbone", action="store_true")
     ap.add_argument("--reset-head", action="store_true",
                     help="重置输出头（从归一化 checkpoint 迁移到 cm 时使用）")
@@ -185,7 +189,7 @@ def main():
                             image_size=224, eye_crops=True,
                             geom_orient=a.geom_orient, target_space="cm")
     tr_idx = split_indices(idx_dir / "index.csv", "train")
-    va_idx = split_indices(idx_dir / "index.csv", "test")
+    va_idx = split_indices(idx_dir / "index.csv", a.val_split)
     va_idx = va_idx[::a.val_stride][:a.val_limit]
     if rank == 0:
         stats = data_stats(idx_dir / "index.csv")
@@ -210,12 +214,12 @@ def main():
         core = RGBDGazeDINOv2(
             gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
             inter_dim=1536, freeze_dino=True, unfreeze_last=12,
-            use_imu=False, use_geom=True, use_geom_orient=a.geom_orient,
+            use_imu=a.use_imu, use_geom=True, use_geom_orient=a.geom_orient,
             use_eye=True, img_size=224,
         ).to(device)
         log("[cm] scratch init")
     else:
-        core = load_model(a.ckpt, device, a.geom_orient)
+        core = load_model(a.ckpt, device, a.geom_orient, a.use_imu)
     if a.freeze_backbone:
         for p in core.rgb.parameters():
             p.requires_grad = False
@@ -241,10 +245,13 @@ def main():
     huber = nn.SmoothL1Loss(beta=1.0, reduction="none")
 
     def fwd(inp):
+        kw = {}
+        if a.use_imu:
+            kw["imu"] = inp["imu"].to(device).float()
         return model(inp["rgb"].to(device).float(),
                      geom=inp["geom"].to(device).float(),
                      eye_l=inp["eye_l"].to(device).float(),
-                     eye_r=inp["eye_r"].to(device).float())
+                     eye_r=inp["eye_r"].to(device).float(), **kw)
 
     def eval_val():
         model.eval(); cm_s = nm_s = n = 0
@@ -279,11 +286,13 @@ def main():
     best_norm = float("inf")
     if a.resume:
         ck = torch.load(a.resume, map_location="cpu", weights_only=False)
-        core.load_state_dict(ck["model"])
+        miss, unexp, resampled = load_state_dict_any_res(core, ck["model"])
+        log(f"[cm] resume load missing={len(miss)} unexpected={len(unexp)} "
+            f"resampled={resampled}")
         if "optimizer" in ck:
             try:
                 opt.load_state_dict(ck["optimizer"])
-            except ValueError as e:
+            except (ValueError, KeyError) as e:
                 log(f"[cm] skip optimizer: {e}")
         start_epoch = int(ck.get("epoch", -1)) + 1
         global_step = int(ck.get("step", 0))
@@ -294,6 +303,8 @@ def main():
     t0 = time.time()
     bad_epochs = 0
     for epoch in range(start_epoch, a.epochs):
+        log(f"[cm] EPOCH_START epoch={epoch} start_epoch={start_epoch} "
+            f"global_step={global_step} best_norm={best_norm:.4f}")
         if distributed:
             sampler.set_epoch(epoch)
         tr.set_epoch(epoch)
