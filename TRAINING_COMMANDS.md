@@ -212,6 +212,56 @@ out/rgbdgaze/ablation/checkpoints/rgd_fold3_oldrecipe_b6/best.pt
 ```
 
 
+
+---
+
+## 0d. 旧 recipe 续训到 16 epoch（过拟合）
+
+续训命令（从 8 epoch 的 last.pt 接上）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,5,7 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train \
+  --dataset rgbdgaze \
+  --index-dir data/RGBDGaze/index/cv/fold3 \
+  --resolution 224 \
+  --use-eye \
+  --no-geom \
+  --geom-randomize 0 \
+  --augment \
+  --aug-shift 0.05 --aug-scale 0.05 --aug-rotate 0 \
+  --unfreeze 12 --diff-lr \
+  --batch-size 6 --lr 1e-4 \
+  --num-workers 4 --epochs 16 --seed 0 \
+  --resume out/rgbdgaze/ablation/checkpoints/rgd_fold3_oldrecipe_b6/last.pt \
+  --tag rgd_fold3_oldrecipe_b6_e16
+```
+
+训练损失：
+
+```text
+epoch 7  0.0041
+epoch 8  0.0038
+epoch 10 0.0033
+epoch 12 0.0030
+epoch 15 0.0027
+```
+
+test：
+
+```text
+8 epoch  : 1.51 cm / L2 0.1359 / ang 2.83°
+16 epoch : 1.61 cm / L2 0.1432 / ang 3.02°
+```
+
+结论：
+
+```text
+训练损失继续下降，但 test 变差 ⇒ 16 epoch 已过拟合。
+fold3 旧 recipe 的最佳轮数在 8 epoch 左右。
+```
+
+
 ---
 
 ## 1. GazeCapture（GC）最佳基线
