@@ -86,7 +86,9 @@ def make_opt(core, head_lr, ratio, wd, freeze_backbone):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default="")
+    ap.add_argument("--scratch", action="store_true",
+                    help="不加载 GC checkpoint，从随机初始化训练当前 cm+geom 模型")
     ap.add_argument("--index-csv", default="data/RGBDGaze/index/index_imu.csv")
     ap.add_argument("--split-dir", default="data/RGBDGaze/index/cv/fold3")
     ap.add_argument("--out", default="out/rgbdgaze/cm_ft_v2")
@@ -182,7 +184,19 @@ def main():
     dl_te = DataLoader(Subset(va, te_idx), batch_size=a.batch, shuffle=False,
                        num_workers=a.num_workers, pin_memory=True)
 
-    core = load_model(a.ckpt, device)
+    if a.scratch:
+        core = RGBDGazeDINOv2(
+            gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
+            inter_dim=1536, freeze_dino=True, unfreeze_last=12,
+            use_imu=False, use_geom=True, use_geom_orient=True,
+            use_eye=True, img_size=224,
+        ).to(device)
+        log("[rgd] scratch init (cm+geom, no GC checkpoint)")
+        start_epoch = 0; step0 = 0; best = float("inf")
+    else:
+        if not a.ckpt:
+            raise ValueError("需要 --ckpt 或 --scratch")
+        core = load_model(a.ckpt, device)
     if a.resume:
         ck = torch.load(a.resume, map_location="cpu", weights_only=False)
         core.load_state_dict(ck["model"])

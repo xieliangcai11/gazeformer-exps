@@ -3,6 +3,134 @@
 > 目的：保存实际使用过的训练/微调命令，避免后续凭印象判断。
 > 说明：命令来自训练日志中的“复现/命令”行和 `train_args.json`；没有记录的命令会明确标注“重建”。
 
+
+---
+
+## 0. 关键口径：1.47 是固定 split，不是 fold3
+
+来源：`out/rgbdgaze/eye224_mgpu.log`
+
+```text
+[final] test_L2 0.1345  test_em 1.47cm (x:0.74 y:1.11)
+```
+
+完整原始命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6 \
+torchrun --standalone --nproc_per_node=6 -m scripts.train \
+  --dataset rgbdgaze \
+  --resolution 224 \
+  --no-geom \
+  --geom-randomize 0 \
+  --augment \
+  --aug-shift 0.05 \
+  --aug-scale 0.05 \
+  --aug-rotate 0 \
+  --unfreeze 12 \
+  --diff-lr \
+  --batch-size 4 \
+  --lr 1e-4 \
+  --num-workers 6 \
+  --epochs 8 \
+  --use-eye \
+  --tag eye224_mgpu
+```
+
+配置：
+
+```text
+数据集：RGBDGaze
+索引：data/RGBDGaze/index        # 固定 split，不是 cv/fold3
+划分：train 127257 / val 4381 / test 11031
+模型：旧归一化模型，输出归一化坐标，无 geom
+loss：mse
+unfreeze：12
+eye：True
+diff_lr：True
+batch/卡：4
+卡数：6
+有效批：24
+lr：1e-4
+epochs：8
+seed：0
+```
+
+checkpoint：
+
+```text
+out/rgbdgaze/ablation/checkpoints/eye224_mgpu/best.pt
+```
+
+注意：
+
+```text
+1.47 = 固定 split 的结果
+1.48 = CV fold3 的结果
+```
+
+两者不能混用。
+
+---
+
+## 0b. GC 最近一次续训（cm_ctx_ft3）
+
+来源：`out/gazecapture/analysis/cm_ctx_ft3.log` / `args.json`。
+这是 `cm_ctx_ft` 的第 4 个 epoch 续训，使用 6 卡、batch 8、accum 4。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,5,6 \
+torchrun --standalone --nproc_per_node=6 -m scripts.calibration.cm_train_epoch \
+  --ckpt out/gazecapture/analysis/cm_ctx_ft/last.pt \
+  --geom-orient \
+  --resume out/gazecapture/analysis/cm_ctx_ft/last.pt \
+  --index-dir data/GazeCapture/index \
+  --out out/gazecapture/analysis/cm_ctx_ft \
+  --epochs 4 \
+  --batch 8 \
+  --accum 4 \
+  --lr 5e-05 \
+  --backbone-lr-ratio 0.05 \
+  --weight-decay 0.01 \
+  --warmup 200 \
+  --loss norm_plus_cm \
+  --cm-weight 0.01 \
+  --huber-beta 0.05 \
+  --augment \
+  --aug-shift 0.05 \
+  --aug-scale 0.05 \
+  --aug-rotate 0 \
+  --geom-randomize 0 \
+  --val-stride 300 \
+  --val-limit 512 \
+  --log-every 200 \
+  --val-every 2000 \
+  --max-norm-rise 0.01 \
+  --num-workers 3 \
+  --distributed
+```
+
+说明：
+
+```text
+日志里的 args 不含 CUDA_VISIBLE_DEVICES；
+GPU 列表按项目约定“跳过 GPU4”记录为 0,1,2,3,5,6。
+如果实际卡号不同，以日志中的 rank/device 为准。
+```
+
+记录结果：
+
+```text
+resume start_epoch=3 step=78246 best_norm=0.1750
+```
+
+checkpoint：
+
+```text
+out/gazecapture/analysis/cm_ctx_ft/best.pt
+```
+
+
 ---
 
 ## 1. GazeCapture（GC）最佳基线
