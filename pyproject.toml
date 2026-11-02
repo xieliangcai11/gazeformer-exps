@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gazelab"
 version = "0.2.0"
-description = "Robust sequential calibration for 2D screen gaze estimation"
+description = "2D screen gaze estimation with DINOv2 + BlockMoba"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -34,4 +34,3 @@ include = ["gazelab*", "configs*", "tools*", "scripts*"]
 
 [project.scripts]
 gazelab-train = "scripts.train:main"
-gazelab-predict = "gazelab.predict:main"

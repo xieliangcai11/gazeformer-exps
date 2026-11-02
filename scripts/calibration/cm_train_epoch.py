@@ -35,14 +35,14 @@ def log(msg):
         print(msg, flush=True)
 
 
-def load_model(ckpt, device):
+def load_model(ckpt, device, geom_orient=True):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "model" in state:
         state = state["model"]
     model = RGBDGazeDINOv2(
         gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
         inter_dim=1536, freeze_dino=True, unfreeze_last=12,
-        use_imu=False, use_geom=True, use_geom_orient=False,
+        use_imu=False, use_geom=True, use_geom_orient=geom_orient,
         use_eye=True, img_size=224,
     ).to(device)
     tgt = model.state_dict()
@@ -100,6 +100,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="")
     ap.add_argument("--scratch", action="store_true")
+    ap.add_argument("--geom-orient", action="store_true", default=True)
+    ap.add_argument("--no-geom-orient", dest="geom_orient", action="store_false")
+    ap.add_argument("--freeze-backbone", action="store_true")
+    ap.add_argument("--reset-head", action="store_true",
+                    help="重置输出头（从归一化 checkpoint 迁移到 cm 时使用）")
     ap.add_argument("--resume", default="")
     ap.add_argument("--index-dir", default="data/GazeCapture/index")
     ap.add_argument("--out", default="out/gazecapture/cm_epoch")
@@ -111,7 +116,11 @@ def main():
     ap.add_argument("--backbone-lr-ratio", type=float, default=0.1)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--warmup", type=int, default=500)
-    ap.add_argument("--loss", choices=["cm", "norm_plus_cm"], default="norm_plus_cm")
+    ap.add_argument("--loss", choices=["cm", "norm_plus_cm", "norm_huber",
+                                       "norm_huber_cm", "norm_mse"],
+                    default="norm_plus_cm")
+    ap.add_argument("--cm-weight", type=float, default=0.01)
+    ap.add_argument("--huber-beta", type=float, default=0.05)
     ap.add_argument("--augment", action="store_true")
     ap.add_argument("--aug-shift", type=float, default=0.05)
     ap.add_argument("--aug-scale", type=float, default=0.05)
@@ -170,11 +179,11 @@ def main():
                             aug_rotate=a.aug_rotate,
                             geom_randomize=a.geom_randomize,
                             image_size=224, eye_crops=True,
-                            geom_orient=False, target_space="cm")
+                            geom_orient=a.geom_orient, target_space="cm")
     tr.set_aug_seed(a.seed)
     va = GazeCaptureDataset(idx_dir / "index.csv", augment=False,
                             image_size=224, eye_crops=True,
-                            geom_orient=False, target_space="cm")
+                            geom_orient=a.geom_orient, target_space="cm")
     tr_idx = split_indices(idx_dir / "index.csv", "train")
     va_idx = split_indices(idx_dir / "index.csv", "test")
     va_idx = va_idx[::a.val_stride][:a.val_limit]
@@ -201,12 +210,22 @@ def main():
         core = RGBDGazeDINOv2(
             gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
             inter_dim=1536, freeze_dino=True, unfreeze_last=12,
-            use_imu=False, use_geom=True, use_geom_orient=False,
+            use_imu=False, use_geom=True, use_geom_orient=a.geom_orient,
             use_eye=True, img_size=224,
         ).to(device)
         log("[cm] scratch init")
     else:
-        core = load_model(a.ckpt, device)
+        core = load_model(a.ckpt, device, a.geom_orient)
+    if a.freeze_backbone:
+        for p in core.rgb.parameters():
+            p.requires_grad = False
+        log("[cm] backbone frozen")
+    if a.reset_head:
+        for m in (core.head,):
+            m.reset_parameters()
+            nn.init.zeros_(m.bias)
+            nn.init.normal_(m.weight, std=0.01)
+        log("[cm] reset output head")
     model = DDP(core, device_ids=[int(device.split(":")[1])],
                 find_unused_parameters=True) if distributed else core
     opt = torch.optim.AdamW([
@@ -293,16 +312,27 @@ def main():
             phi = inp["phi"].to(device).float()
             valid = inp["imu_valid"].to(device).float()
             p = fwd(inp)
+            w = valid
             if a.loss == "cm":
-                lcm = huber(p, lab_cm).mean(dim=1)
-                loss = ((lcm * valid).sum() / valid.sum().clamp_min(1.0))
-                lnorm = torch.zeros((), device=device)
+                lcm_v = huber(p, lab_cm).mean(dim=1)
+                loss = (lcm_v * w).sum() / w.sum().clamp_min(1.0)
+                lnorm_v = torch.zeros_like(lcm_v)
             else:
                 pn = to_norm(p, scm, phi)
-                lnorm = ((pn - lab_norm) ** 2).mean(dim=1)
-                lcm = huber(p, lab_cm).mean(dim=1)
-                w = valid
-                loss = ((lnorm * w).sum() + 0.1 * (lcm * w).sum()) / w.sum().clamp_min(1.0)
+                if a.loss in ("norm_huber", "norm_huber_cm"):
+                    lnorm_v = torch.nn.functional.smooth_l1_loss(
+                        pn, lab_norm, reduction="none",
+                        beta=a.huber_beta).mean(dim=1)
+                else:
+                    lnorm_v = ((pn - lab_norm) ** 2).mean(dim=1)
+                if a.loss in ("norm_huber", "norm_mse"):
+                    lcm_v = torch.zeros_like(lnorm_v)
+                    loss = (lnorm_v * w).sum() / w.sum().clamp_min(1.0)
+                else:
+                    lcm_v = huber(p, lab_cm).mean(dim=1)
+                    loss = ((lnorm_v + a.cm_weight * lcm_v) * w).sum() / w.sum().clamp_min(1.0)
+            lnorm = lnorm_v.mean()
+            lcm = lcm_v.mean()
             if not torch.isfinite(loss):
                 log(f"[cm] NONFINITE loss epoch={epoch} batch={bi} "
                     f"loss={loss} lnorm={lnorm} lcm={lcm}")
@@ -339,7 +369,18 @@ def main():
                 cm, nm, ob = eval_val()
                 log(f"[cm] MID epoch={epoch} step={global_step} "
                     f"val_cm={cm:.4f} val_norm={nm:.4f} "
-                    f"ori={ {k: round(v,3) for k,v in ob.items()} }")
+                    f"ori={ {k: round(v[0],3) for k,v in ob.items()} }")
+                if nm < best_norm:
+                    best_norm = nm
+                    bad_epochs = 0
+                    if rank == 0:
+                        state = {"model": core.state_dict(),
+                                 "optimizer": opt.state_dict(),
+                                 "epoch": epoch, "step": global_step,
+                                 "best_norm": best_norm, "val_cm": cm,
+                                 "val_norm": nm, "args": vars(a)}
+                        torch.save(state, out / "best.pt")
+                    log(f"[cm] BEST(mid) step={global_step} val_norm={nm:.4f}")
         cm, nm, ob = eval_val()
         train_loss = ep_loss / max(ep_n, 1)
         log(f"[cm] EPOCH {epoch} train_loss={train_loss:.5f} "

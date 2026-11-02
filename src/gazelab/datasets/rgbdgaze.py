@@ -92,6 +92,8 @@ class RGBDGazeDataset(Dataset):
         eye_crops: bool = False,
         orient: str = "raw",
         eye_scale: float = 0.0,
+        geom_orient: bool = False,
+        target_space: str = "norm",
     ):
         """裁剪朝向 orient（**只用于评估历史 ckpt**；所有训练与新实验用默认 raw）
 
@@ -162,6 +164,10 @@ class RGBDGazeDataset(Dataset):
         # 框表由 tools/data/rgbdgaze/build_eye_boxes.py 生成（**原图坐标**，与裁剪同帧；
         # 8 帧检测失败用同被试中位数兜底，filled 掩码备查）。
         self.eye_crops = bool(eye_crops)
+        self.geom_orient = bool(geom_orient)
+        if target_space not in ("norm", "cm"):
+            raise ValueError("target_space 只能是 'norm' 或 'cm'")
+        self.target_space = target_space
         if self.eye_crops:
             # 必须校验 idx == arange(N)：只比长度会在"索引重建但行数恰好相同"时
             # 让眼框与帧逐行错位（训练照跑、指标静默失真）。
@@ -382,8 +388,6 @@ class RGBDGazeDataset(Dataset):
                 gx, gy, geom, w_cm, h_cm = out
                 screen_cm = torch.tensor([w_cm, h_cm], dtype=torch.float32)
 
-        label = np.array([gx, gy], dtype=np.float32)
-
         # IMU 重力向量（若 index 含该列则返回，供 use_imu 模型使用；否则零向量占位）
         try:
             imu = torch.tensor([float(row["imu_x"]), float(row["imu_y"]),
@@ -391,9 +395,31 @@ class RGBDGazeDataset(Dataset):
         except (KeyError, ValueError):
             imu = torch.zeros(3, dtype=torch.float32)
 
-        out = edict(rgb=rgb_face, screen_cm=screen_cm, imu=imu, geom=geom)
+        label = np.array([gx, gy], dtype=np.float32)
+        phi = float(np.arctan2(float(imu[0]), -float(imu[1])))
+        xc = (gx - 0.5) * w_cm
+        yc = (gy - 0.5) * h_cm
+        c, s_ = np.cos(phi), np.sin(phi)
+        target_cm = torch.tensor([c * xc + s_ * yc,
+                                  -s_ * xc + c * yc], dtype=torch.float32)
+        if self.geom_orient:
+            o = int(float(row.get("orientation", 0) or 0))
+            oh = torch.zeros(4, dtype=torch.float32)
+            if 1 <= o <= 4:
+                oh[o - 1] = 1.0
+            else:
+                oh[0] = 1.0  # RGD index orientation=0：默认按竖屏
+            geom = torch.cat([geom, oh])
+
+        imu_valid = bool(np.hypot(float(imu[0]), float(imu[1])) >= 0.05)
+        out = edict(rgb=rgb_face, screen_cm=screen_cm, imu=imu, geom=geom,
+                    phi=torch.tensor(phi), imu_valid=torch.tensor(imu_valid),
+                    label_norm=torch.from_numpy(label.copy()),
+                    target_cm=target_cm,
+                    orientation=torch.tensor(int(float(row.get("orientation", 0) or 0))))
         if self.eye_crops:
             # 眼部放大支流（use_eye=True 的模型消费）：默认 collate 会堆成 [B,3,S,S]
             out.eye_l = eye_l
             out.eye_r = eye_r
-        return out, self.target_transform(label)
+        y = target_cm if self.target_space == "cm" else self.target_transform(label)
+        return out, y

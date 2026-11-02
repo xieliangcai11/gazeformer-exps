@@ -1,167 +1,225 @@
-# Robust Sequential Calibration for 2D Screen Gaze
+# Gazelab: 2D Screen Gaze Estimation
 
-Label-efficient per-user calibration for RGB / RGB-D screen gaze estimation.
-The calibrator is model-agnostic: it takes the base model's 2D screen predictions,
-a few labelled calibration points, and optional per-frame pose features.
+面向手机前置摄像头的 2D 屏幕注视点估计。核心链路只有一条：
 
-## Method
-
-For each homogeneous context (phone orientation for GazeCapture, activity for
-RGBDGaze) we fit a small affine correction
-
-```
-u = sx * x + bx,   v = sy * y + by
+```text
+数据索引 → 人脸/眼部裁剪 → DINOv2 + BlockMoba → cm 坐标
 ```
 
-with a population prior learned from source users and a robust (Huber) fit:
+支持 GazeCapture（GC）预训练和 RGBDGaze（RGD）微调。模型输出**物理厘米**坐标，
+屏幕几何在输入侧显式提供；校准方法作为可选的轻量后处理保留。
 
-1. **Coverage selection** — calibration frames are spread over a 3×3 grid of
-   predicted screen positions.
-2. **Ridge prior** — source users provide the prior mean; `lambda` controls its
-   strength.
-3. **Huber IRLS** — calibration points with large residuals (blinks, missed
-   fixations) are down-weighted. This is the main source of gain and of
-   worst-case robustness.
-4. **Sequential update (optional)** — points can be processed one by one with a
-   Bayesian posterior; fixed K and sequential updates are mathematically
-   equivalent when no early stopping is used.
+---
 
-No target-domain labels are used outside the K calibration points. Evaluation
-labels are used only for scoring.
+## 1. 方法
 
-## Results
+### 输入
 
-Frame-weighted screen error (cm). Baselines: GazeCapture 1.612, RGBDGaze 1.465.
-K is per context (per orientation / per activity); 5 calibration-seed average.
+- 整脸裁剪：224×224
+- 左眼裁剪：224×224
+- 右眼裁剪：224×224
+- 屏幕几何：7 维
+  ```text
+  [短边/长边, log(短边cm), log(长边cm), orientation one-hot ×4]
+  ```
 
-### GazeCapture
+### 骨干
 
-| K/orientation | B2 (ridge) | Robust sequential |
-|---|---|---|
-| 5  | −15.86% | **−17.68%** |
-| 9  | −19.97% | **−22.10%** |
-| 13 | −22.12% | **−23.62%** |
-| 26 | −23.23% | **−25.26%** |
+- DINOv2 ViT-S/14；patch embedding、position embedding、final norm 冻结；
+- Transformer block 可全部或部分解冻；
+- 人脸 CLS + patch tokens、双眼 CLS、几何 token 拼接；
+- 6 层 BlockMoba（d_model=384，MoE/FFN）；
+- RMSNorm + 线性头 → 2D cm。
 
-At K=9 (≈28 labels/session) error drops from **1.612 → 1.256 cm**.
+### 输出
 
-### RGBDGaze
-
-| K/activity | B2 | Robust sequential |
-|---|---|---|
-| 5  | −12.71% | **−13.37%** |
-| 9  | −16.96% | **−18.19%** |
-| 13 | −16.05% | **−17.44%** |
-| 26 | −18.87% | **−19.59%** |
-
-At K=9 error drops from **1.465 → 1.201 cm**.
-
-### Label-budget curve (Huber calibration, frame-weighted cm)
-
-| K/context | GazeCapture | RGBDGaze |
-|---|---|---|
-9  | 1.256 | 1.230 |
-13 | 1.237 | 1.208 |
-26 | 1.202 | 1.155 |
-52 | 1.182 | 1.133 |
-104| 1.161 | 1.115 |
-
-Labels are per context: GazeCapture has ≈3.1 orientations/session, so K=52
-means ≈160 labels/session; K=104 means ≈320. Returns are strongly diminishing:
-going from K=9 to K=104 buys 0.095 cm (GC) / 0.115 cm (RGD) for 10× labels.
-
-Ablations: quadratic/RBF residual models did not beat affine; active D-optimal
-selection was worse than coverage/random; device-family priors and context
-means did not help; checkpoint ensembles did not improve the base model. See
-`results/k_curve.csv`.
-
-## Layout
-
-```
-src/gazelab/              datasets, DINOv2 gaze model, training utilities
-configs/                  dataset paths and hyper-parameters
-scripts/train.py          model training / evaluation
-scripts/calibration/      final calibration method + baselines
-  dump_feats.py           export frozen-model features and predictions
-  pose_features.py        head-pose / eye-geometry proxy features
-  seq_bayes_calib.py      robust sequential calibration (main)
-  robust_calib.py         Huber-B2 baseline / comparison
-  cc_eb.py                coverage selection + ridge prior (B2)
-tools/data/               dataset preprocessing
-assets/                   MediaPipe / OpenCV assets
-tests/                    unit tests
+```text
+(X, Y)_cm
 ```
 
-## Install
+- 原点：屏幕中心；
+- 坐标轴：竖屏标准方向；
+- 归一化标签通过 IMU 角度旋转到 cm。
+
+### 训练
+
+- 损失：归一化 MSE + 0.01 × cm Huber；
+- 阶段 A：冻结 DINOv2，训练融合层和输出头；
+- 阶段 B：解冻 Transformer，backbone 使用较低学习率；
+- 支持 DDP、断点续训、验证集 best checkpoint、早停。
+
+---
+
+## 2. 目录
+
+```text
+configs/                      数据集路径与超参
+src/gazelab/datasets/         GazeCapture / RGBDGaze 数据读取
+src/gazelab/models/           DINOv2 + BlockMoba 模型
+src/gazelab/utils/            通用工具
+scripts/train.py              GC / RGD 主训练入口
+scripts/calibration/
+  cm_infer.py                 模型评估（norm / cm / 分设备）
+  cm_train_epoch.py           cm 空间续训
+  rgd_cm_ft_v2.py             GC → RGD 微调
+  dump_feats.py               导出特征与预测
+  pose_features.py            位姿代理特征
+  seq_bayes_calib.py          最终校准方法
+  robust_calib.py             Huber-B2 对照
+  cc_eb.py                    覆盖选择 + ridge prior
+tools/data/                   数据预处理与索引构建
+tests/                        核心单元测试
+docs/papers/                  参考论文
+```
+
+---
+
+## 3. 安装
 
 ```bash
 pip install -e .
 ```
 
-Optional: `pip install mediapipe` for eye-box/pose extraction.
-
-## Quickstart
-
-1. Preprocess a dataset with `tools/data/.../preprocess.py` (see `configs/`).
-2. Train or obtain a base model with `scripts/train.py`.
-3. Export features/predictions:
+可选：
 
 ```bash
-python -m scripts.calibration.dump_feats \
+pip install mediapipe
+```
+
+---
+
+## 4. 数据
+
+### GazeCapture
+
+```bash
+python tools/data/gazecapture/preprocess.py \
+  --archive-dir data/GazeCapture \
+  --extract-dir data/GazeCapture_extracted \
+  --index-dir data/GazeCapture/index
+
+python tools/data/gazecapture/build_eye_boxes_mp.py \
+  --index-dir data/GazeCapture/index
+```
+
+### RGBDGaze
+
+```bash
+python tools/data/rgbdgaze/preprocess.py \
+  --index-dir data/RGBDGaze/index
+
+python tools/data/rgbdgaze/build_eye_boxes.py \
+  --index-dir data/RGBDGaze/index
+
+python tools/data/rgbdgaze/add_imu_to_index.py \
+  --index-dir data/RGBDGaze/index
+```
+
+---
+
+## 5. 训练
+
+完整命令见 `TRAINING_COMMANDS.md`。最小示例：
+
+### GazeCapture
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train \
   --dataset gazecapture \
+  --index-dir data/GazeCapture/index \
+  --resolution 224 \
+  --use-eye \
+  --geom --geom-orient --geom-randomize 0 \
+  --augment --aug-shift 0.05 --aug-scale 0.05 --aug-rotate 0 \
+  --unfreeze 12 --diff-lr --lr 1.4e-4 \
+  --batch-size 32 --num-workers 4 \
+  --epochs 6 --seed 0 \
+  --tag gc_cm
+```
+
+### RGBDGaze 微调
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 -m scripts.calibration.rgd_cm_ft_v2 \
   --ckpt out/gazecapture/.../best.pt \
-  --index-dir data/GazeCapture/index \
-  --split test --resolution 224 --use-eye \
-  --out out/gazecapture/analysis/feats_gc_test.npz
+  --index-csv data/RGBDGaze/index/index_imu.csv \
+  --split-dir data/RGBDGaze/index/cv/fold3 \
+  --epochs 8 --head-epochs 1 \
+  --batch 16 --accum 2 \
+  --head-lr 2e-4 --lr 5e-5 \
+  --backbone-lr-ratio 0.1 \
+  --augment --val-frac 0.15 \
+  --patience 3 --distributed
 ```
 
-4. Export pose proxies:
+---
+
+## 6. 评估
 
 ```bash
-python -m scripts.calibration.pose_features \
-  --dataset gazecapture \
+python -m scripts.calibration.cm_infer \
+  --ckpt out/.../best.pt \
   --index-dir data/GazeCapture/index \
-  --eye-boxes data/GazeCapture/index/eye_boxes.npz \
-  --out out/gazecapture/analysis/pose_features.npz
+  --split test --stride 10 \
+  --out out/eval/pred.npz
 ```
 
-5. Run robust sequential calibration (K=9 per orientation):
+输出：
+
+- 归一化 L2；
+- cm 误差；
+- 分朝向/设备误差。
+
+---
+
+## 7. 校准（可选）
+
+最终校准方法是按上下文拟合仿射修正：
+
+```text
+u = sx * x + bx
+v = sy * y + by
+```
+
+流程：
+
+1. `dump_feats.py` 导出基模型预测/特征；
+2. `pose_features.py` 导出位姿代理特征；
+3. `seq_bayes_calib.py` 做覆盖选择、ridge prior、Huber IRLS。
+
+示例：
 
 ```bash
 python -m scripts.calibration.seq_bayes_calib \
-  --train-npz out/gazecapture/analysis/feats_gc_train.npz \
-  --val-npz   out/gazecapture/analysis/feats_gc_val.npz \
-  --test-npz  out/gazecapture/analysis/feats_gc_test.npz \
+  --train-npz out/.../feats_train.npz \
+  --val-npz out/.../feats_val.npz \
+  --test-npz out/.../feats_test.npz \
   --index-csv data/GazeCapture/index/index.csv \
-  --pose-npz  out/gazecapture/analysis/pose_features.npz \
+  --pose-npz out/.../pose_features.npz \
   --context-key orientation \
-  --select-mode coverage_b2 --noise-mode const --prior-mode ridge \
-  --prior-lam 1.0 --huber-delta 2.0 \
-  --kmin 3 --kmax 9 --stop-std 0 \
-  --out out/gazecapture/analysis/calibrated.csv
+  --select-mode coverage_b2 \
+  --prior-mode ridge --prior-lam 1.0 \
+  --huber-delta 2.0 \
+  --kmin 3 --kmax 9
 ```
 
-For RGBDGaze use `--context-key activity --prior-lam 0.1 --huber-delta 1.345`.
+校准只在少量目标域标签上拟合；评估标签不参与拟合。
 
-## Notes and limitations
+---
 
-- Dataset labels are **displayed target points**, not measured eye position;
-  calibration assumes the user fixates the shown targets.
-- GazeCapture sessions mix four phone orientations, so calibration is per
-  orientation; RGBDGaze sessions are already per activity.
-- Default K=9; K=13 helps GazeCapture slightly, K=26 has diminishing returns.
-- Optional quality gate: `--gate-quantile 0.9` falls back to the prior when the
-  calibration residual is in the top decile. On these benchmarks 0.9 was too
-  aggressive; tune on validation before enabling.
-- Reported numbers are on the official test splits; no test labels are used for
-  fitting or hyper-parameter selection.
-
-## Tests
+## 8. 测试
 
 ```bash
 python -m unittest tests.test_calibration -v
+python -m compileall -q src scripts tools
 ```
 
-## License
+---
 
-MIT. See `LICENSE`.
+## 9. 说明
+
+- 数据、`out/`、`experiments/` 为本地生成物，不进入 git；
+- 训练资源不超过服务器 75%，不使用 GPU 4；
+- 归一化/cm 两种口径必须在同一 split 上比较，不能混用。
