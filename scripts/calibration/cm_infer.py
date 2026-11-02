@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--output-space", default="cm", choices=["cm", "norm"])
     a = ap.parse_args()
     device = "cuda" if (a.gpu >= 0 and torch.cuda.is_available()) else "cpu"
     log(f"[cmi] args={vars(a)} device={device}")
@@ -103,8 +104,9 @@ def main():
                   geom=inp["geom"].to(device).float(),
                   eye_l=inp["eye_l"].to(device).float(),
                   eye_r=inp["eye_r"].to(device).float())
-        pn = to_norm(p, inp["screen_cm"].to(device).float(),
-                     inp["phi"].to(device).float()).cpu()
+        pn = (p if a.output_space == "norm" else to_norm(
+            p, inp["screen_cm"].to(device).float(),
+            inp["phi"].to(device).float())).cpu()
         ln = inp["label_norm"].float()
         scm = inp["screen_cm"].float()
         cm = ((pn - ln) * scm).norm(dim=1)
