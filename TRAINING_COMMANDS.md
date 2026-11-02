@@ -131,6 +131,87 @@ out/gazecapture/analysis/cm_ctx_ft/best.pt
 ```
 
 
+
+---
+
+## 0c. 旧 recipe 复跑 fold3（1.51 cm）
+
+用途：验证“当前代码 + 旧 1.47 recipe”能否复现旧基线。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,5,7 \
+torchrun --standalone --nproc_per_node=4 -m scripts.train \
+  --dataset rgbdgaze \
+  --index-dir data/RGBDGaze/index/cv/fold3 \
+  --resolution 224 \
+  --use-eye \
+  --no-geom \
+  --geom-randomize 0 \
+  --augment \
+  --aug-shift 0.05 \
+  --aug-scale 0.05 \
+  --aug-rotate 0 \
+  --unfreeze 12 \
+  --diff-lr \
+  --batch-size 6 \
+  --lr 1e-4 \
+  --num-workers 4 \
+  --epochs 8 \
+  --seed 0 \
+  --resume off \
+  --tag rgd_fold3_oldrecipe_b6
+```
+
+说明：
+
+```text
+有效批 = 6 × 4 = 24
+旧 1.47：batch 4 × 6 卡 = 24
+```
+
+结果：
+
+```text
+test_L2  = 0.1359
+test_em  = 1.51 cm
+test_ang = 2.83°
+n        = 25703
+```
+
+训练损失：
+
+```text
+epoch 0  0.0220
+epoch 1  0.0096
+epoch 2  0.0074
+epoch 3  0.0062
+epoch 7  0.0041
+```
+
+对照旧 1.47：
+
+```text
+epoch 0  0.0217
+epoch 1  0.0089
+epoch 2  0.0072
+epoch 3  0.0061
+epoch 7  0.0042
+```
+
+结论：
+
+```text
+当前代码 + 旧 recipe 可复现旧基线（1.51 vs 1.48）。
+当前归一化实验差主要来自 training recipe，不是归一化输出本身。
+```
+
+checkpoint：
+
+```text
+out/rgbdgaze/ablation/checkpoints/rgd_fold3_oldrecipe_b6/best.pt
+```
+
+
 ---
 
 ## 1. GazeCapture（GC）最佳基线
