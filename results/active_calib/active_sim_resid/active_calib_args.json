@@ -1,0 +1,31 @@
+{
+  "train_npz": "out/gazecapture/analysis/feats_cm_val.npz",
+  "test_npz": "out/gazecapture/analysis/feats_cm_test_full.npz",
+  "index_csv": "data/GazeCapture/index/index.csv",
+  "dino_npz": "out/gazecapture/analysis/dino_pca16_cm_full.npz",
+  "landmark_npz": "out/gazecapture/analysis/lm_gc_test.npz",
+  "features": "dino,landmark",
+  "regions": "3x3",
+  "no_residual": false,
+  "methods": "random,dotcov,dopt,doptcov,frame",
+  "K_dots": [
+    8,
+    12,
+    16,
+    20
+  ],
+  "K_frames": [
+    20,
+    50
+  ],
+  "seeds": 1,
+  "dot_split": 0.65,
+  "min_dot_frames": 2,
+  "min_frames": 40,
+  "split_seed": 0,
+  "dopt_sigma": 0.02,
+  "cov_weight": 0.1,
+  "limit_sessions": 0,
+  "log_level": 1,
+  "out_dir": "out/gazecapture/analysis/active_sim_resid"
+}

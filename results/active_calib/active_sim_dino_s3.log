@@ -1,0 +1,58 @@
+[INFO 17:14:05 +     0.0s] ==============================================================================
+[INFO 17:14:05 +     0.0s] active_calib_sim
+[INFO 17:14:05 +     0.0s] host=hr-RTX4090-132-41 python=3.11.16 numpy=2.4.6 pid=1474035
+[INFO 17:14:05 +     0.0s] args={"train_npz": "out/gazecapture/analysis/feats_cm_val.npz", "test_npz": "out/gazecapture/analysis/feats_cm_test_full.npz", "index_csv": "data/GazeCapture/index/index.csv", "dino_npz": "out/gazecapture/analysis/dino_pca16_cm_full.npz", "landmark_npz": "", "features": "dino", "regions": "none", "no_residual": false, "methods": "random,dotcov,featdiv,hybrid,frame", "residual_level": "dot", "n_affine": 4, "K_dots": [12, 16, 20], "K_frames": [50], "seeds": 3, "dot_split": 0.65, "min_dot_frames": 2, "min_frames": 40, "split_seed": 0, "dopt_sigma": 0.02, "cov_weight": 0.1, "limit_sessions": 0, "log_level": 1, "out_dir": "out/gazecapture/analysis/active_sim_dino_s3"}
+[INFO 17:14:05 +     0.0s] script=/data1/xieliangcai/code/gazeformer-exps/scripts/calibration/active_calib_sim.py sha256=161e777266217135
+[INFO 17:14:05 +     0.0s] input out/gazecapture/analysis/feats_cm_val.npz: exists=True size=362771861
+[INFO 17:14:05 +     0.0s] input out/gazecapture/analysis/feats_cm_test_full.npz: exists=True size=556188240
+[INFO 17:14:05 +     0.0s] input data/GazeCapture/index/index.csv: exists=True size=384867448
+[INFO 17:14:05 +     0.0s] input out/gazecapture/analysis/dino_pca16_cm_full.npz: exists=True size=10668642
+[INFO 17:14:27 +    21.9s] [index] rows=1490911 fields=('frame_path', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h', 'device', 'screen_w', 'screen_h', 'gaze_x', 'gaze_y', 'cm_px_x', 'cm_px_y', 'imu_x', 'imu_y', 'imu_z', 'subject', 'orientation', 'split', 'face_grid_x', 'face_grid_y', 'face_grid_w', 'face_grid_h', 'dot_num', 'frame_index')
+[WARN 17:14:29 +    23.4s] !! out/gazecapture/analysis/feats_cm_val.npz: 9/58136 条 IMU |g_xy|<0.05 或缺失（drop_invalid_imu=False）
+[INFO 17:14:29 +    23.4s] [load] out/gazecapture/analysis/feats_cm_val.npz: frames=58136 groups=153 kept=145 dropped<40=8 missing_path=0 bad_scm=0 bad_imu=9
+[WARN 17:14:31 +    26.2s] !! out/gazecapture/analysis/feats_cm_test_full.npz: 441/175563 条 IMU |g_xy|<0.05 或缺失（drop_invalid_imu=False）
+[INFO 17:14:32 +    26.4s] [load] out/gazecapture/analysis/feats_cm_test_full.npz: frames=175563 groups=477 kept=464 dropped<40=13 missing_path=0 bad_scm=0 bad_imu=441
+[INFO 17:14:32 +    26.4s] [sessions] source=145 test=464
+[INFO 17:14:32 +    26.4s] [prior] mu=[1.00758, -0.00582, 1.01871, 0.02855] sd=[0.13125, 0.1005, 0.25868, 0.17376] sigma_dopt=0.02
+[INFO 17:14:32 +    26.6s] [feat] out/gazecapture/analysis/dino_pca16_cm_full.npz: rows=175563 dims=16 valid=175563 dup=0 prefix=dino
+[INFO 17:14:32 +    26.6s] [feat] matrix=(1490911, 16) covered=175563/1490911 all_valid=175563 names=16
+[INFO 17:14:32 +    26.6s] [feat] dims=16
+[INFO 17:14:35 +    29.4s] [dots] sessions=464 mean_total=50.3 mean_cand=32.6 mean_held=17.7 min_total=4
+[INFO 17:14:41 +    36.1s] [progress] 25/464 sessions, rows=975, elapsed=6.7s
+[INFO 17:14:47 +    42.1s] [progress] 50/464 sessions, rows=1950, elapsed=12.7s
+[INFO 17:14:53 +    48.2s] [progress] 75/464 sessions, rows=2925, elapsed=18.9s
+[INFO 17:14:59 +    54.0s] [progress] 100/464 sessions, rows=3900, elapsed=24.6s
+[INFO 17:15:05 +    60.1s] [progress] 125/464 sessions, rows=4875, elapsed=30.7s
+[INFO 17:15:11 +    65.4s] [progress] 150/464 sessions, rows=5850, elapsed=36.0s
+[INFO 17:15:17 +    71.4s] [progress] 175/464 sessions, rows=6825, elapsed=42.0s
+[INFO 17:15:22 +    77.3s] [progress] 200/464 sessions, rows=7800, elapsed=47.9s
+[INFO 17:15:28 +    82.9s] [progress] 225/464 sessions, rows=8775, elapsed=53.5s
+[INFO 17:15:34 +    88.9s] [progress] 250/464 sessions, rows=9750, elapsed=59.5s
+[INFO 17:15:40 +    94.6s] [progress] 275/464 sessions, rows=10725, elapsed=65.2s
+[INFO 17:15:46 +   100.5s] [progress] 300/464 sessions, rows=11700, elapsed=71.2s
+[INFO 17:15:51 +   106.1s] [progress] 325/464 sessions, rows=12675, elapsed=76.7s
+[INFO 17:15:57 +   111.8s] [progress] 350/464 sessions, rows=13650, elapsed=82.4s
+[INFO 17:16:03 +   118.0s] [progress] 375/464 sessions, rows=14625, elapsed=88.7s
+[INFO 17:16:09 +   124.2s] [progress] 400/464 sessions, rows=15600, elapsed=94.8s
+[INFO 17:16:15 +   130.0s] [progress] 425/464 sessions, rows=16575, elapsed=100.7s
+[INFO 17:16:21 +   136.0s] [progress] 450/464 sessions, rows=17550, elapsed=106.6s
+[INFO 17:16:25 +   139.3s] [progress] 464/464 sessions, rows=18096, elapsed=110.0s
+[INFO 17:16:25 +   139.3s] [loop] rows=18096 sessions=464 elapsed=110.0s maxrss=1.22GB
+[INFO 17:16:26 +   140.9s] [save] out/gazecapture/analysis/active_sim_dino_s3/active_calib_detail.csv rows=18096
+[INFO 17:16:26 +   140.9s] [save] out/gazecapture/analysis/active_sim_dino_s3/active_calib_summary.json
+[INFO 17:16:26 +   140.9s] [save] out/gazecapture/analysis/active_sim_dino_s3/active_calib_args.json
+[INFO 17:16:26 +   140.9s] ==============================================================================
+[INFO 17:16:26 +   140.9s] [RESULT] dotcov@12: dots=11.8 frames=85 base=1.2598 cal=1.2351 (-1.96% vs base) raw=1.5942 improved=937/1392 worst=+17.65%
+[INFO 17:16:26 +   140.9s] [RESULT] dotcov@16: dots=15.5 frames=113 base=1.2441 cal=1.2166 (-2.21% vs base) raw=1.5942 improved=950/1392 worst=+18.60%
+[INFO 17:16:26 +   140.9s] [RESULT] dotcov@20: dots=19.1 frames=140 base=1.2347 cal=1.2024 (-2.62% vs base) raw=1.5942 improved=1005/1392 worst=+20.57%
+[INFO 17:16:26 +   140.9s] [RESULT] featdiv@12: dots=11.8 frames=82 base=1.2541 cal=1.2256 (-2.27% vs base) raw=1.5942 improved=953/1392 worst=+17.25%
+[INFO 17:16:26 +   140.9s] [RESULT] featdiv@16: dots=15.5 frames=110 base=1.2421 cal=1.2123 (-2.40% vs base) raw=1.5942 improved=965/1392 worst=+21.38%
+[INFO 17:16:26 +   140.9s] [RESULT] featdiv@20: dots=19.1 frames=137 base=1.2310 cal=1.1976 (-2.71% vs base) raw=1.5942 improved=1029/1392 worst=+22.80%
+[INFO 17:16:26 +   140.9s] [RESULT] frame@50: dots=24.5 frames=48 base=1.2396 cal=1.2045 (-2.83% vs base) raw=1.5942 improved=1050/1392 worst=+40.98%
+[INFO 17:16:26 +   140.9s] [RESULT] hybrid@12: dots=11.8 frames=82 base=1.2554 cal=1.2274 (-2.23% vs base) raw=1.5942 improved=975/1392 worst=+14.24%
+[INFO 17:16:26 +   140.9s] [RESULT] hybrid@16: dots=15.5 frames=110 base=1.2423 cal=1.2102 (-2.58% vs base) raw=1.5942 improved=1014/1392 worst=+14.66%
+[INFO 17:16:26 +   140.9s] [RESULT] hybrid@20: dots=19.1 frames=136 base=1.2326 cal=1.1986 (-2.76% vs base) raw=1.5942 improved=1020/1392 worst=+13.33%
+[INFO 17:16:26 +   140.9s] [RESULT] random@12: dots=11.8 frames=85 base=1.2619 cal=1.2372 (-1.95% vs base) raw=1.5942 improved=935/1392 worst=+33.04%
+[INFO 17:16:26 +   140.9s] [RESULT] random@16: dots=15.5 frames=112 base=1.2464 cal=1.2175 (-2.32% vs base) raw=1.5942 improved=973/1392 worst=+27.33%
+[INFO 17:16:26 +   140.9s] [RESULT] random@20: dots=19.1 frames=139 base=1.2351 cal=1.2040 (-2.52% vs base) raw=1.5942 improved=1016/1392 worst=+29.04%
+[INFO 17:16:26 +   140.9s] [done]
