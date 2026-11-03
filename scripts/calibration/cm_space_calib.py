@@ -28,6 +28,13 @@ def to_cm(p, scm, phi):
     return np.stack([c * x + s * y, -s * x + c * y], 1)
 
 
+def to_norm(q, scm, phi):
+    c, s = np.cos(phi), np.sin(phi)
+    x = c * q[:, 0] - s * q[:, 1]
+    y = s * q[:, 0] + c * q[:, 1]
+    return np.stack([x / scm[:, 0] + 0.5, y / scm[:, 1] + 0.5], 1)
+
+
 def fit_affine(P, U, lam, mu):
     out = []
     for ax in range(2):
@@ -134,6 +141,12 @@ def main():
     ap.add_argument("--lam", type=float, default=1.0)
     ap.add_argument("--delta", type=float, default=1.345)
     ap.add_argument("--dino-lam", type=float, default=1.0)
+    ap.add_argument("--base-space", choices=["norm", "cm"], default="cm",
+                    help="基础校准所在空间；norm=原始归一化坐标，cm=canonical cm")
+    ap.add_argument("--resid-space", choices=["norm", "cm"], default="cm",
+                    help="DINO 残差拟合/裁剪所在空间")
+    ap.add_argument("--resid-clip", type=float, default=0.0,
+                    help="残差裁剪阈值（resid-space 单位）；0=自动 norm 0.02 / cm 0.15")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     log(f"[cmcal] args={vars(a)}")
@@ -149,28 +162,50 @@ def main():
         extra = (er, ef, ev)
         log(f"[cmcal] extra dims={ef.shape[1]} valid={int(ev.sum())}")
 
-    # source prior in cm
-    TH = []
+    # source prior in cm and norm
+    TH = []; THn = []
     for s, d in D.items():
         th = fit_affine(d["pc"], d["lc"], 1e-6, np.array([1., 0., 1., 0.]))
         TH.append(np.array([th[0][0], th[0][1], th[1][0], th[1][1]]))
+        thn = fit_affine(d["pred"], d["label"], 1e-6, np.array([1., 0., 1., 0.]))
+        THn.append(np.array([thn[0][0], thn[0][1], thn[1][0], thn[1][1]]))
     TH = np.array(TH); mu = TH.mean(0); S = np.cov(TH.T) + 1e-6 * np.eye(4)
-    log(f"[cmcal] prior mu={np.round(mu,4).tolist()} sd={np.round(np.sqrt(np.diag(S)),4).tolist()}")
+    THn = np.array(THn); mun = THn.mean(0); Sn = np.cov(THn.T) + 1e-6 * np.eye(4)
+    log(f"[cmcal] prior_cm mu={np.round(mu,4).tolist()} sd={np.round(np.sqrt(np.diag(S)),4).tolist()}")
+    log(f"[cmcal] prior_norm mu={np.round(mun,4).tolist()} sd={np.round(np.sqrt(np.diag(Sn)),4).tolist()}")
 
+    clip = a.resid_clip if a.resid_clip > 0 else (0.02 if a.resid_space == "norm" else 0.15)
+    log(f"[cmcal] base_space={a.base_space} resid_space={a.resid_space} clip={clip}")
     rows = []
     Bn = Cn = Nn = 0.0
+    Bn_n = Cn_n = 0.0
+    Rn = Rn_n = 0.0
     for s, d in T.items():
-        base_errs = []; cal_errs = []
+        raw_errs = []; base_errs = []; cal_errs = []
+        raw_errs_n = []; base_errs_n = []; cal_errs_n = []
         for seed in range(a.seeds):
             sel = coverage_select(d["pred"], a.K, seed)
             q = np.setdiff1d(np.arange(len(d["pred"])), sel)
             if len(q) < 20:
                 continue
-            th = fit_huber(d["pc"][sel], d["lc"][sel], a.lam, mu, a.delta)
-            q0 = apply_affine(d["pc"][q], th)
-            e0 = float(np.linalg.norm(q0 - d["lc"][q], axis=1).mean())
-            base_errs.append(e0)
-            q1 = q0
+            raw_errs.append(float(np.linalg.norm(d["pc"][q] - d["lc"][q], axis=1).mean()))
+            raw_errs_n.append(float(np.linalg.norm(d["pred"][q] - d["label"][q], axis=1).mean()))
+            if a.base_space == "cm":
+                th = fit_huber(d["pc"][sel], d["lc"][sel], a.lam, mu, a.delta)
+                q0_cm = apply_affine(d["pc"][q], th)
+                q0_cm_sel = apply_affine(d["pc"][sel], th)
+                q0_norm = to_norm(q0_cm, d["scm"][q], d["phi"][q])
+                q0_norm_sel = to_norm(q0_cm_sel, d["scm"][sel], d["phi"][sel])
+            else:
+                th = fit_huber(d["pred"][sel], d["label"][sel], a.lam, mun, a.delta)
+                q0_norm = apply_affine(d["pred"][q], th)
+                q0_norm_sel = apply_affine(d["pred"][sel], th)
+                q0_cm = to_cm(q0_norm, d["scm"][q], d["phi"][q])
+                q0_cm_sel = to_cm(q0_norm_sel, d["scm"][sel], d["phi"][sel])
+            e0 = float(np.linalg.norm(q0_cm - d["lc"][q], axis=1).mean())
+            e0n = float(np.linalg.norm(q0_norm - d["label"][q], axis=1).mean())
+            base_errs.append(e0); base_errs_n.append(e0n)
+            q1_cm = q0_cm.copy(); q1_norm = q0_norm.copy()
             if extra is not None:
                 er, ef, ev = extra
                 fmap = {int(r): i for i, r in enumerate(er) if bool(ev[i])}
@@ -185,25 +220,46 @@ def main():
                     Zs = np.concatenate([Zs, np.ones((len(Zs), 1))], 1)
                     Zq = np.clip((ef[qi] - muX) / sdX, -5, 5)
                     Zq = np.concatenate([Zq, np.ones((len(Zq), 1))], 1)
-                    Rs = d["lc"][sel] - apply_affine(d["pc"][sel], th)
+                    if a.resid_space == "cm":
+                        Rs = d["lc"][sel] - q0_cm_sel
+                    else:
+                        Rs = d["label"][sel] - q0_norm_sel
                     ws = []
                     for ax in range(2):
                         A = Zs.T @ Zs + a.dino_lam * np.eye(Zs.shape[1])
                         ws.append(np.linalg.solve(A, Zs.T @ Rs[:, ax]))
                     corr = np.stack([Zq @ ws[0], Zq @ ws[1]], 1)
-                    q1 = q0 + np.clip(corr, -0.15, 0.15)
-            cal_errs.append(float(np.linalg.norm(q1 - d["lc"][q], axis=1).mean()))
+                    corr = np.clip(corr, -clip, clip)
+                    if a.resid_space == "cm":
+                        q1_cm = q0_cm + corr
+                        q1_norm = to_norm(q1_cm, d["scm"][q], d["phi"][q])
+                    else:
+                        q1_norm = q0_norm + corr
+                        q1_cm = to_cm(q1_norm, d["scm"][q], d["phi"][q])
+            cal_errs.append(float(np.linalg.norm(q1_cm - d["lc"][q], axis=1).mean()))
+            cal_errs_n.append(float(np.linalg.norm(q1_norm - d["label"][q], axis=1).mean()))
         if base_errs:
             n = len(d["pred"]) - int(a.K)
+            rm = float(np.mean(raw_errs)); rmn = float(np.mean(raw_errs_n))
+            bm = float(np.mean(base_errs)); cmv = float(np.mean(cal_errs))
+            bmn = float(np.mean(base_errs_n)); cmn = float(np.mean(cal_errs_n))
             rows.append([s, len(d["pred"]), int(a.K), a.seeds,
-                         float(np.mean(base_errs)), float(np.mean(cal_errs)),
-                         float(np.mean(cal_errs) / max(np.mean(base_errs), 1e-9) - 1)])
-            Bn += np.mean(base_errs) * n; Cn += np.mean(cal_errs) * n; Nn += n
+                         rm, bm, cmv, cmv / max(rm, 1e-9) - 1,
+                         rmn, bmn, cmn, cmn / max(rmn, 1e-9) - 1])
+            Rn += rm * n; Bn += bm * n; Cn += cmv * n
+            Rn_n += rmn * n; Bn_n += bmn * n; Cn_n += cmn * n; Nn += n
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh); w.writerow(["session", "n", "K", "seeds", "base", "calib", "gain"]); w.writerows(rows)
-    B = Bn / max(Nn, 1); C = Cn / max(Nn, 1)
-    log(f"[cmcal] RESULT sessions={len(rows)} base={B:.4f} calib={C:.4f} ({100*(C/B-1):+.2f}%)")
+        w = csv.writer(fh)
+        w.writerow(["session", "n", "K", "seeds",
+                    "raw_cm", "base_cm", "calib_cm", "gain_vs_raw_cm",
+                    "raw_norm", "base_norm", "calib_norm", "gain_vs_raw_norm"])
+        w.writerows(rows)
+    R = Rn / max(Nn, 1); B = Bn / max(Nn, 1); C = Cn / max(Nn, 1)
+    Rn_ = Rn_n / max(Nn, 1); Bn_ = Bn_n / max(Nn, 1); Cn_ = Cn_n / max(Nn, 1)
+    log(f"[cmcal] RESULT sessions={len(rows)} raw_cm={R:.4f} base_cm={B:.4f} "
+        f"calib_cm={C:.4f} ({100*(C/R-1):+.2f}%) raw_norm={Rn_:.4f} "
+        f"base_norm={Bn_:.4f} calib_norm={Cn_:.4f} ({100*(Cn_/Rn_-1):+.2f}%)")
 
 
 if __name__ == "__main__": main()

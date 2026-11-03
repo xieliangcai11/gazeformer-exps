@@ -76,7 +76,13 @@ def main():
                     help="按索引等距抽样（用于快速测试/诊断）")
     ap.add_argument("--per-session", type=int, default=0,
                     help="每个被试最多取多少帧（0=全部；用于快速导出）")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="当前分片编号（0..nshards-1）；用于把全量导出切成可独立落盘的小块")
+    ap.add_argument("--nshards", type=int, default=1,
+                    help="分片总数（1=不分片）")
     args = ap.parse_args()
+    if args.nshards < 1 or not (0 <= args.shard < args.nshards):
+        raise SystemExit(f"非法分片：shard={args.shard} nshards={args.nshards}")
 
     import torch
 
@@ -185,7 +191,13 @@ def main():
                 if base_ds.rows[gidces[p]].get("subject", "?") in subs]
         positions = [positions[k] for k in keep]
         print(f"[subset] max-subjects={args.max_subjects} ⇒ {len(positions)} 帧 / {len(subs)} 被试")
-    if args.per_session or args.max_subjects or args.stride > 1:
+    if args.nshards > 1:
+        n = len(positions)
+        lo = (n * args.shard) // args.nshards
+        hi = (n * (args.shard + 1)) // args.nshards
+        positions = positions[lo:hi]
+        print(f"[shard] {args.shard}/{args.nshards} 帧区间=[{lo},{hi}) ⇒ {len(positions)} 帧")
+    if args.per_session or args.max_subjects or args.stride > 1 or args.nshards > 1:
         dl = _TDL(_TSubset(cur_ds, positions), batch_size=args.batch_size,
                   shuffle=False, num_workers=args.num_workers)
     final_gi = [gidces[k] for k in positions]
