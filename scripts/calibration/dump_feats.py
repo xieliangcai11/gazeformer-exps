@@ -66,6 +66,14 @@ def main():
     ap.add_argument("--max-subjects", type=int, default=0,
                     help="只导出前/随机 N 个被试（0=全部）")
     ap.add_argument("--subject-seed", type=int, default=0)
+    ap.add_argument("--amp", action="store_true",
+                    help="DINOv2/融合前向使用 autocast fp16")
+    ap.add_argument("--log-every", type=int, default=0,
+                    help="导出每 N 个 batch 打印进度/ETA")
+    ap.add_argument("--output-space", default="norm", choices=["norm", "cm"],
+                    help="基模型输出空间；cm 会在导出前转成归一化坐标")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="按索引等距抽样（用于快速测试/诊断）")
     ap.add_argument("--per-session", type=int, default=0,
                     help="每个被试最多取多少帧（0=全部；用于快速导出）")
     args = ap.parse_args()
@@ -75,6 +83,9 @@ def main():
     # eye_shuffle 是 scripts/train.py 的模块级全局（predict_frames 读它）
     import scripts.train as _T
     _T.EYE_SHUFFLE = bool(args.eye_shuffle)
+    _T.PRED_SPACE = args.output_space
+    _T.PRED_AMP = bool(args.amp)
+    _T.PRED_LOG_EVERY = int(args.log_every)
     _sc = Path(args.ckpt).parent / "train_args.json"
     _cfg = {}
     if _sc.is_file():
@@ -90,6 +101,16 @@ def main():
     args.geom_orient = bool(_cfg.get("geom_orient", False)) and args.use_geom
     print(f"[cfg] use_geom={args.use_geom} geom_orient={args.geom_orient}")
 
+    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    has_geom = "proj_geom.weight" in state
+    geom_dim = int(state["proj_geom.weight"].shape[1]) if has_geom else 0
+    has_imu = "proj_imu.weight" in state
+    args.use_geom = bool(has_geom)
+    args.geom_orient = bool(has_geom and geom_dim == 7)
+    print(f"[cfg-ckpt] use_geom={args.use_geom} geom_orient={args.geom_orient} "
+          f"use_imu={has_imu} geom_dim={geom_dim}")
     spec = DATASET_SPECS[args.dataset]
     index_dir = Path(args.index_dir) if args.index_dir else Path(spec["default_index"])
     out_npz = Path(args.out) if args.out else (
@@ -104,10 +125,10 @@ def main():
     paths = [ln.strip() for ln in (index_dir / f"{args.split}.txt").read_text(
         encoding="utf-8").splitlines() if ln.strip()]
 
-    model = RGBDGazeDINOv2(unfreeze_last=args.unfreeze, use_geom=args.use_geom,
+    model = RGBDGazeDINOv2(unfreeze_last=args.unfreeze, use_imu=has_imu,
+                           use_geom=args.use_geom,
                            use_geom_orient=args.geom_orient,
                            use_eye=args.use_eye, img_size=args.resolution).to(args.device)
-    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     miss, unexp, resampled = load_state_dict_any_res(model, state)
     print(f"[load] {args.ckpt}  缺失键={len(miss)} 多余键={len(unexp)} resampled={resampled}")
     if miss or unexp:
@@ -141,6 +162,9 @@ def main():
     from collections import defaultdict as _dd
     cur_ds = dl.dataset
     positions = list(range(len(gidces)))          # 相对 cur_ds 的位置
+    if args.stride > 1:
+        positions = positions[::args.stride]
+        print(f"[subset] stride={args.stride} ⇒ {len(positions)} 帧")
     if args.per_session:
         per = _dd(list); sel = []
         for pos, gi in enumerate(gidces):
@@ -161,7 +185,7 @@ def main():
                 if base_ds.rows[gidces[p]].get("subject", "?") in subs]
         positions = [positions[k] for k in keep]
         print(f"[subset] max-subjects={args.max_subjects} ⇒ {len(positions)} 帧 / {len(subs)} 被试")
-    if args.per_session or args.max_subjects:
+    if args.per_session or args.max_subjects or args.stride > 1:
         dl = _TDL(_TSubset(cur_ds, positions), batch_size=args.batch_size,
                   shuffle=False, num_workers=args.num_workers)
     final_gi = [gidces[k] for k in positions]

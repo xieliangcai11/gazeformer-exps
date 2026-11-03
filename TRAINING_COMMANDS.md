@@ -296,6 +296,106 @@ epoch 15：1.61 cm
 ```
 
 
+
+---
+
+## 0f. GC cm + IMU 阶段 A/B（当前路线）
+
+### 阶段 A：冻结 DINO，训练 IMU/融合/头
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,3,5,6,7 \
+torchrun --standalone --nproc_per_node=6 \
+  -m scripts.calibration.cm_train_epoch \
+  --ckpt out/gazecapture/analysis/cm_ctx_ft/best.pt \
+  --use-imu \
+  --val-split val \
+  --freeze-backbone \
+  --epochs 2 \
+  --batch 16 --accum 2 \
+  --lr 1e-4 --backbone-lr-ratio 0.1 \
+  --weight-decay 0.01 --warmup 500 \
+  --loss norm_plus_cm --cm-weight 0.01 \
+  --augment --aug-shift 0.05 --aug-scale 0.05 --aug-rotate 0 \
+  --geom-randomize 0 \
+  --val-stride 10 --val-limit 0 \
+  --log-every 200 --val-every 0 --max-norm-rise 0.01 \
+  --num-workers 4 --distributed \
+  --out out/gazecapture/analysis/cm_imu_stageA
+```
+
+结果：
+
+```text
+epoch 0 val_cm = 1.6851
+epoch 1 val_cm = 1.6819
+baseline val_cm = 1.6305
+```
+
+checkpoint：
+
+```text
+out/gazecapture/analysis/cm_imu_stageA/last.pt
+```
+
+### 阶段 B：解冻 DINO 续训
+
+由 watcher 自动启动：
+
+```text
+scripts/calibration/wait_stageB.sh
+```
+
+条件：
+
+```text
+至少 4 张非 GPU4 卡
+每张空闲 >= 14GB
+```
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=<auto> \
+torchrun --standalone --nproc_per_node=<N> \
+  -m scripts.calibration.cm_train_epoch \
+  --ckpt out/gazecapture/analysis/cm_imu_stageA/last.pt \
+  --resume out/gazecapture/analysis/cm_imu_stageA/last.pt \
+  --use-imu --val-split val \
+  --epochs 6 \
+  --batch 24 --accum 1 \
+  --lr 5e-5 --backbone-lr-ratio 0.05 \
+  --weight-decay 0.01 --warmup 200 \
+  --loss norm_plus_cm --cm-weight 0.01 \
+  --augment --aug-shift 0.05 --aug-scale 0.05 --aug-rotate 0 \
+  --geom-randomize 0 \
+  --val-stride 10 --val-limit 0 \
+  --log-every 200 --val-every 0 --max-norm-rise 0.01 \
+  --num-workers 4 --distributed \
+  --out out/gazecapture/analysis/cm_imu_stageB
+```
+
+注意：
+
+```text
+--ckpt 和 --resume 必须同时给
+--epochs 是总轮数；从 epoch 2 开始，所以 6 表示再跑 4 轮
+batch 24 可能 OOM，门槛 14GB
+```
+
+### 2026-11-03 阶段 B 历史故障
+
+```text
+1. 缺 --ckpt：
+   FileNotFoundError: [Errno 2] No such file or directory: ''
+
+2. batch16 在共享 GPU3 OOM：
+   CUDA out of memory
+```
+
+已修复。
+
+
 ---
 
 ## 1. GazeCapture（GC）最佳基线

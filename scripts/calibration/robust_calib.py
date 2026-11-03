@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path[:0] = ["src", "."]
-from scripts.calibration.seq_bayes_calib import load_sessions, em  # noqa: E402
+from scripts.calibration.seq_bayes_calib import load_sessions, em, stable_seed  # noqa: E402
 from scripts.calibration.cc_eb import select_coverage  # noqa: E402
 
 
@@ -106,7 +106,7 @@ def main():
             for delta in delta_iter:
                 acc0 = acc1 = nn = 0.0
                 for s, d in V.items():
-                    rng = np.random.RandomState(abs(hash((s, method, k, lam, delta))) % 2**31)
+                    rng = np.random.RandomState(stable_seed(s, method, int(k), float(lam), str(delta)))
                     sel = select_coverage(d["pred"], k, rng)
                     r = eval_case(d, sel, lam, delta)
                     if r is None:
@@ -128,7 +128,7 @@ def main():
             for s, d in T.items():
                 r0 = r1 = rn = 0.0
                 for seed in range(a.seeds):
-                    rng = np.random.RandomState(abs(hash((s, k, seed, method, lam, delta))) % 2**31)
+                    rng = np.random.RandomState(stable_seed(s, int(k), int(seed), method, float(lam), str(delta)))
                     sel = select_coverage(d["pred"], k, rng)
                     r = eval_case(d, sel, lam, delta)
                     if r is None:

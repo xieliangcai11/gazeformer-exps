@@ -362,6 +362,11 @@ def geometric_angular_loss(pred, label, screen_cm, D):
 #: 说明收益确实来自虹膜细节。
 EYE_SHUFFLE = False
 
+#: 预测空间：dump_feats 用。norm=模型输出归一化；cm=模型输出厘米，评估前转换。
+PRED_SPACE = "norm"
+PRED_AMP = False
+PRED_LOG_EVERY = 0
+
 
 def _shuffle_eyes(eye_l, eye_r):
     """对照实验用：破坏眼图与当前帧的对应（batch 内循环错位）。"""
@@ -389,9 +394,14 @@ def predict_frames(model, dl, device):
     use_geom = getattr(model, "use_geom", False)
     use_eye = getattr(model, "use_eye", False)
 
+    import contextlib
     preds, labels, cmxs, cmys, angs = [], [], [], [], []
-    with torch.no_grad():
-        for inp, label in dl:
+    amp_ctx = (torch.autocast("cuda", dtype=torch.float16)
+               if PRED_AMP and str(device).startswith("cuda")
+               else contextlib.nullcontext())
+    t0 = time.time()
+    with torch.inference_mode(), amp_ctx:
+        for bi, (inp, label) in enumerate(dl):
             face = inp.rgb.to(device).float()
             label = label.to(device)
             imu = inp.imu.to(device).float() if use_imu else None
@@ -403,6 +413,15 @@ def predict_frames(model, dl, device):
                 pred = model(face, imu=imu, geom=geom, eye_l=eye_l, eye_r=eye_r)
             else:
                 pred = model(face, imu=imu, geom=geom)
+
+            if PRED_SPACE == "cm":
+                scm_c = inp.screen_cm.to(device).float()
+                ph_c = inp.phi.to(device).float()
+                cc, ss = torch.cos(ph_c), torch.sin(ph_c)
+                x = cc * pred[:, 0] - ss * pred[:, 1]
+                y = ss * pred[:, 0] + cc * pred[:, 1]
+                pred = torch.stack([x / scm_c[:, 0] + 0.5,
+                                    y / scm_c[:, 1] + 0.5], 1)
 
             # 物理换算所需量来自数据项本身，避免依赖 DataLoader 的样本顺序
             cm_b = inp.screen_cm.to(device).float()
@@ -428,6 +447,14 @@ def predict_frames(model, dl, device):
             cmxs.append(cm_x.cpu().numpy())
             cmys.append(cm_y.cpu().numpy())
             angs.append((torch.acos(cosim) * 180.0 / PI).cpu().numpy())
+            if PRED_LOG_EVERY and (bi + 1) % PRED_LOG_EVERY == 0:
+                el = time.time() - t0
+                done = (bi + 1) * label.shape[0]
+                sps = done / max(el, 1e-9)
+                eta = (len(dl) - bi - 1) * label.shape[0] / max(sps, 1e-9)
+                print(f"[pred] batch={bi+1}/{len(dl)} frames={done} "
+                      f"sps={sps:.1f} eta={eta/60:.1f}min elapsed={el:.1f}s",
+                      flush=True)
 
     if not preds:
         raise ValueError("DataLoader 为空，无法评估")

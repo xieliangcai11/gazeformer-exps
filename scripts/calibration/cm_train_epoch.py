@@ -190,7 +190,9 @@ def main():
                             geom_orient=a.geom_orient, target_space="cm")
     tr_idx = split_indices(idx_dir / "index.csv", "train")
     va_idx = split_indices(idx_dir / "index.csv", a.val_split)
-    va_idx = va_idx[::a.val_stride][:a.val_limit]
+    va_idx = va_idx[::a.val_stride]
+    if a.val_limit:
+        va_idx = va_idx[:a.val_limit]
     if rank == 0:
         stats = data_stats(idx_dir / "index.csv")
         log(f"[cm] train={len(tr_idx)} val={len(va_idx)} "

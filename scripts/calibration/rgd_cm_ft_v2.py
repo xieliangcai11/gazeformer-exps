@@ -40,14 +40,15 @@ def log(msg):
         print(msg, flush=True)
 
 
-def load_model(ckpt, device):
+def load_model(ckpt, device, use_geom=True, geom_orient=True, use_imu=False):
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "model" in state:
         state = state["model"]
     model = RGBDGazeDINOv2(
         gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
         inter_dim=1536, freeze_dino=True, unfreeze_last=12,
-        use_imu=False, use_geom=True, use_geom_orient=True,
+        use_imu=use_imu, use_geom=use_geom,
+        use_geom_orient=(geom_orient and use_geom),
         use_eye=True, img_size=224,
     ).to(device)
     miss, unexp, resampled = load_state_dict_any_res(model, state)
@@ -69,19 +70,21 @@ def to_norm(pred_cm, scm, phi):
     return torch.stack([x / scm[:, 0] + 0.5, y / scm[:, 1] + 0.5], 1)
 
 
-def make_opt(core, head_lr, ratio, wd, freeze_backbone):
+def make_opt(core, head_lr, ratio, wd, freeze_backbone, optimizer="adamw"):
     if freeze_backbone:
         for p in core.rgb.parameters():
             p.requires_grad = False
     else:
         for p in core.rgb.parameters():
             p.requires_grad = True
-    return torch.optim.AdamW([
+    groups = [
         {"params": [p for p in core.rgb.parameters() if p.requires_grad],
          "lr": head_lr * ratio},
         {"params": [p for n, p in core.named_parameters()
                     if not n.startswith("rgb.")], "lr": head_lr},
-    ], weight_decay=wd)
+    ]
+    cls = torch.optim.Adam if optimizer == "adam" else torch.optim.AdamW
+    return cls(groups, weight_decay=wd)
 
 
 def main():
@@ -91,6 +94,18 @@ def main():
                     help="不加载 GC checkpoint，从随机初始化训练当前 cm+geom 模型")
     ap.add_argument("--index-csv", default="data/RGBDGaze/index/index_imu.csv")
     ap.add_argument("--split-dir", default="data/RGBDGaze/index/cv/fold3")
+    ap.add_argument("--target-space", default="cm", choices=["cm", "norm"])
+    ap.add_argument("--use-geom", dest="use_geom", action="store_true",
+                    default=True)
+    ap.add_argument("--no-geom", dest="use_geom", action="store_false")
+    ap.add_argument("--geom-orient", action="store_true", default=True)
+    ap.add_argument("--no-geom-orient", dest="geom_orient",
+                    action="store_false")
+    ap.add_argument("--use-imu", action="store_true",
+                    help="把重力/姿态向量作为 IMU token 输入模型")
+    ap.add_argument("--cm-frame", default="canonical",
+                    choices=["canonical", "screen"],
+                    help="cm 目标坐标系：canonical=按 phi 旋转；screen=屏幕轴，不用 phi")
     ap.add_argument("--out", default="out/rgbdgaze/cm_ft_v2")
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--head-epochs", type=int, default=1)
@@ -104,6 +119,13 @@ def main():
     ap.add_argument("--min-lr-ratio", type=float, default=0.05)
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--select-metric", default="cm", choices=["cm", "norm"])
+    ap.add_argument("--optimizer", default="adamw", choices=["adamw", "adam"])
+    ap.add_argument("--no-val-carve", action="store_true",
+                    help="val.txt 为空时不要从 train 划 val；按旧 recipe 末轮权重")
+    ap.add_argument("--loss", default="norm_plus_cm",
+                    choices=["norm_mse", "norm_huber", "norm_plus_cm",
+                             "cm_mse", "cm_huber"])
+    ap.add_argument("--cm-weight", type=float, default=0.01)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--augment", action="store_true")
     ap.add_argument("--val-every", type=int, default=500)
@@ -149,7 +171,9 @@ def main():
     train_paths = read_split(Path(a.split_dir) / "train.txt")
     val_paths = read_split(Path(a.split_dir) / "val.txt")
     test_paths = read_split(Path(a.split_dir) / "test.txt")
-    if not val_paths:
+    if not val_paths and a.no_val_carve:
+        log("[rgd] val empty; --no-val-carve => no validation, use last epoch")
+    elif not val_paths:
         by_sub = defaultdict(list)
         for p in train_paths:
             by_sub[subj.get(p, "")].append(p)
@@ -166,11 +190,11 @@ def main():
     te_idx = [lut[p] for p in test_paths if p in lut]
     log(f"[rgd] splits train={len(tr_idx)} val={len(va_idx)} test={len(te_idx)}")
     tr = RGBDGazeDataset(a.index_csv, augment=a.augment, eye_crops=True,
-                         geom_orient=True, target_space="cm",
-                         geom_randomize=0.0)
+                         geom_orient=a.geom_orient and a.use_geom,
+                         target_space=a.target_space, geom_randomize=0.0)
     va = RGBDGazeDataset(a.index_csv, augment=False, eye_crops=True,
-                         geom_orient=True, target_space="cm",
-                         geom_randomize=0.0)
+                         geom_orient=a.geom_orient and a.use_geom,
+                         target_space=a.target_space, geom_randomize=0.0)
     tr.set_aug_seed(a.seed)
     tr_sub = Subset(tr, tr_idx)
     sampler = (DistributedSampler(tr_sub, num_replicas=world, rank=rank,
@@ -188,7 +212,8 @@ def main():
         core = RGBDGazeDINOv2(
             gaze_dim=2, d_model=384, num_heads=8, num_layers=6,
             inter_dim=1536, freeze_dino=True, unfreeze_last=12,
-            use_imu=False, use_geom=True, use_geom_orient=True,
+            use_imu=a.use_imu, use_geom=a.use_geom,
+            use_geom_orient=(a.geom_orient and a.use_geom),
             use_eye=True, img_size=224,
         ).to(device)
         log("[rgd] scratch init (cm+geom, no GC checkpoint)")
@@ -196,7 +221,7 @@ def main():
     else:
         if not a.ckpt:
             raise ValueError("需要 --ckpt 或 --scratch")
-        core = load_model(a.ckpt, device)
+        core = load_model(a.ckpt, device, a.use_geom, a.geom_orient, a.use_imu)
     if a.resume:
         ck = torch.load(a.resume, map_location="cpu", weights_only=False)
         core.load_state_dict(ck["model"])
@@ -212,15 +237,27 @@ def main():
 
     freeze = start_epoch < a.head_epochs
     head_lr = a.head_lr if freeze else a.lr
-    opt = make_opt(core, head_lr, a.backbone_lr_ratio, a.weight_decay, freeze)
+    opt = make_opt(core, head_lr, a.backbone_lr_ratio, a.weight_decay,
+                   freeze, a.optimizer)
     log(f"[rgd] stage={'head' if freeze else 'full'} stage_lr={head_lr}")
     huber = nn.SmoothL1Loss(beta=1.0, reduction="none")
 
+    def to_norm_mode(p, scm, phi):
+        if a.target_space == "norm":
+            return p
+        if a.cm_frame == "screen":
+            return p / scm + 0.5
+        return to_norm(p, scm, phi)
+
     def fwd(inp):
+        kw = {}
+        if a.use_geom:
+            kw["geom"] = inp["geom"].to(device).float()
+        if a.use_imu:
+            kw["imu"] = inp["imu"].to(device).float()
         return model(inp["rgb"].to(device).float(),
-                     geom=inp["geom"].to(device).float(),
                      eye_l=inp["eye_l"].to(device).float(),
-                     eye_r=inp["eye_r"].to(device).float())
+                     eye_r=inp["eye_r"].to(device).float(), **kw)
 
     def evaluate(loader):
         model.eval(); ns = cs = n = 0
@@ -229,7 +266,8 @@ def main():
                 scm = inp["screen_cm"].to(device).float()
                 phi = inp["phi"].to(device).float()
                 ln = inp["label_norm"].to(device).float()
-                pn = to_norm(fwd(inp), scm, phi)
+                p = fwd(inp)
+                pn = to_norm_mode(p, scm, phi)
                 cs += float(((pn - ln) * scm).norm(dim=1).sum())
                 ns += float((pn - ln).norm(dim=1).sum())
                 n += len(pn)
@@ -244,7 +282,7 @@ def main():
         if epoch >= a.head_epochs and freeze:
             freeze = False
             opt = make_opt(core, a.lr, a.backbone_lr_ratio,
-                           a.weight_decay, False)
+                           a.weight_decay, False, a.optimizer)
             log(f"[rgd] stage switch -> full at epoch={epoch}")
         if distributed:
             sampler.set_epoch(epoch)
@@ -271,12 +309,35 @@ def main():
             phi = inp["phi"].to(device).float()
             valid = inp["imu_valid"].to(device).float()
             p = fwd(inp)
-            pn = to_norm(p, scm, phi)
-            lnorm = (((pn - lab_norm) ** 2).mean(dim=1) * valid).sum() / \
-                valid.sum().clamp_min(1.0)
-            lcm = (huber(p, lab_cm).mean(dim=1) * valid).sum() / \
-                valid.sum().clamp_min(1.0)
-            loss = lnorm + 0.01 * lcm
+            pn = to_norm_mode(p, scm, phi)
+            if a.loss == "norm_huber":
+                lnorm = (torch.nn.functional.smooth_l1_loss(
+                    pn, lab_norm, reduction="none", beta=0.05
+                ).mean(dim=1) * valid).sum() / valid.sum().clamp_min(1.0)
+            else:
+                lnorm = (((pn - lab_norm) ** 2).mean(dim=1) * valid).sum() / \
+                    valid.sum().clamp_min(1.0)
+            if a.target_space == "cm" and a.cm_frame == "canonical":
+                cm_pred = p
+                cm_label = lab_cm
+            else:
+                cm_pred = (pn - 0.5) * scm
+                cm_label = (lab_norm - 0.5) * scm
+            if a.loss in ("norm_mse", "norm_huber"):
+                lcm = torch.zeros_like(lnorm)
+                loss = lnorm
+            elif a.loss == "cm_mse":
+                lcm = (((cm_pred - cm_label) ** 2).mean(dim=1) * valid).sum() / \
+                    valid.sum().clamp_min(1.0)
+                loss = lcm
+            elif a.loss == "cm_huber":
+                lcm = (huber(cm_pred, cm_label).mean(dim=1) * valid).sum() / \
+                    valid.sum().clamp_min(1.0)
+                loss = lcm
+            else:
+                lcm = (huber(cm_pred, cm_label).mean(dim=1) * valid).sum() / \
+                    valid.sum().clamp_min(1.0)
+                loss = lnorm + a.cm_weight * lcm
             (loss / a.accum).backward()
             if (bi + 1) % a.accum == 0:
                 gn = float(torch.nn.utils.clip_grad_norm_(
@@ -315,7 +376,7 @@ def main():
             if improved:
                 torch.save(state, out / "best.pt")
                 log(f"[rgd] BEST epoch={epoch} score={best:.4f}")
-        stop = torch.tensor([1 if bad >= a.patience else 0],
+        stop = torch.tensor([1 if (a.patience > 0 and bad >= a.patience) else 0],
                             device=device, dtype=torch.int32)
         if distributed:
             dist.broadcast(stop, 0)
@@ -323,11 +384,16 @@ def main():
             log(f"[rgd] early stop bad={bad}")
             break
 
-    if (out / "best.pt").exists():
+    use_best = bool(va_idx) and (out / "best.pt").exists() and not a.no_val_carve
+    if use_best:
         ck = torch.load(out / "best.pt", map_location="cpu", weights_only=False)
         core.load_state_dict(ck["model"])
         log(f"[rgd] restored best epoch={ck.get('epoch')}")
-    nm, cm = evaluate(dl_va)
+    elif (out / "last.pt").exists():
+        ck = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+        core.load_state_dict(ck["model"])
+        log(f"[rgd] no val; restored last epoch={ck.get('epoch')}")
+    nm, cm = evaluate(dl_va) if va_idx else (0.0, 0.0)
     nt, ct = evaluate(dl_te)
     log(f"[rgd] FINAL val_norm={nm:.4f} val_cm={cm:.4f} "
         f"test_norm={nt:.4f} test_cm={ct:.4f}")

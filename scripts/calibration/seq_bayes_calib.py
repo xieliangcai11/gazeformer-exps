@@ -28,6 +28,7 @@ def _maxrss():
         return 0.0
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
 import sys
+import zlib
 from collections import defaultdict
 
 import numpy as np
@@ -35,8 +36,13 @@ import numpy as np
 sys.path[:0] = ["src", "."]
 
 
+def stable_seed(*parts):
+    """跨进程稳定的整数种子；不要用 Python hash()（受 PYTHONHASHSEED 影响）。"""
+    return int(zlib.crc32(repr(parts).encode("utf-8")) & 0xffffffff)
+
+
 # ---------- 数据 ----------
-def load_index(index_csv, needed):
+def load_index(index_csv, needed, context_key="orientation"):
     need = set(needed.tolist())
     out = {}
     with open(index_csv, encoding="utf-8") as fh:
@@ -46,9 +52,20 @@ def load_index(index_csv, needed):
             p = r[pcol]
             if p not in need:
                 continue
-            ctx = r.get("orientation")
-            if ctx is None or ctx == "":
-                ctx = r.get("activity", "")
+            if context_key == "orientation":
+                ctx = r.get("orientation")
+                if ctx is None or ctx == "":
+                    ctx = r.get("activity", "")
+            elif context_key == "activity":
+                ctx = r.get("activity")
+                if ctx is None or ctx == "":
+                    ctx = r.get("orientation", "")
+            elif context_key == "subject":
+                ctx = r.get("subject", "")
+            elif context_key == "session":
+                ctx = p.rsplit("/", 1)[0]
+            else:
+                ctx = ""
             out[p] = (float(r["screen_w"]) * float(r["cm_px_x"]),
                       float(r["screen_h"]) * float(r["cm_px_y"]),
                       float(r["screen_w"]) * float(r["cm_px_x"]),
@@ -86,7 +103,7 @@ def load_sessions(npz_path, index_csv, pose_npz, context_key):
     label = z["label"].astype(np.float32)
     path = z["path"]
     fidx = z["frame_index"].astype(np.int64)
-    meta = load_index(index_csv, path)
+    meta = load_index(index_csv, path, context_key)
     pose = load_pose(pose_npz, index_csv, path)
     sess = defaultdict(list)
     for i in range(len(pred)):
@@ -251,7 +268,7 @@ def main():
         return float(np.linalg.slogdet(M)[1]), i
 
     def coverage_b2(d, k, seed=0):
-        rng = np.random.RandomState(abs(hash((d["label"][0, 0], k, seed))) % 2**31)
+        rng = np.random.RandomState(stable_seed(float(d["label"][0, 0]), int(k), int(seed)))
         cells = defaultdict(list)
         for j in range(len(d["pred"])):
             cells[(min(2, int(d["pred"][j, 0] * 3)),
@@ -372,7 +389,7 @@ def main():
 
     # 基线：B2 覆盖选点固定 K
     def coverage_sel(d, k, seed):
-        rng = np.random.RandomState(abs(hash((d["label"][0, 0], k, seed))) % 2**31)
+        rng = np.random.RandomState(stable_seed(float(d["label"][0, 0]), int(k), int(seed)))
         pred = d["pred"]
         cells = defaultdict(list)
         for j in range(len(pred)):

@@ -33,7 +33,7 @@ import numpy as np
 sys.path[:0] = ["src", "."]
 
 
-def load_index(index_csv, needed):
+def load_index(index_csv, needed, context_key="orientation"):
     need = set(needed.tolist())
     out = {}
     with open(index_csv, encoding="utf-8") as fh:
@@ -43,9 +43,16 @@ def load_index(index_csv, needed):
             p = r[pcol]
             if p not in need:
                 continue
-            ctx = r.get("orientation")
-            if ctx is None or ctx == "":
-                ctx = r.get("activity", "")
+            if context_key == "orientation":
+                ctx = r.get("orientation")
+                if ctx is None or ctx == "":
+                    ctx = r.get("activity", "")
+            elif context_key == "activity":
+                ctx = r.get("activity")
+                if ctx is None or ctx == "":
+                    ctx = r.get("orientation", "")
+            else:
+                ctx = ""
             out[p] = (float(r["screen_w"]) * float(r["cm_px_x"]),
                       float(r["screen_h"]) * float(r["cm_px_y"]),
                       float(r["screen_w"]) * float(r["cm_px_x"]),
@@ -92,13 +99,13 @@ def apply_theta(p, tx, ty):
     return q
 
 
-def load_sessions(npz_path, index_csv, pose_npz):
+def load_sessions(npz_path, index_csv, pose_npz, context_key="orientation"):
     z = np.load(npz_path, allow_pickle=True)
     pred = z["pred"].astype(np.float32)
     label = z["label"].astype(np.float32)
     path = z["path"]
     fidx = z["frame_index"].astype(np.int64)
-    meta = load_index(index_csv, path)
+    meta = load_index(index_csv, path, context_key)
     pose = load_pose(pose_npz, index_csv, path)
     sess = defaultdict(list)
     for i in range(len(pred)):
@@ -228,11 +235,11 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    D = load_sessions(a.train_npz, a.index_csv, a.pose_npz)
-    V = load_sessions(a.val_npz, a.index_csv, a.pose_npz)
+    D = load_sessions(a.train_npz, a.index_csv, a.pose_npz, a.context_key)
+    V = load_sessions(a.val_npz, a.index_csv, a.pose_npz, a.context_key)
     ti = a.test_index_csv or a.index_csv
     tp = a.test_pose_npz or a.pose_npz
-    T = load_sessions(a.test_npz, ti, tp)
+    T = load_sessions(a.test_npz, ti, tp, a.context_key)
     D = expand_groups(D, a.context_key)
     V = expand_groups(V, a.context_key)
     T = expand_groups(T, a.context_key)
@@ -335,7 +342,7 @@ def main():
                     r0 = r1 = rn = 0.0
                     for seed in range(a.seeds):
                         rng_s = np.random.RandomState(
-                            abs(hash((s, k, seed, "cov", a.context_key))) % 2**31)
+                            int(__import__("zlib").crc32(repr((s, int(k), int(seed), "cov", a.context_key)).encode()) & 0xffffffff))
                         sel = select_coverage(d["pred"], k, rng_s)
                         r = eval_case(d, sel, pname)
                         if r is None:
@@ -362,7 +369,7 @@ def main():
                     r0 = r1 = rn = 0.0
                     for seed in range(a.seeds):
                         rng_s = np.random.RandomState(
-                            abs(hash((s, k, seed, mode, a.context_key))) % 2**31)
+                            int(__import__("zlib").crc32(repr((s, int(k), int(seed), mode, a.context_key)).encode()) & 0xffffffff))
                         if mode == "coverage":
                             sel = select_coverage(d["pred"], k, rng_s)
                         elif mode == "random":
