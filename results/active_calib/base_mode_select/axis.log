@@ -1,0 +1,45 @@
+[INFO 20:13:14 +     0.0s] ==============================================================================
+[INFO 20:13:14 +     0.0s] active_calib_sim
+[INFO 20:13:14 +     0.0s] host=hr-RTX4090-132-41 python=3.11.16 numpy=2.4.6 pid=2169813
+[INFO 20:13:14 +     0.0s] args={"train_npz": "out/gazecapture/analysis/feats_soup_val.npz", "test_npz": "out/gazecapture/analysis/feats_soup_test_full.npz", "index_csv": "data/GazeCapture/index/index.csv", "dino_npz": "out/gazecapture/analysis/dino_pca16_soup_full.npz", "landmark_npz": "", "features": "dino", "regions": "none", "no_residual": false, "methods": "expected_feat,hybrid,frame", "residual_level": "dot", "n_affine": 4, "session_split": "select", "session_split_seed": 0, "expected_grid": 5, "mc_samples": 32, "stop_tol": 0.001, "stop_min_dots": 4, "resid_noise_frac": 0.1, "resid_stop_tol": 0.01, "resid_min_support": 10, "K_dots": [20, 28], "K_frames": [50], "seeds": 1, "dot_split": 0.65, "min_dot_frames": 2, "min_frames": 40, "split_seed": 0, "dopt_sigma": 0.02, "base_mode": "axis", "base_prior_scale": 1.0, "cov_weight": 0.1, "limit_sessions": 0, "log_level": 1, "out_dir": "out/gazecapture/analysis/base_mode_select/axis"}
+[INFO 20:13:14 +     0.0s] script=/data1/xieliangcai/code/gazeformer-exps/scripts/calibration/active_calib_sim.py sha256=c179165f2038c4c3
+[INFO 20:13:14 +     0.0s] input out/gazecapture/analysis/feats_soup_val.npz: exists=True size=184178069
+[INFO 20:13:14 +     0.0s] input out/gazecapture/analysis/feats_soup_test_full.npz: exists=True size=556188240
+[INFO 20:13:14 +     0.0s] input data/GazeCapture/index/index.csv: exists=True size=384867448
+[INFO 20:13:14 +     0.0s] input out/gazecapture/analysis/dino_pca16_soup_full.npz: exists=True size=10671672
+[INFO 20:13:37 +    23.1s] [index] rows=1490911 fields=('frame_path', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h', 'device', 'screen_w', 'screen_h', 'gaze_x', 'gaze_y', 'cm_px_x', 'cm_px_y', 'imu_x', 'imu_y', 'imu_z', 'subject', 'orientation', 'split', 'face_grid_x', 'face_grid_y', 'face_grid_w', 'face_grid_h', 'dot_num', 'frame_index')
+[WARN 20:13:38 +    24.7s] !! out/gazecapture/analysis/feats_soup_val.npz: 9/58136 条 IMU |g_xy|<0.05 或缺失（drop_invalid_imu=False）
+[INFO 20:13:39 +    24.7s] [load] out/gazecapture/analysis/feats_soup_val.npz: frames=58136 groups=153 kept=145 dropped<40=8 missing_path=0 bad_scm=0 bad_imu=9
+[WARN 20:13:42 +    27.7s] !! out/gazecapture/analysis/feats_soup_test_full.npz: 441/175563 条 IMU |g_xy|<0.05 或缺失（drop_invalid_imu=False）
+[INFO 20:13:42 +    27.9s] [load] out/gazecapture/analysis/feats_soup_test_full.npz: frames=175563 groups=477 kept=464 dropped<40=13 missing_path=0 bad_scm=0 bad_imu=441
+[INFO 20:13:42 +    27.9s] [sessions] source=145 test=464
+[INFO 20:13:42 +    28.0s] [prior] mu=[0.9976, -0.00173, 0.99467, 0.04158] sd=[0.12668, 0.10041, 0.25921, 0.17431] sigma_dopt=0.02
+[INFO 20:13:42 +    28.0s] [base] mode=axis dim=2 prior_scale=1.0
+[INFO 20:13:42 +    28.0s] [base-prior] x mu=[0.9976, -0.00173] sd=[1.0, 1.0]
+[INFO 20:13:42 +    28.0s] [base-prior] y mu=[0.99467, 0.04158] sd=[1.0, 1.0]
+[INFO 20:13:42 +    28.1s] [feat] out/gazecapture/analysis/dino_pca16_soup_full.npz: rows=175563 dims=16 valid=175563 dup=0 prefix=dino
+[INFO 20:13:42 +    28.2s] [feat] matrix=(1490911, 16) covered=175563/1490911 all_valid=175563 names=16
+[INFO 20:13:42 +    28.2s] [feat] dims=16
+[INFO 20:13:45 +    31.1s] [dots] sessions=464 mean_total=50.3 mean_cand=32.6 mean_held=17.7 min_total=4
+[INFO 20:13:45 +    31.1s] [split] select before=464 after=216 subjects=70
+[INFO 20:13:45 +    31.1s] [expected] target_grid=25 mc=32 stop_tol=0.001 stop_min=4
+[INFO 20:13:47 +    33.6s] [progress] 25/216 sessions, rows=125, elapsed=2.5s
+[INFO 20:13:50 +    35.8s] [progress] 50/216 sessions, rows=250, elapsed=4.7s
+[INFO 20:13:52 +    38.2s] [progress] 75/216 sessions, rows=375, elapsed=7.1s
+[INFO 20:13:54 +    40.6s] [progress] 100/216 sessions, rows=500, elapsed=9.5s
+[INFO 20:13:57 +    42.7s] [progress] 125/216 sessions, rows=625, elapsed=11.6s
+[INFO 20:13:59 +    44.8s] [progress] 150/216 sessions, rows=750, elapsed=13.7s
+[INFO 20:14:01 +    47.3s] [progress] 175/216 sessions, rows=875, elapsed=16.2s
+[INFO 20:14:03 +    49.6s] [progress] 200/216 sessions, rows=1000, elapsed=18.5s
+[INFO 20:14:05 +    51.1s] [progress] 216/216 sessions, rows=1080, elapsed=20.0s
+[INFO 20:14:05 +    51.1s] [loop] rows=1080 sessions=216 elapsed=20.0s maxrss=1.22GB
+[INFO 20:14:05 +    51.3s] [save] out/gazecapture/analysis/base_mode_select/axis/active_calib_detail.csv rows=1080
+[INFO 20:14:05 +    51.3s] [save] out/gazecapture/analysis/base_mode_select/axis/active_calib_summary.json
+[INFO 20:14:05 +    51.3s] [save] out/gazecapture/analysis/base_mode_select/axis/active_calib_args.json
+[INFO 20:14:05 +    51.3s] ==============================================================================
+[INFO 20:14:05 +    51.3s] [RESULT] expected_feat@20: dots=19.1 frames=143 base=1.1153 cal=1.0842 (-2.79% vs base) raw=1.4418 improved=153/216 worst=+9.93%
+[INFO 20:14:05 +    51.3s] [RESULT] expected_feat@28: dots=25.6 frames=197 base=1.1082 cal=1.0759 (-2.92% vs base) raw=1.4418 improved=155/216 worst=+19.71%
+[INFO 20:14:05 +    51.3s] [RESULT] frame@50: dots=24.3 frames=48 base=1.1178 cal=1.0934 (-2.18% vs base) raw=1.4418 improved=152/216 worst=+36.17%
+[INFO 20:14:05 +    51.3s] [RESULT] hybrid@20: dots=19.1 frames=143 base=1.1126 cal=1.0863 (-2.37% vs base) raw=1.4418 improved=152/216 worst=+31.82%
+[INFO 20:14:05 +    51.3s] [RESULT] hybrid@28: dots=25.6 frames=198 base=1.1095 cal=1.0780 (-2.84% vs base) raw=1.4418 improved=156/216 worst=+25.36%
+[INFO 20:14:05 +    51.3s] [done]
