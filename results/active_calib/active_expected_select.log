@@ -1,0 +1,73 @@
+[INFO 18:48:15 +     0.0s] ==============================================================================
+[INFO 18:48:15 +     0.0s] active_calib_sim
+[INFO 18:48:15 +     0.0s] host=hr-RTX4090-132-41 python=3.11.16 numpy=2.4.6 pid=1153595
+[INFO 18:48:15 +     0.0s] args={"train_npz": "out/gazecapture/analysis/feats_soup_val.npz", "test_npz": "out/gazecapture/analysis/feats_soup_test_full.npz", "index_csv": "data/GazeCapture/index/index.csv", "dino_npz": "out/gazecapture/analysis/dino_pca16_soup_full.npz", "landmark_npz": "", "features": "dino", "regions": "none", "no_residual": false, "methods": "random,dotcov,featdiv,hybrid,expected,expected_feat,expected_stop,frame", "residual_level": "dot", "n_affine": 4, "session_split": "select", "session_split_seed": 0, "expected_grid": 5, "mc_samples": 32, "stop_tol": 0.001, "stop_min_dots": 4, "K_dots": [4, 8, 12, 16, 20], "K_frames": [50], "seeds": 1, "dot_split": 0.65, "min_dot_frames": 2, "min_frames": 40, "split_seed": 0, "dopt_sigma": 0.02, "cov_weight": 0.1, "limit_sessions": 0, "log_level": 1, "out_dir": "out/gazecapture/analysis/active_expected_select"}
+[INFO 18:48:15 +     0.0s] script=/data1/xieliangcai/code/gazeformer-exps/scripts/calibration/active_calib_sim.py sha256=f265982fa23a8707
+[INFO 18:48:15 +     0.0s] input out/gazecapture/analysis/feats_soup_val.npz: exists=True size=184178069
+[INFO 18:48:15 +     0.0s] input out/gazecapture/analysis/feats_soup_test_full.npz: exists=True size=556188240
+[INFO 18:48:15 +     0.0s] input data/GazeCapture/index/index.csv: exists=True size=384867448
+[INFO 18:48:15 +     0.0s] input out/gazecapture/analysis/dino_pca16_soup_full.npz: exists=True size=10671672
+[INFO 18:48:38 +    23.2s] [index] rows=1490911 fields=('frame_path', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h', 'device', 'screen_w', 'screen_h', 'gaze_x', 'gaze_y', 'cm_px_x', 'cm_px_y', 'imu_x', 'imu_y', 'imu_z', 'subject', 'orientation', 'split', 'face_grid_x', 'face_grid_y', 'face_grid_w', 'face_grid_h', 'dot_num', 'frame_index')
+[WARN 18:48:39 +    24.8s] !! out/gazecapture/analysis/feats_soup_val.npz: 9/58136 条 IMU |g_xy|<0.05 或缺失（drop_invalid_imu=False）
+[INFO 18:48:40 +    24.8s] [load] out/gazecapture/analysis/feats_soup_val.npz: frames=58136 groups=153 kept=145 dropped<40=8 missing_path=0 bad_scm=0 bad_imu=9
+[WARN 18:48:43 +    27.8s] !! out/gazecapture/analysis/feats_soup_test_full.npz: 441/175563 条 IMU |g_xy|<0.05 或缺失（drop_invalid_imu=False）
+[INFO 18:48:43 +    28.0s] [load] out/gazecapture/analysis/feats_soup_test_full.npz: frames=175563 groups=477 kept=464 dropped<40=13 missing_path=0 bad_scm=0 bad_imu=441
+[INFO 18:48:43 +    28.1s] [sessions] source=145 test=464
+[INFO 18:48:43 +    28.1s] [prior] mu=[0.9976, -0.00173, 0.99467, 0.04158] sd=[0.12668, 0.10041, 0.25921, 0.17431] sigma_dopt=0.02
+[INFO 18:48:43 +    28.2s] [feat] out/gazecapture/analysis/dino_pca16_soup_full.npz: rows=175563 dims=16 valid=175563 dup=0 prefix=dino
+[INFO 18:48:43 +    28.3s] [feat] matrix=(1490911, 16) covered=175563/1490911 all_valid=175563 names=16
+[INFO 18:48:43 +    28.3s] [feat] dims=16
+[INFO 18:48:46 +    30.9s] [dots] sessions=464 mean_total=50.3 mean_cand=32.6 mean_held=17.7 min_total=4
+[INFO 18:48:46 +    30.9s] [split] select before=464 after=216 subjects=70
+[INFO 18:48:46 +    30.9s] [expected] target_grid=25 mc=32 stop_tol=0.001 stop_min=4
+[INFO 18:49:11 +    56.5s] [progress] 25/216 sessions, rows=900, elapsed=25.6s
+[INFO 18:49:32 +    77.0s] [progress] 50/216 sessions, rows=1800, elapsed=46.1s
+[INFO 18:49:53 +    98.4s] [progress] 75/216 sessions, rows=2700, elapsed=67.6s
+[INFO 18:50:15 +   120.6s] [progress] 100/216 sessions, rows=3600, elapsed=89.7s
+[INFO 18:50:35 +   140.3s] [progress] 125/216 sessions, rows=4500, elapsed=109.5s
+[INFO 18:50:54 +   159.5s] [progress] 150/216 sessions, rows=5400, elapsed=128.6s
+[INFO 18:51:19 +   184.0s] [progress] 175/216 sessions, rows=6300, elapsed=153.1s
+[INFO 18:51:40 +   205.0s] [progress] 200/216 sessions, rows=7200, elapsed=174.1s
+[INFO 18:51:53 +   218.6s] [progress] 216/216 sessions, rows=7776, elapsed=187.7s
+[INFO 18:51:53 +   218.6s] [loop] rows=7776 sessions=216 elapsed=187.7s maxrss=1.22GB
+[INFO 18:51:55 +   220.4s] [save] out/gazecapture/analysis/active_expected_select/active_calib_detail.csv rows=7776
+[INFO 18:51:55 +   220.4s] [save] out/gazecapture/analysis/active_expected_select/active_calib_summary.json
+[INFO 18:51:55 +   220.4s] [save] out/gazecapture/analysis/active_expected_select/active_calib_args.json
+[INFO 18:51:55 +   220.4s] ==============================================================================
+[INFO 18:51:55 +   220.4s] [RESULT] dotcov@12: dots=11.8 frames=90 base=1.1354 cal=1.1179 (-1.54% vs base) raw=1.4418 improved=145/216 worst=+15.38%
+[INFO 18:51:55 +   220.4s] [RESULT] dotcov@16: dots=15.5 frames=119 base=1.1253 cal=1.1041 (-1.89% vs base) raw=1.4418 improved=146/216 worst=+13.70%
+[INFO 18:51:55 +   220.4s] [RESULT] dotcov@20: dots=19.1 frames=147 base=1.1175 cal=1.0922 (-2.27% vs base) raw=1.4418 improved=154/216 worst=+14.06%
+[INFO 18:51:55 +   220.4s] [RESULT] dotcov@4: dots=4.0 frames=30 base=1.2360 cal=1.2360 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] dotcov@8: dots=8.0 frames=61 base=1.1733 cal=1.1733 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] expected@12: dots=11.8 frames=89 base=1.1416 cal=1.1153 (-2.30% vs base) raw=1.4418 improved=151/216 worst=+23.28%
+[INFO 18:51:55 +   220.4s] [RESULT] expected@16: dots=15.5 frames=118 base=1.1353 cal=1.1082 (-2.39% vs base) raw=1.4418 improved=154/216 worst=+19.14%
+[INFO 18:51:55 +   220.4s] [RESULT] expected@20: dots=19.1 frames=146 base=1.1244 cal=1.0948 (-2.63% vs base) raw=1.4418 improved=143/216 worst=+14.80%
+[INFO 18:51:55 +   220.4s] [RESULT] expected@4: dots=4.0 frames=30 base=1.2349 cal=1.2349 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] expected@8: dots=8.0 frames=60 base=1.1711 cal=1.1711 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_feat@12: dots=11.8 frames=86 base=1.1396 cal=1.1096 (-2.63% vs base) raw=1.4418 improved=146/216 worst=+12.52%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_feat@16: dots=15.5 frames=115 base=1.1256 cal=1.0980 (-2.44% vs base) raw=1.4418 improved=142/216 worst=+12.22%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_feat@20: dots=19.1 frames=143 base=1.1153 cal=1.0842 (-2.79% vs base) raw=1.4418 improved=153/216 worst=+9.93%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_feat@4: dots=4.0 frames=30 base=1.2349 cal=1.2349 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_feat@8: dots=8.0 frames=58 base=1.1711 cal=1.1711 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_stop@12: dots=11.7 frames=89 base=1.1415 cal=1.1154 (-2.29% vs base) raw=1.4418 improved=149/216 worst=+23.28%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_stop@16: dots=15.4 frames=118 base=1.1353 cal=1.1082 (-2.39% vs base) raw=1.4418 improved=150/216 worst=+19.14%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_stop@20: dots=19.0 frames=145 base=1.1244 cal=1.0949 (-2.63% vs base) raw=1.4418 improved=140/216 worst=+14.80%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_stop@4: dots=4.0 frames=30 base=1.2349 cal=1.2349 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] expected_stop@8: dots=7.9 frames=59 base=1.1711 cal=1.1711 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] featdiv@12: dots=11.8 frames=87 base=1.1426 cal=1.1206 (-1.92% vs base) raw=1.4418 improved=141/216 worst=+14.76%
+[INFO 18:51:55 +   220.4s] [RESULT] featdiv@16: dots=15.5 frames=115 base=1.1254 cal=1.1005 (-2.22% vs base) raw=1.4418 improved=145/216 worst=+12.93%
+[INFO 18:51:55 +   220.4s] [RESULT] featdiv@20: dots=19.1 frames=144 base=1.1174 cal=1.0881 (-2.62% vs base) raw=1.4418 improved=154/216 worst=+13.48%
+[INFO 18:51:55 +   220.4s] [RESULT] featdiv@4: dots=4.0 frames=30 base=1.2360 cal=1.2360 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] featdiv@8: dots=8.0 frames=58 base=1.1645 cal=1.1645 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] frame@50: dots=24.3 frames=48 base=1.1178 cal=1.0934 (-2.18% vs base) raw=1.4418 improved=152/216 worst=+36.17%
+[INFO 18:51:55 +   220.4s] [RESULT] hybrid@12: dots=11.8 frames=86 base=1.1383 cal=1.1113 (-2.37% vs base) raw=1.4418 improved=145/216 worst=+12.80%
+[INFO 18:51:55 +   220.4s] [RESULT] hybrid@16: dots=15.5 frames=115 base=1.1226 cal=1.0955 (-2.41% vs base) raw=1.4418 improved=150/216 worst=+19.67%
+[INFO 18:51:55 +   220.4s] [RESULT] hybrid@20: dots=19.1 frames=143 base=1.1126 cal=1.0863 (-2.37% vs base) raw=1.4418 improved=152/216 worst=+31.82%
+[INFO 18:51:55 +   220.4s] [RESULT] hybrid@4: dots=4.0 frames=30 base=1.2401 cal=1.2401 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] hybrid@8: dots=8.0 frames=58 base=1.1615 cal=1.1615 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] random@12: dots=11.8 frames=89 base=1.1489 cal=1.1255 (-2.04% vs base) raw=1.4418 improved=151/216 worst=+34.29%
+[INFO 18:51:55 +   220.4s] [RESULT] random@16: dots=15.5 frames=118 base=1.1369 cal=1.1147 (-1.95% vs base) raw=1.4418 improved=145/216 worst=+31.22%
+[INFO 18:51:55 +   220.4s] [RESULT] random@20: dots=19.1 frames=146 base=1.1204 cal=1.0952 (-2.25% vs base) raw=1.4418 improved=152/216 worst=+34.71%
+[INFO 18:51:55 +   220.4s] [RESULT] random@4: dots=4.0 frames=30 base=1.2603 cal=1.2603 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [RESULT] random@8: dots=8.0 frames=59 base=1.1697 cal=1.1697 (+0.00% vs base) raw=1.4418 improved=0/216 worst=+0.00%
+[INFO 18:51:55 +   220.4s] [done]

@@ -293,6 +293,91 @@ def select_hybrid(cand, K, seed, Lambda0, sigma2, cov_weight, n_affine):
     return _featdiv_complete(cand, first, K, cov_weight)
 
 
+def _grid_phi(n: int, margin: float = 0.05):
+    xs = np.linspace(margin, 1.0 - margin, int(n))
+    grid = np.array([(x, y) for x in xs for y in xs], np.float64)
+    G = np.zeros((len(grid), 2, 4), np.float64)
+    G[:, 0, 0] = grid[:, 0]
+    G[:, 0, 1] = 1.0
+    G[:, 1, 2] = grid[:, 1]
+    G[:, 1, 3] = 1.0
+    return G
+
+
+def _trace_err(Lambda: np.ndarray, G: np.ndarray) -> float:
+    Sigma = np.linalg.inv(Lambda)
+    return float(np.einsum("tij,jk,tik->t", G, Sigma, G).mean())
+
+
+def _post_update(Lambda, mu, dot, sigma2):
+    Phi = _phi(dot["pred"])
+    M = Phi.T @ Phi / max(sigma2, 1e-12)
+    Lnew = Lambda + M
+    Sig = np.linalg.inv(Lnew)
+    mu_new = Sig @ (Lambda @ mu + Phi.T @ dot["label"] / max(sigma2, 1e-12))
+    return Lnew, mu_new
+
+
+def _expected_after(dot, Lambda, mu, sigma2, G, rng, n_mc):
+    """Expected cm/norm error at target grid after observing candidate dot."""
+    Sigma = np.linalg.inv(Lambda)
+    try:
+        L = np.linalg.cholesky(Sigma + 1e-10 * np.eye(4))
+    except np.linalg.LinAlgError:
+        return float("inf")
+    theta = mu[None, :] + rng.randn(n_mc, 4) @ L.T
+    Phi = _phi(dot["pred"])
+    y = theta @ Phi.T + rng.randn(n_mc, 2) * np.sqrt(max(sigma2, 1e-12))
+    M = Phi.T @ Phi / max(sigma2, 1e-12)
+    Lnew = Lambda + M
+    Sig_new = np.linalg.inv(Lnew)
+    m_new = (Sig_new @ (Lambda @ mu)[:, None] +
+             (Sig_new @ Phi.T) @ y.T / max(sigma2, 1e-12)).T
+    pred = np.einsum("tij,nj->nti", G, m_new)
+    true = np.einsum("tij,nj->nti", G, theta)
+    return float(((pred - true) ** 2).sum(2).mean())
+
+
+def select_expected(cand, K, seed, mu, Lambda0, sigma2, G, n_mc,
+                    n_affine, cov_weight, feat_div=False, stop=False,
+                    stop_tol=0.001, stop_min_dots=4):
+    """Sequential Bayesian active selection; optionally feature-div after affine."""
+    rng = np.random.RandomState(seed)
+    sel = []
+    Lambda = Lambda0.copy()
+    mu_cur = mu.copy()
+    utils = []
+    reason = ""
+    K = min(int(K), len(cand))
+    while len(sel) < K:
+        if feat_div and len(sel) >= n_affine:
+            rest, u = _featdiv_complete(cand, sel, K, cov_weight)
+            sel = rest
+            utils += u
+            reason = "featdiv"
+            break
+        err0 = _trace_err(Lambda, G)
+        best = None
+        best_i = None
+        for i, dot in enumerate(cand):
+            if any(dot is x for x in sel):
+                continue
+            e = _expected_after(dot, Lambda, mu_cur, sigma2, G, rng, n_mc)
+            if best is None or e < best:
+                best, best_i = e, i
+        if best_i is None:
+            break
+        reduction = err0 - best
+        if stop and len(sel) >= stop_min_dots and reduction < stop_tol * max(err0, 1e-12):
+            reason = "tol"
+            break
+        dot = cand[best_i]
+        sel.append(dot)
+        utils.append(float(reduction))
+        Lambda, mu_cur = _post_update(Lambda, mu_cur, dot, sigma2)
+    return sel, utils, reason
+
+
 def select_frame_coverage(d, cand_pos, K, seed):
     if len(cand_pos) == 0:
         return np.array([], np.int64), []
@@ -498,6 +583,18 @@ def main():
                     help="dot 方法默认按 dot 均值拟合残差，避免同 dot 多帧被当作独立样本")
     ap.add_argument("--n-affine", type=int, default=4,
                     help="featdiv/hybrid 先用多少个点确定仿射")
+    ap.add_argument("--session-split", choices=["all", "select", "eval"],
+                    default="all",
+                    help="按 subject 划 selection/eval；用于避免在 test 上调参")
+    ap.add_argument("--session-split-seed", type=int, default=0)
+    ap.add_argument("--expected-grid", type=int, default=5,
+                    help="expected 方法的屏幕目标网格 n×n")
+    ap.add_argument("--mc-samples", type=int, default=32,
+                    help="expected 方法的 posterior MC 样本数")
+    ap.add_argument("--stop-tol", type=float, default=0.001,
+                    help="expected_stop 的相对期望误差下降阈值")
+    ap.add_argument("--stop-min-dots", type=int, default=4,
+                    help="expected_stop 至少选多少个 dot")
     ap.add_argument("--K-dots", type=int, nargs="+", default=[4, 6, 8, 10, 15, 20])
     ap.add_argument("--K-frames", type=int, nargs="+", default=[20, 50])
     ap.add_argument("--seeds", type=int, default=1)
@@ -598,9 +695,27 @@ def main():
         f"min_total={min(x[0] for x in dot_stats)}")
 
     sessions = list(tabs.items())
+    if a.session_split != "all":
+        want = 0 if a.session_split == "select" else 1
+
+        def _subj(sess):
+            parts = str(sess).split("/")
+            return parts[2] if len(parts) > 2 else str(sess)
+
+        before = len(sessions)
+        sessions = [(s, d) for s, d in sessions
+                    if (zlib.crc32(
+                        (_subj(s) + "|" + str(a.session_split_seed)).encode("utf-8")
+                    ) % 2) == want]
+        log(f"[split] {a.session_split} before={before} after={len(sessions)} "
+            f"subjects={len({_subj(s) for s, _ in sessions})}")
     if a.limit_sessions:
         sessions = sessions[:a.limit_sessions]
         log(f"[limit] {len(sessions)} sessions")
+
+    G = _grid_phi(a.expected_grid)
+    log(f"[expected] target_grid={G.shape[0]} mc={a.mc_samples} "
+        f"stop_tol={a.stop_tol} stop_min={a.stop_min_dots}")
 
     rows = []
     t0 = time.time()
@@ -609,7 +724,8 @@ def main():
         task_lists = []
         for method in methods:
             if method in ("random", "dotcov", "dopt", "doptcov",
-                          "featdiv", "hybrid"):
+                          "featdiv", "hybrid", "expected", "expected_feat",
+                          "expected_stop"):
                 for K in a.K_dots:
                     for seed in range(a.seeds):
                         task_lists.append((method, K, seed))
@@ -646,6 +762,20 @@ def main():
                                                 a.cov_weight, a.n_affine)
                 rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
+            elif method in ("expected", "expected_feat", "expected_stop"):
+                sel_dots, utils, reason = select_expected(
+                    tab["cand"], K, seed, mu_norm, Lambda0,
+                    a.dopt_sigma ** 2, G, a.mc_samples, a.n_affine,
+                    a.cov_weight,
+                    feat_div=(method == "expected_feat"),
+                    stop=(method == "expected_stop"),
+                    stop_tol=a.stop_tol,
+                    stop_min_dots=a.stop_min_dots,
+                )
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
+                               a, F, V, mu_norm, RA)
+                if rec is not None:
+                    rec["stop_reason"] = reason
             else:  # frame
                 sel_pos, utils = select_frame_coverage(d, tab["cand_pos"], K, seed)
                 rec = fit_eval(d, tab, None, sel_pos, method, K, seed,
@@ -656,6 +786,7 @@ def main():
             rec.update(session=s, ori=d["ori"], device=d["device"],
                        n_candidate_dots=len(tab["cand"]),
                        n_heldout_dots=len(tab["held"]),
+                       stop_reason=rec.get("stop_reason", ""),
                        utility=";".join(f"{u:.5f}" for u in utils) if utils else "")
             rows.append(rec)
             if a.log_level >= 2:
@@ -698,7 +829,8 @@ def main():
             "gain_vs_base_cm", "gain_vs_raw_cm",
             "raw_norm", "base_norm", "calib_norm",
             "gain_vs_base_norm", "feat_valid", "note",
-            "lam_x", "lam_y", "alpha_x", "alpha_y", "selected", "utility"]
+            "lam_x", "lam_y", "alpha_x", "alpha_y", "selected", "utility",
+            "stop_reason"]
     with open(detail, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
