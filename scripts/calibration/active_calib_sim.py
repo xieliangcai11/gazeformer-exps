@@ -378,6 +378,106 @@ def select_expected(cand, K, seed, mu, Lambda0, sigma2, G, n_mc,
     return sel, utils, reason
 
 
+def _standardize_dot_features(cand, regions="none"):
+    X = np.stack([d["feat"] for d in cand]).astype(np.float64)
+    V = np.array([d["valid"] > 0 for d in cand], bool)
+    ok = V & np.isfinite(X).all(1)
+    if ok.sum() < 2:
+        return np.zeros_like(X), V
+    mu = X[ok].mean(0)
+    sd = X[ok].std(0) + 1e-6
+    Z = np.clip((X - mu) / sd, -5.0, 5.0)
+    Z[~np.isfinite(Z)] = 0.0
+    Z[~V] = 0.0
+    if regions != "none":
+        P = np.stack([d["pred"] for d in cand]).astype(np.float64)
+        Z = np.concatenate([Z, region_feats(P, regions)], 1)
+    return Z, V
+
+
+def select_residual(cand, K, seed, mu, Lambda0, sigma2, G, n_affine,
+                    stop=False, stop_tol=0.01, noise_frac=0.1,
+                    min_support=10, regions="none"):
+    """前 n_affine 个 dot 用 affine 期望误差；其余用残差特征的后验 D-optimal。
+
+    残差特征在 candidate 上标准化（不看 target），目标分布用未选 candidate
+    dot 的特征；每选一个 dot 用实际残差更新一次后验。support 少于
+    min_support 时不允许停止，保证残差模型可拟合。
+    """
+    K = min(int(K), len(cand))
+    n_aff = min(int(n_affine), K)
+    aff, _, _ = select_expected(
+        cand, n_aff, seed, mu, Lambda0, sigma2, G, 32, n_aff, 0.0,
+        feat_div=False, stop=False,
+    )
+    sel = list(aff)
+    if len(sel) >= K:
+        return sel, [], "", dict(resid_tau2=float("nan"),
+                                 resid_sigma2=float("nan"),
+                                 resid_err0=float("nan"))
+
+    # 用 affine 子集拟合 base，计算 dot-level 残差
+    P = np.stack([d["pred"] for d in sel]).astype(np.float64)
+    U = np.stack([d["label"] for d in sel]).astype(np.float64)
+    th = fit_huber(P, U, 1.0, mu, 1.345, scale_mode="axis")
+    R = np.stack([d["label"] - apply_affine(d["pred"][None, :], th)[0]
+                  for d in sel]).astype(np.float64)
+
+    Z, V = _standardize_dot_features(cand, regions)
+    idx = {id(d): i for i, d in enumerate(cand)}
+    sel_idx = [idx[id(d)] for d in sel]
+    tau2 = float(np.mean(np.var(R, axis=0)))
+    tau2 = max(tau2, 1e-3)
+    sig2 = max(float(noise_frac) * tau2, 1e-6)
+
+    D = Z.shape[1]
+    Lambda = np.eye(D) / tau2
+    for j in sel_idx:
+        if V[j]:
+            Lambda = Lambda + np.outer(Z[j], Z[j]) / sig2
+    Inv = np.linalg.inv(Lambda + 1e-9 * np.eye(D))
+    tgt = [i for i in range(len(cand)) if i not in set(sel_idx) and V[i]]
+    if len(tgt) < 2:
+        tgt = [i for i in range(len(cand)) if V[i]]
+    Zt = Z[tgt]
+    err0 = float(np.einsum("ij,jk,ik->", Zt, Inv, Zt))
+    err_init = err0
+    utils = []
+    reason = ""
+    stop_min = max(int(min_support), n_aff + 2)
+    while len(sel) < K:
+        best = None
+        best_i = None
+        for i, dot in enumerate(cand):
+            if i in set(sel_idx) or not V[i]:
+                continue
+            z = Z[i]
+            u = Inv @ z
+            denom = sig2 + float(z @ u)
+            if denom <= 1e-12:
+                continue
+            v = Zt @ u
+            red = float((v @ v) / denom)
+            if best is None or red > best:
+                best, best_i = red, i
+        if best_i is None:
+            break
+        if stop and len(sel) >= stop_min and best < stop_tol * max(err_init, 1e-12):
+            reason = "tol"
+            break
+        dot = cand[best_i]
+        sel.append(dot)
+        sel_idx.append(best_i)
+        utils.append(float(best))
+        z = Z[best_i]
+        u = Inv @ z
+        denom = sig2 + float(z @ u)
+        Inv = Inv - np.outer(u, u) / max(denom, 1e-12)
+        err0 = max(err0 - best, 0.0)
+    info = dict(resid_tau2=tau2, resid_sigma2=sig2, resid_err0=err_init)
+    return sel, utils, reason, info
+
+
 def select_frame_coverage(d, cand_pos, K, seed):
     if len(cand_pos) == 0:
         return np.array([], np.int64), []
@@ -595,6 +695,12 @@ def main():
                     help="expected_stop 的相对期望误差下降阈值")
     ap.add_argument("--stop-min-dots", type=int, default=4,
                     help="expected_stop 至少选多少个 dot")
+    ap.add_argument("--resid-noise-frac", type=float, default=0.1,
+                    help="residual D-optimal 的观测噪声/先验方差比")
+    ap.add_argument("--resid-stop-tol", type=float, default=0.01,
+                    help="resid_stop 的相对残差期望误差下降阈值")
+    ap.add_argument("--resid-min-support", type=int, default=10,
+                    help="resid_stop 至少保留多少个 dot 以拟合残差")
     ap.add_argument("--K-dots", type=int, nargs="+", default=[4, 6, 8, 10, 15, 20])
     ap.add_argument("--K-frames", type=int, nargs="+", default=[20, 50])
     ap.add_argument("--seeds", type=int, default=1)
@@ -725,7 +831,7 @@ def main():
         for method in methods:
             if method in ("random", "dotcov", "dopt", "doptcov",
                           "featdiv", "hybrid", "expected", "expected_feat",
-                          "expected_stop"):
+                          "expected_stop", "resid", "resid_stop"):
                 for K in a.K_dots:
                     for seed in range(a.seeds):
                         task_lists.append((method, K, seed))
@@ -776,6 +882,21 @@ def main():
                                a, F, V, mu_norm, RA)
                 if rec is not None:
                     rec["stop_reason"] = reason
+            elif method in ("resid", "resid_stop"):
+                sel_dots, utils, reason, rinfo = select_residual(
+                    tab["cand"], K, seed, mu_norm, Lambda0,
+                    a.dopt_sigma ** 2, G, a.n_affine,
+                    stop=(method == "resid_stop"),
+                    stop_tol=a.resid_stop_tol,
+                    noise_frac=a.resid_noise_frac,
+                    min_support=a.resid_min_support,
+                    regions=a.regions,
+                )
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
+                               a, F, V, mu_norm, RA)
+                if rec is not None:
+                    rec["stop_reason"] = reason
+                    rec.update(rinfo)
             else:  # frame
                 sel_pos, utils = select_frame_coverage(d, tab["cand_pos"], K, seed)
                 rec = fit_eval(d, tab, None, sel_pos, method, K, seed,
@@ -830,7 +951,7 @@ def main():
             "raw_norm", "base_norm", "calib_norm",
             "gain_vs_base_norm", "feat_valid", "note",
             "lam_x", "lam_y", "alpha_x", "alpha_y", "selected", "utility",
-            "stop_reason"]
+            "stop_reason", "resid_tau2", "resid_sigma2", "resid_err0"]
     with open(detail, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
