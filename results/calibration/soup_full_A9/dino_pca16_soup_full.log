@@ -1,0 +1,4 @@
+[dino] args={'train_npz': 'out/gazecapture/analysis/feats_soup_val.npz', 'test_npz': 'out/gazecapture/analysis/feats_soup_test_full.npz', 'index_csv': 'data/GazeCapture/index/index.csv', 'out': 'out/gazecapture/analysis/dino_pca16_soup_full.npz', 'components': 16}
+[dino] train=(58136, 1536) test=(175563, 1536)
+[dino] explained=0.8032
+[dino] saved out/gazecapture/analysis/dino_pca16_soup_full.npz valid=175563/175563
