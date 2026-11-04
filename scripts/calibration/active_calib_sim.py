@@ -104,121 +104,6 @@ def stable_seed(*parts) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 可消融 base：axis / full / quad
-# ---------------------------------------------------------------------------
-
-_BASE_DIMS = {"axis": 2, "full": 3, "quad": 6}
-
-
-def _base_design(P: np.ndarray, mode: str, axis: int = 0) -> np.ndarray:
-    P = np.asarray(P, np.float64)
-    x = P[:, 0]
-    y = P[:, 1]
-    if mode == "axis":
-        return np.stack([P[:, axis], np.ones(len(P))], 1)
-    if mode == "full":
-        return np.stack([x, y, np.ones(len(P))], 1)
-    if mode == "quad":
-        return np.stack([x, y, x * x, x * y, y * y, np.ones(len(P))], 1)
-    raise ValueError(f"未知 base_mode={mode}")
-
-
-def base_dim(mode: str) -> int:
-    if mode not in _BASE_DIMS:
-        raise ValueError(f"未知 base_mode={mode}")
-    return _BASE_DIMS[mode]
-
-
-def fit_base(P: np.ndarray, U: np.ndarray,
-             prior_mu: np.ndarray, prior_prec: np.ndarray,
-             delta: float = 1.345, iters: int = 6,
-             scale_mode: str = "axis", mode: str = "axis"):
-    """Per-axis affine/Huber，支持 axis(4), full(6), quad(12) 参数。"""
-    P = np.asarray(P, np.float64)
-    U = np.asarray(U, np.float64)
-    k = base_dim(mode)
-    prior_mu = np.asarray(prior_mu, np.float64)
-    prior_prec = np.asarray(prior_prec, np.float64)
-    if prior_mu.shape != (2, k):
-        raise ValueError(f"prior_mu shape={prior_mu.shape} 应为 (2,{k})")
-    if prior_prec.shape != (2, k, k):
-        raise ValueError(f"prior_prec shape={prior_prec.shape} 应为 (2,{k},{k})")
-    X = [_base_design(P, mode, ax) for ax in range(2)]
-    th = []
-    for ax in range(2):
-        A = X[ax].T @ X[ax] + prior_prec[ax]
-        b = X[ax].T @ U[:, ax] + prior_prec[ax] @ prior_mu[ax]
-        th.append(np.linalg.solve(A, b))
-    for _ in range(int(iters)):
-        q = [X[ax] @ th[ax] for ax in range(2)]
-        r = U - np.stack(q, 1)
-        if scale_mode == "axis":
-            scales = np.array([
-                1.4826 * np.median(np.abs(r[:, ax] - np.median(r[:, ax]))) + 1e-9
-                for ax in range(2)
-            ])
-        else:
-            scales = np.full(2, 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-9)
-        out = []
-        for ax in range(2):
-            z = np.abs(r[:, ax]) / (delta * scales[ax])
-            w = np.where(z <= 1.0, 1.0, 1.0 / np.maximum(z, 1e-12))
-            A = X[ax].T @ (w[:, None] * X[ax]) + prior_prec[ax]
-            b = X[ax].T @ (w * U[:, ax]) + prior_prec[ax] @ prior_mu[ax]
-            out.append(np.linalg.solve(A, b))
-        th = out
-    return th
-
-
-def apply_base(P: np.ndarray, th, mode: str = "axis") -> np.ndarray:
-    P = np.asarray(P, np.float64)
-    return np.stack([_base_design(P, mode, ax) @ th[ax] for ax in range(2)], 1)
-
-
-def flatten_base(th) -> np.ndarray:
-    return np.concatenate([np.asarray(th[0], np.float64),
-                           np.asarray(th[1], np.float64)])
-
-
-def build_base_prior(D: dict, mode: str, mu_axis: np.ndarray,
-                     prior_scale: float = 1.0,
-                     weak: float = 1e-3):
-    """返回 (prior_mu[2,k], prior_prec[2,k,k])。
-
-    axis 保持旧行为：mu 来自 source，precision=I。
-    full/quad 在 source 会话上拟合参数，使用 source 参数协方差的逆。
-    """
-    k = base_dim(mode)
-    if mode == "axis":
-        mu = np.asarray([[mu_axis[0], mu_axis[1]],
-                         [mu_axis[2], mu_axis[3]]], np.float64)
-        prec = np.stack([np.eye(2), np.eye(2)]) * float(prior_scale)
-        return mu, prec
-    zero = np.zeros((2, k), np.float64)
-    weak_prec = np.stack([np.eye(k) * float(weak),
-                          np.eye(k) * float(weak)])
-    params = []
-    for d in D.values():
-        if len(d["pred"]) < 4:
-            continue
-        th = fit_base(d["pred"], d["label"], zero, weak_prec,
-                      delta=1.345, iters=4, scale_mode="axis", mode=mode)
-        params.append(flatten_base(th))
-    if len(params) < 3:
-        raise SystemExit(f"source 太少，无法构建 {mode} prior: {len(params)}")
-    params = np.asarray(params, np.float64)
-    mu_flat = params.mean(0)
-    cov = np.cov(params.T) + 1e-4 * np.eye(2 * k)
-    mu = mu_flat.reshape(2, k)
-    prec = []
-    for ax in range(2):
-        block = cov[ax * k:(ax + 1) * k, ax * k:(ax + 1) * k]
-        prec.append(np.linalg.inv(block + 1e-6 * np.eye(k)))
-    prec = np.stack(prec) * float(prior_scale)
-    return mu, prec
-
-
-# ---------------------------------------------------------------------------
 # dot 表
 # ---------------------------------------------------------------------------
 
@@ -512,8 +397,7 @@ def _standardize_dot_features(cand, regions="none"):
 
 def select_residual(cand, K, seed, mu, Lambda0, sigma2, G, n_affine,
                     stop=False, stop_tol=0.01, noise_frac=0.1,
-                    min_support=10, regions="none", base_mode="axis",
-                    prior_mu=None, prior_prec=None):
+                    min_support=10, regions="none"):
     """前 n_affine 个 dot 用 affine 期望误差；其余用残差特征的后验 D-optimal。
 
     残差特征在 candidate 上标准化（不看 target），目标分布用未选 candidate
@@ -535,16 +419,8 @@ def select_residual(cand, K, seed, mu, Lambda0, sigma2, G, n_affine,
     # 用 affine 子集拟合 base，计算 dot-level 残差
     P = np.stack([d["pred"] for d in sel]).astype(np.float64)
     U = np.stack([d["label"] for d in sel]).astype(np.float64)
-    if prior_mu is None or prior_prec is None:
-        k = base_dim(base_mode)
-        prior_mu = np.zeros((2, k), np.float64)
-        prior_prec = np.stack([np.eye(k), np.eye(k)]) * 1.0
-        if base_mode == "axis":
-            prior_mu = np.asarray([[mu[0], mu[1]],
-                                   [mu[2], mu[3]]], np.float64)
-    th = fit_base(P, U, prior_mu, prior_prec,
-                  delta=1.345, scale_mode="axis", mode=base_mode)
-    R = np.stack([d["label"] - apply_base(d["pred"][None, :], th, base_mode)[0]
+    th = fit_huber(P, U, 1.0, mu, 1.345, scale_mode="axis")
+    R = np.stack([d["label"] - apply_affine(d["pred"][None, :], th)[0]
                   for d in sel]).astype(np.float64)
 
     Z, V = _standardize_dot_features(cand, regions)
@@ -625,8 +501,7 @@ def _dot_target_sel(selected_dots):
     return np.concatenate(pos), np.concatenate(tgt, 0)
 
 
-def _fit_dot_residual(d, selected_dots, held_pos, th, args, F, V, RA,
-                      base_mode="axis"):
+def _fit_dot_residual(d, selected_dots, held_pos, th, args, F, V, RA):
     """按 dot 均值拟合残差：有效样本数=dot 数，避免同 dot 多帧被当作独立样本。"""
     rows_held = d["rows"][held_pos]
     Xs = np.stack([dot["feat"] for dot in selected_dots]).astype(np.float64)
@@ -634,7 +509,7 @@ def _fit_dot_residual(d, selected_dots, held_pos, th, args, F, V, RA,
     Vs = np.array([dot["valid"] > 0 for dot in selected_dots], bool)
     Rs = np.empty((len(selected_dots), 2), np.float64)
     for i, dot in enumerate(selected_dots):
-        q0 = apply_base(dot["pred"][None, :], th, base_mode)[0]
+        q0 = apply_affine(dot["pred"][None, :], th)[0]
         Rs[i] = dot["label"] - q0
     prep = prepare_features(Xs, F[rows_held], Vs, V[rows_held])
     if prep is None:
@@ -654,8 +529,7 @@ def _fit_dot_residual(d, selected_dots, held_pos, th, args, F, V, RA,
 
 
 def fit_eval(d, tab, selected_dots, sel_pos_frame, method, K, seed,
-             args, F, V, mu_norm, RA, base_mode="axis",
-             prior_mu=None, prior_prec=None):
+             args, F, V, mu_norm, RA):
     if method == "frame":
         sel_pos = np.asarray(sel_pos_frame, np.int64)
         target_sel = d["label"][sel_pos]
@@ -670,19 +544,11 @@ def fit_eval(d, tab, selected_dots, sel_pos_frame, method, K, seed,
     if len(sel_pos) < 2 or len(held_pos) < 2:
         return None
 
-    if prior_mu is None or prior_prec is None:
-        k = base_dim(base_mode)
-        prior_mu = np.zeros((2, k), np.float64)
-        prior_prec = np.stack([np.eye(k), np.eye(k)]) * 1.0
-        if base_mode == "axis":
-            prior_mu = np.asarray([[mu_norm[0], mu_norm[1]],
-                                   [mu_norm[2], mu_norm[3]]], np.float64)
-
-    # base: per-axis/全 2D/二次 Huber，source prior；dot 方法用 dot target
-    th = fit_base(d["pred"][sel_pos], target_sel, prior_mu, prior_prec,
-                  delta=1.345, scale_mode="axis", mode=base_mode)
-    q0_sel = apply_base(d["pred"][sel_pos], th, base_mode)
-    q0_held = apply_base(d["pred"][held_pos], th, base_mode)
+    # base: per-axis Huber，source prior；dot 方法用 dot target，frame 方法用逐帧 label
+    th = fit_huber(d["pred"][sel_pos], target_sel, 1.0, mu_norm,
+                   1.345, scale_mode="axis")
+    q0_sel = apply_affine(d["pred"][sel_pos], th)
+    q0_held = apply_affine(d["pred"][held_pos], th)
 
     # residual
     corr = np.zeros((len(held_pos), 2), np.float64)
@@ -691,8 +557,7 @@ def fit_eval(d, tab, selected_dots, sel_pos_frame, method, K, seed,
     if not args.no_residual:
         if args.residual_level == "dot" and method != "frame":
             corr, info = _fit_dot_residual(d, selected_dots, held_pos,
-                                           th, args, F, V, RA,
-                                           base_mode=base_mode)
+                                           th, args, F, V, RA)
         else:
             prep = prepare_features(F[d["rows"][sel_pos]], F[d["rows"][held_pos]],
                                     V[d["rows"][sel_pos]], V[d["rows"][held_pos]])
@@ -729,7 +594,6 @@ def fit_eval(d, tab, selected_dots, sel_pos_frame, method, K, seed,
 
     return dict(
         method=method, K=int(K), seed=int(seed),
-        base_mode=base_mode,
         n_selected_dots=int(n_sel_dots), n_frames_used=int(len(sel_pos)),
         n_heldout_frames=int(len(held_pos)),
         raw_cm=raw, base_cm=base, calib_cm=cal,
@@ -811,7 +675,6 @@ def main():
     ap.add_argument("--index-csv", required=True)
     ap.add_argument("--dino-npz", default="")
     ap.add_argument("--landmark-npz", default="")
-    ap.add_argument("--pose-npz", default="")
     ap.add_argument("--features", default="dino,landmark")
     ap.add_argument("--regions", choices=["none", "2x2", "3x3"], default="3x3")
     ap.add_argument("--no-residual", action="store_true")
@@ -847,11 +710,6 @@ def main():
     ap.add_argument("--split-seed", type=int, default=0)
     ap.add_argument("--dopt-sigma", type=float, default=0.02,
                     help="D-optimal 观测噪声标准差（norm 空间）")
-    ap.add_argument("--base-mode", choices=["axis", "full", "quad"],
-                    default="axis",
-                    help="base 模型：axis=4参数；full=6参数含交叉项；quad=12参数")
-    ap.add_argument("--base-prior-scale", type=float, default=1.0,
-                    help="source prior precision 缩放；越大越强")
     ap.add_argument("--cov-weight", type=float, default=0.1,
                     help="D-optimal+coverage 的覆盖/多样性权重")
     ap.add_argument("--limit-sessions", type=int, default=0)
@@ -873,8 +731,7 @@ def main():
     log(f"args={json.dumps(vars(a), ensure_ascii=False, default=str)}")
     script = Path(__file__).resolve()
     log(f"script={script} sha256={hashlib.sha256(script.read_bytes()).hexdigest()[:16]}")
-    for p in (a.train_npz, a.test_npz, a.index_csv, a.dino_npz,
-              a.landmark_npz, a.pose_npz):
+    for p in (a.train_npz, a.test_npz, a.index_csv, a.dino_npz, a.landmark_npz):
         if p:
             pp = Path(p)
             log(f"input {p}: exists={pp.exists()} "
@@ -901,20 +758,6 @@ def main():
         f"sd={np.round(np.sqrt(np.diag(Sigma)), 5).tolist()} "
         f"sigma_dopt={a.dopt_sigma}")
 
-    prior_mu, prior_prec = build_base_prior(
-        D, a.base_mode, mu_norm, prior_scale=a.base_prior_scale)
-    log(f"[base] mode={a.base_mode} dim={base_dim(a.base_mode)} "
-        f"prior_scale={a.base_prior_scale}")
-    for ax, name in enumerate(("x", "y")):
-        sd = np.sqrt(np.diag(np.linalg.inv(prior_prec[ax] + 1e-9 * np.eye(
-            base_dim(a.base_mode)))))
-        log(f"[base-prior] {name} mu={np.round(prior_mu[ax], 5).tolist()} "
-            f"sd={np.round(sd, 5).tolist()}")
-
-    def fit_eval_base(*fargs, **fkwargs):
-        return fit_eval(*fargs, base_mode=a.base_mode,
-                        prior_mu=prior_mu, prior_prec=prior_prec, **fkwargs)
-
     # features
     feats = [x.strip() for x in a.features.split(",") if x.strip()]
     sources = []
@@ -926,11 +769,7 @@ def main():
         if not a.landmark_npz:
             raise SystemExit("features 含 landmark 但 --landmark-npz 为空")
         sources.append(load_feature_source(a.landmark_npz, "lm"))
-    if "pose" in feats:
-        if not a.pose_npz:
-            raise SystemExit("features 含 pose 但 --pose-npz 为空")
-        sources.append(load_feature_source(a.pose_npz, "pose"))
-    unknown = set(feats) - {"dino", "landmark", "pose"}
+    unknown = set(feats) - {"dino", "landmark"}
     if unknown:
         raise SystemExit(f"未知特征组 {unknown}")
     F, V, fnames = build_feature_matrix(sources, len(table))
@@ -1006,28 +845,28 @@ def main():
         for method, K, seed in task_lists:
             if method == "random":
                 sel_dots, utils = select_random(tab["cand"], K, seed)
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
             elif method == "dotcov":
                 sel_dots, utils = select_dot_coverage(tab["cand"], K, seed)
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
             elif method in ("dopt", "doptcov"):
                 cw = a.cov_weight if method == "doptcov" else 0.0
                 sel_dots, utils = select_dopt(tab["cand"], K, seed, Lambda0,
                                               a.dopt_sigma ** 2, cw)
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
             elif method == "featdiv":
                 sel_dots, utils = select_featdiv(tab["cand"], K, seed,
                                                  a.n_affine, a.cov_weight)
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
             elif method == "hybrid":
                 sel_dots, utils = select_hybrid(tab["cand"], K, seed, Lambda0,
                                                 a.dopt_sigma ** 2,
                                                 a.cov_weight, a.n_affine)
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
             elif method in ("expected", "expected_feat", "expected_stop"):
                 sel_dots, utils, reason = select_expected(
@@ -1039,7 +878,7 @@ def main():
                     stop_tol=a.stop_tol,
                     stop_min_dots=a.stop_min_dots,
                 )
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
                 if rec is not None:
                     rec["stop_reason"] = reason
@@ -1052,18 +891,15 @@ def main():
                     noise_frac=a.resid_noise_frac,
                     min_support=a.resid_min_support,
                     regions=a.regions,
-                    base_mode=a.base_mode,
-                    prior_mu=prior_mu,
-                    prior_prec=prior_prec,
                 )
-                rec = fit_eval_base(d, tab, sel_dots, None, method, K, seed,
+                rec = fit_eval(d, tab, sel_dots, None, method, K, seed,
                                a, F, V, mu_norm, RA)
                 if rec is not None:
                     rec["stop_reason"] = reason
                     rec.update(rinfo)
             else:  # frame
                 sel_pos, utils = select_frame_coverage(d, tab["cand_pos"], K, seed)
-                rec = fit_eval_base(d, tab, None, sel_pos, method, K, seed,
+                rec = fit_eval(d, tab, None, sel_pos, method, K, seed,
                                a, F, V, mu_norm, RA)
             if rec is None:
                 warn(f"[skip] {s} {method} K={K} seed={seed}: 样本不足")
@@ -1108,7 +944,6 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     detail = outdir / "active_calib_detail.csv"
     cols = ["session", "ori", "device", "method", "K", "seed",
-            "base_mode",
             "n_candidate_dots", "n_heldout_dots", "n_selected_dots",
             "n_frames_used", "n_heldout_frames",
             "raw_cm", "base_cm", "calib_cm",
