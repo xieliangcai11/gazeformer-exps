@@ -1,0 +1,19 @@
+{
+  "args": {
+    "val_npz": "out/gazecapture/analysis/feats_soup_val.npz",
+    "index_csv": "data/GazeCapture/index/index.csv",
+    "dino_npz": "out/gazecapture/analysis/dino_pca16_val.npz",
+    "landmark_npz": "out/gazecapture/analysis/lm_gc_val.npz",
+    "K": 20,
+    "source_lam": 10.0,
+    "target_lam": 1.0,
+    "rank": 8,
+    "out_dir": "out/gazecapture/analysis/posterior_adapter_8"
+  },
+  "sessions": 47,
+  "base": 1.0063675445366522,
+  "adapter": 1.103327795100225,
+  "delta": 0.09696025056357271,
+  "win": 0.46808510638297873,
+  "source_rows": 1920
+}
